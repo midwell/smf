@@ -153,9 +153,11 @@ func (smf *SMF) Start() {
 	// Lawful Interception IRI-POI: start only when the opt-in Li config is
 	// present; silent otherwise.
 	if li := factory.SmfConfig.Configuration.Li; li != nil {
+		kaTimeout, _ := time.ParseDuration(li.KeepaliveTimeout)
 		if err := lawfulintercept.Init(lawfulintercept.Config{
 			X1Listen: li.X1Listen, MDF2: li.MDF2, NEID: li.NEID,
 			Cert: li.Cert, Key: li.Key, CACert: li.CACert,
+			AdmfURL: li.AdmfURL, AdmfID: li.AdmfID, KeepaliveTimeout: kaTimeout,
 		}); err != nil {
 			logger.InitLog.Errorf("lawful interception init failed: %v", err)
 		}

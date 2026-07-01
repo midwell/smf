@@ -85,6 +85,10 @@ type Li struct {
 	Cert     string `yaml:"cert"`     // X0 LI PKI: this NE's certificate
 	Key      string `yaml:"key"`      // its private key
 	CACert   string `yaml:"caCert"`   // the LI CA trust anchor
+
+	AdmfURL          string `yaml:"admfUrl"`          // ADMF X1 endpoint for NE-initiated issue reports (optional)
+	AdmfID           string `yaml:"admfId"`           // responsible ADMF identifier (for reports)
+	KeepaliveTimeout string `yaml:"keepaliveTimeout"` // duration; purge tasking if no X1 message within it (optional)
 }
 
 type StaticIpInfo struct {
