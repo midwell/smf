@@ -73,6 +73,18 @@ type Configuration struct {
 	EnableUpfAdapter         bool              `yaml:"enableUPFAdapter,omitempty"`
 	ULCL                     bool              `yaml:"ulcl,omitempty"`
 	PCSCFInfo                PCSCFInfo         `yaml:"pcscfInfos,omitempty"`
+	Li                       *Li               `yaml:"li,omitempty"`
+}
+
+// Li configures the Lawful Interception IRI-POI. It is opt-in: when absent, LI
+// is inactive and the SMF behaves exactly as before.
+type Li struct {
+	X1Listen string `yaml:"x1Listen"` // address for the X1 provisioning listener
+	MDF2     string `yaml:"mdf2"`     // X2 delivery destination (host:port)
+	NEID     string `yaml:"neId"`     // this network element's identifier
+	Cert     string `yaml:"cert"`     // X0 LI PKI: this NE's certificate
+	Key      string `yaml:"key"`      // its private key
+	CACert   string `yaml:"caCert"`   // the LI CA trust anchor
 }
 
 type StaticIpInfo struct {

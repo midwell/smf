@@ -20,6 +20,7 @@ import (
 	"github.com/omec-project/openapi/v2/models"
 	"github.com/omec-project/smf/consumer"
 	smf_context "github.com/omec-project/smf/context"
+	"github.com/omec-project/smf/lawfulintercept"
 	"github.com/omec-project/smf/logger"
 	"github.com/omec-project/smf/metrics"
 	"github.com/omec-project/smf/msgtypes/svcmsgtypes"
@@ -405,6 +406,12 @@ func HandlePDUSessionSMContextCreate(eventData interface{}) error {
 
 	smContext.SubPduSessLog.Infof("PDUSessionSMContextCreate, PDU session context create success ")
 
+	// Lawful Interception IRI-POI: the PDU session is established (data path
+	// activated, UE IP and serving UPF known), so emit an
+	// SMFPDUSessionEstablishment xIRI for a tasked target. Silent no-op unless LI
+	// is configured.
+	lawfulintercept.ReportEstablishment(smContext)
+
 	return nil
 	// TODO: UECM registration
 }
@@ -464,6 +471,10 @@ func HandlePDUSessionSMContextUpdate(eventData interface{}) error {
 		// Initiate PFCP Delete
 		if pfcpAction.sendPfcpDelete {
 			smContext.SubPduSessLog.Infoln("PDUSessionSMContextUpdate, send PFCP Deletion")
+
+			// Lawful Interception IRI-POI: an update-initiated release of the PDU
+			// session — emit an SMFPDUSessionRelease xIRI for a tasked target.
+			lawfulintercept.ReportRelease(smContext)
 			smContext.ChangeState(smf_context.SmStatePfcpRelease)
 			smContext.SubCtxLog.Debugln("PDUSessionSMContextUpdate, SMContextState Change State:", smContext.SMContextState.String())
 
@@ -485,6 +496,10 @@ func HandlePDUSessionSMContextUpdate(eventData interface{}) error {
 			smContext.ChangeState(smf_context.SmStatePfcpModify)
 			smContext.SubCtxLog.Debugln("PDUSessionSMContextUpdate, SMContextState Change State:", smContext.SMContextState.String())
 			smContext.SubPduSessLog.Infof("PDUSessionSMContextUpdate, send PFCP Modification")
+
+			// Lawful Interception IRI-POI: the PDU session is being modified — emit
+			// an SMFPDUSessionModification xIRI for a tasked target.
+			lawfulintercept.ReportModification(smContext)
 
 			// Initiate PFCP Modify
 			if err = SendPfcpSessionModifyReq(smContext, pfcpParam); err != nil {
@@ -613,6 +628,11 @@ func HandlePDUSessionSMContextRelease(eventData interface{}) error {
 	defer smContext.SMLock.Unlock()
 
 	smContext.SubPduSessLog.Infof("PDUSessionSMContextRelease, PDU Session SMContext Release received")
+
+	// Lawful Interception IRI-POI: emit an SMFPDUSessionRelease xIRI for a tasked
+	// target before the session state is torn down. Silent no-op unless LI is
+	// configured.
+	lawfulintercept.ReportRelease(smContext)
 
 	// Send Policy delete
 	metrics.IncrementSvcPcfMsgStats(smf_context.SMF_Self().NfInstanceID, string(svcmsgtypes.SmPolicyAssociationDelete), "Out", "", "")

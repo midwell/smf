@@ -29,6 +29,7 @@ import (
 	smfContext "github.com/omec-project/smf/context"
 	"github.com/omec-project/smf/eventexposure"
 	"github.com/omec-project/smf/factory"
+	"github.com/omec-project/smf/lawfulintercept"
 	"github.com/omec-project/smf/logger"
 	"github.com/omec-project/smf/metrics"
 	"github.com/omec-project/smf/nfregistration"
@@ -148,6 +149,17 @@ func (smf *SMF) Start() {
 
 	// Init UE Specific Config
 	smfContext.InitSMFUERouting(&factory.UERoutingConfig)
+
+	// Lawful Interception IRI-POI: start only when the opt-in Li config is
+	// present; silent otherwise.
+	if li := factory.SmfConfig.Configuration.Li; li != nil {
+		if err := lawfulintercept.Init(lawfulintercept.Config{
+			X1Listen: li.X1Listen, MDF2: li.MDF2, NEID: li.NEID,
+			Cert: li.Cert, Key: li.Key, CACert: li.CACert,
+		}); err != nil {
+			logger.InitLog.Errorf("lawful interception init failed: %v", err)
+		}
+	}
 
 	// Init Kafka stream before spawning goroutines that may publish metric events.
 	if err := metrics.InitialiseKafkaStream(factory.SmfConfig.Configuration); err != nil {
