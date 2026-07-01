@@ -189,7 +189,7 @@ func farToCreateFAR(far *context.FAR) *ie.IE {
 		createFARies = append(createFARies, ie.NewForwardingParameters(forwardingParametersIEs...))
 	}
 	if far.ApplyAction.Dupl && far.DuplicatingParameters != nil {
-		createFARies = append(createFARies, duplicatingParametersIE(far.DuplicatingParameters))
+		createFARies = append(createFARies, ie.NewDuplicatingParameters(duplicatingParametersIEs(far.DuplicatingParameters)...))
 	}
 	return ie.NewCreateFAR(createFARies...)
 }
@@ -197,7 +197,10 @@ func farToCreateFAR(far *context.FAR) *ie.IE {
 // duplicatingParametersIE builds the Duplicating Parameters grouped IE that
 // accompanies a DUPL FAR, telling the UPF where to copy the user-plane packets
 // (for Lawful Interception, the LI Function interface).
-func duplicatingParametersIE(dp *context.DuplicatingParameters) *ie.IE {
+// duplicatingParametersIEs builds the inner IEs shared by the Create and Update
+// Duplicating Parameters grouped IEs: the LI destination interface plus an
+// optional outer header.
+func duplicatingParametersIEs(dp *context.DuplicatingParameters) []*ie.IE {
 	ies := []*ie.IE{ie.NewDestinationInterface(dp.DestinationInterface.InterfaceValue)}
 	if dp.OuterHeaderCreation != nil {
 		ies = append(ies, ie.NewOuterHeaderCreation(
@@ -210,7 +213,7 @@ func duplicatingParametersIE(dp *context.DuplicatingParameters) *ie.IE {
 			0,
 		))
 	}
-	return ie.NewDuplicatingParameters(ies...)
+	return ies
 }
 
 func qerToCreateQER(qer *context.QER) *ie.IE {
@@ -295,20 +298,7 @@ func farToUpdateFAR(far *context.FAR) *ie.IE {
 		updateFARies = append(updateFARies, ie.NewUpdateForwardingParameters(forwardingParametersIEs...))
 	}
 	if far.ApplyAction.Dupl && far.DuplicatingParameters != nil {
-		dp := far.DuplicatingParameters
-		dupIEs := []*ie.IE{ie.NewDestinationInterface(dp.DestinationInterface.InterfaceValue)}
-		if dp.OuterHeaderCreation != nil {
-			dupIEs = append(dupIEs, ie.NewOuterHeaderCreation(
-				dp.OuterHeaderCreation.OuterHeaderCreationDescription,
-				dp.OuterHeaderCreation.Teid,
-				dp.OuterHeaderCreation.Ipv4Address.String(),
-				dp.OuterHeaderCreation.Ipv6Address.String(),
-				dp.OuterHeaderCreation.PortNumber,
-				0,
-				0,
-			))
-		}
-		updateFARies = append(updateFARies, ie.NewUpdateDuplicatingParameters(dupIEs...))
+		updateFARies = append(updateFARies, ie.NewUpdateDuplicatingParameters(duplicatingParametersIEs(far.DuplicatingParameters)...))
 	}
 	return ie.NewUpdateFAR(updateFARies...)
 }

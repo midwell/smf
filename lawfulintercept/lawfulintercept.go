@@ -10,6 +10,7 @@ package lawfulintercept
 
 import (
 	"encoding/hex"
+	"fmt"
 	"net"
 	"net/http"
 	"strings"
@@ -66,13 +67,19 @@ func Init(cfg Config) error {
 		iriCtx: iri.NewContext(),
 		neID:   cfg.NEID,
 	}
+	// Bind the X1 listener synchronously so a bind/permission failure is reported
+	// to the caller, rather than being swallowed in a goroutine while LI already
+	// looks enabled (active.Store below) — otherwise no X1 tasking can be received.
+	ln, err := net.Listen("tcp", cfg.X1Listen)
+	if err != nil {
+		return fmt.Errorf("lawful interception: X1 listen on %s: %w", cfg.X1Listen, err)
+	}
 	srv := &http.Server{
-		Addr:      cfg.X1Listen,
 		Handler:   x1.NewServer(st, cfg.NEID),
 		TLSConfig: mat.ServerTLS(),
 	}
 	// Certificates come from TLSConfig, so the file arguments are empty.
-	go func() { _ = srv.ListenAndServeTLS("", "") }()
+	go func() { _ = srv.ServeTLS(ln, "", "") }()
 	active.Store(sub)
 	return nil
 }
