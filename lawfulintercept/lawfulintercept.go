@@ -112,13 +112,17 @@ func ReportRelease(sc *smfctx.SMContext) {
 // the session's target has an active task requesting CC product, it marks the
 // session's forwarding FARs for user-plane duplication (ApplyAction DUPL +
 // Duplicating Parameters to the LI Function) so the serving UPF(s) tee the
-// traffic to the MDF3. It is authoritative over the DUPL bit — a session no
-// longer CC-tasked has it cleared on the next rule send — and idempotent, so it
-// is safe to call before every PFCP rule send. No-op and silent when LI is
-// inactive.
+// traffic to the MDF3. No-op and silent when LI is inactive.
 //
 // It walks the session's whole data-path pool, so duplication is applied on
 // every UPF serving the target (multi-slice / UPF scaling), covering task 4.6.
+//
+// SCOPE: this runs only from SendPFCPRules, which the FSM invokes once, at
+// PDU-session establishment — so it triggers CC only for sessions established
+// after tasking. Triggering CC on a session that is ALREADY active when the
+// warrant arrives, and clearing on mid-session deactivation, needs an
+// X1-activation hook that flips far.State to RULE_UPDATE and re-sends a PFCP
+// modification; that is tracked as tasks 4.7/4.8 and is not yet implemented.
 func ApplyCCTrigger(sc *smfctx.SMContext) {
 	sub := active.Load()
 	if sub == nil || sc == nil || sc.Tunnel == nil {
@@ -269,27 +273,31 @@ func smfRelease(sc *smfctx.SMContext) iri.SMFPDUSessionRelease {
 
 // servingUPFTEID returns the N3 GTP-U F-TEID (uplink TEID + serving UPF IP) of
 // the session's default data path, best-effort: a zero F-TEID if the tunnel is
-// not yet set up. The PDU-session establishment record carries this mandatory
+// not yet set up. It uses the canonical default-path selector (the same one the
+// PFCP establishment-response handler uses to find the N3 UPF) rather than an
+// arbitrary map entry, so a multi-path (ULCL) session yields the anchoring path
+// deterministically. The PDU-session establishment record carries this mandatory
 // field so the MDF can correlate the user plane.
 func servingUPFTEID(sc *smfctx.SMContext) iri.FTEID {
 	var f iri.FTEID
 	if sc.Tunnel == nil {
 		return f
 	}
-	for _, dp := range sc.Tunnel.DataPathPool {
-		node := dp.FirstDPNode
-		if node == nil || node.UpLinkTunnel == nil || node.UPF == nil {
-			continue
-		}
-		f.TEID = int64(node.UpLinkTunnel.TEID)
-		if ip := net.ParseIP(node.UPF.GetUPFIP()); ip != nil {
-			if v4 := ip.To4(); v4 != nil {
-				f.IPv4Address = v4
-			} else if v16 := ip.To16(); v16 != nil {
-				f.IPv6Address = v16
-			}
-		}
+	dp := sc.Tunnel.DataPathPool.GetDefaultPath()
+	if dp == nil {
 		return f
+	}
+	node := dp.FirstDPNode
+	if node == nil || node.UpLinkTunnel == nil || node.UPF == nil {
+		return f
+	}
+	f.TEID = int64(node.UpLinkTunnel.TEID)
+	if ip := net.ParseIP(node.UPF.GetUPFIP()); ip != nil {
+		if v4 := ip.To4(); v4 != nil {
+			f.IPv4Address = v4
+		} else if v16 := ip.To16(); v16 != nil {
+			f.IPv6Address = v16
+		}
 	}
 	return f
 }
