@@ -6,6 +6,7 @@ package producer
 
 import (
 	"github.com/omec-project/smf/context"
+	"github.com/omec-project/smf/lawfulintercept"
 	"github.com/omec-project/smf/logger"
 	"github.com/omec-project/smf/pfcp/message"
 )
@@ -20,6 +21,12 @@ type PFCPState struct {
 
 // SendPFCPRules send all datapaths to UPFs
 func SendPFCPRules(smContext *context.SMContext) {
+	// Lawful Interception CC Triggering Function: mark the session's forwarding
+	// FARs for user-plane duplication when the target is tasked for CC, before
+	// the FARs are encoded and sent to every serving UPF. Silent no-op unless LI
+	// is configured.
+	lawfulintercept.ApplyCCTrigger(smContext)
+
 	pfcpPool := make(map[string]*PFCPState)
 
 	for _, dataPath := range smContext.Tunnel.DataPathPool {

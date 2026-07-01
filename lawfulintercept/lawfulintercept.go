@@ -102,6 +102,65 @@ func ReportRelease(sc *smfctx.SMContext) {
 	sub.deliverIRI(sub.matchingTasks(sc), smfRelease(sc))
 }
 
+// ApplyCCTrigger is the SMF Content-of-Communication Triggering Function. When
+// the session's target has an active task requesting CC product, it marks the
+// session's forwarding FARs for user-plane duplication (ApplyAction DUPL +
+// Duplicating Parameters to the LI Function) so the serving UPF(s) tee the
+// traffic to the MDF3. It is authoritative over the DUPL bit — a session no
+// longer CC-tasked has it cleared on the next rule send — and idempotent, so it
+// is safe to call before every PFCP rule send. No-op and silent when LI is
+// inactive.
+//
+// It walks the session's whole data-path pool, so duplication is applied on
+// every UPF serving the target (multi-slice / UPF scaling), covering task 4.6.
+func ApplyCCTrigger(sc *smfctx.SMContext) {
+	sub := active.Load()
+	if sub == nil || sc == nil || sc.Tunnel == nil {
+		return
+	}
+	cc := sub.ccTasked(sc)
+	for _, dp := range sc.Tunnel.DataPathPool {
+		for node := dp.FirstDPNode; node != nil; node = node.Next() {
+			for _, tun := range []*smfctx.GTPTunnel{node.UpLinkTunnel, node.DownLinkTunnel} {
+				if tun == nil {
+					continue
+				}
+				for _, pdr := range tun.PDR {
+					// Duplicate only forwarding FARs — the ones actually carrying
+					// the target's user-plane traffic.
+					if pdr != nil && pdr.FAR != nil && pdr.FAR.ApplyAction.Forw {
+						setDuplication(pdr.FAR, cc)
+					}
+				}
+			}
+		}
+	}
+}
+
+// setDuplication turns user-plane duplication on or off for one forwarding FAR.
+// When on, the copy is destined for the LI Function; the SD-Core UPF CC-POI
+// frames and ships it over X3 natively, so no OuterHeaderCreation tunnel is set.
+func setDuplication(far *smfctx.FAR, on bool) {
+	far.ApplyAction.Dupl = on
+	if on {
+		far.DuplicatingParameters = &smfctx.DuplicatingParameters{
+			DestinationInterface: smfctx.DestinationInterface{InterfaceValue: smfctx.DestinationInterfaceLIFunction},
+		}
+	} else {
+		far.DuplicatingParameters = nil
+	}
+}
+
+// ccTasked reports whether any active task targeting sc requests CC product.
+func (s *subsystem) ccTasked(sc *smfctx.SMContext) bool {
+	for _, t := range s.matchingTasks(sc) {
+		if t.WantsProduct(types.ProductCC) {
+			return true
+		}
+	}
+	return false
+}
+
 // deliverIRI encodes event once and delivers it as an X2 xIRI to every task in
 // tasks that wants IRI product. It is silent on any error (encoding or
 // delivery) so that interception can never be inferred from SMF behaviour.

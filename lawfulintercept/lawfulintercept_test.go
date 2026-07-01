@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/omec-project/li/iri"
+	"github.com/omec-project/li/store"
 	"github.com/omec-project/li/types"
 	"github.com/omec-project/openapi/v2/models"
 	smfctx "github.com/omec-project/smf/context"
@@ -110,6 +111,96 @@ func TestParseXID(t *testing.T) {
 	if got := parseXID("not-a-uuid"); got != ([16]byte{}) {
 		t.Errorf("bad XID = % x, want zero", got)
 	}
+}
+
+// ccSession builds a minimal one-node PDU session whose default uplink PDR
+// points at far, so ApplyCCTrigger has a forwarding FAR to act on.
+func ccSession(far *smfctx.FAR) *smfctx.SMContext {
+	node := smfctx.NewDataPathNode()
+	node.UpLinkTunnel.PDR["default"] = &smfctx.PDR{FAR: far}
+	return &smfctx.SMContext{
+		Supi:   "imsi-262019876543210",
+		Tunnel: &smfctx.UPTunnel{DataPathPool: smfctx.DataPathPool{1: &smfctx.DataPath{FirstDPNode: node}}},
+	}
+}
+
+// activateWith installs sub with a store holding task, and cleans up after.
+func activateWith(t *testing.T, task types.InterceptTask) {
+	t.Helper()
+	st := store.New()
+	if !st.Activate(task) {
+		t.Fatalf("failed to activate test task %+v", task)
+	}
+	active.Store(&subsystem{store: st})
+	t.Cleanup(func() { active.Store(nil) })
+}
+
+func TestApplyCCTriggerSetsDuplication(t *testing.T) {
+	activateWith(t, types.InterceptTask{
+		XID:      "task-cc",
+		Target:   types.TargetIdentifier{Type: types.TargetSUPI, Value: "262019876543210"},
+		Products: []types.ProductType{types.ProductIRI, types.ProductCC},
+		State:    types.TaskActive,
+	})
+
+	far := &smfctx.FAR{ApplyAction: smfctx.ApplyAction{Forw: true}}
+	ApplyCCTrigger(ccSession(far))
+
+	if !far.ApplyAction.Dupl {
+		t.Fatal("CC-tasked session: DUPL not set on forwarding FAR")
+	}
+	if far.DuplicatingParameters == nil ||
+		far.DuplicatingParameters.DestinationInterface.InterfaceValue != smfctx.DestinationInterfaceLIFunction {
+		t.Errorf("DuplicatingParameters = %+v, want LI Function", far.DuplicatingParameters)
+	}
+}
+
+func TestApplyCCTriggerClearsWhenNotCCTasked(t *testing.T) {
+	// An IRI-only task must not trigger CC duplication, and must clear a FAR that
+	// was previously duplicating.
+	activateWith(t, types.InterceptTask{
+		XID:      "task-iri",
+		Target:   types.TargetIdentifier{Type: types.TargetSUPI, Value: "262019876543210"},
+		Products: []types.ProductType{types.ProductIRI},
+		State:    types.TaskActive,
+	})
+
+	far := &smfctx.FAR{
+		ApplyAction:           smfctx.ApplyAction{Forw: true, Dupl: true},
+		DuplicatingParameters: &smfctx.DuplicatingParameters{},
+	}
+	ApplyCCTrigger(ccSession(far))
+
+	if far.ApplyAction.Dupl || far.DuplicatingParameters != nil {
+		t.Errorf("IRI-only task must clear DUPL: dupl=%v params=%+v", far.ApplyAction.Dupl, far.DuplicatingParameters)
+	}
+}
+
+func TestApplyCCTriggerSkipsNonForwardingFAR(t *testing.T) {
+	activateWith(t, types.InterceptTask{
+		XID:      "task-cc",
+		Target:   types.TargetIdentifier{Type: types.TargetSUPI, Value: "262019876543210"},
+		Products: []types.ProductType{types.ProductCC},
+		State:    types.TaskActive,
+	})
+
+	// A drop/buffer FAR (not forwarding) must never be marked for duplication.
+	far := &smfctx.FAR{ApplyAction: smfctx.ApplyAction{Drop: true}}
+	ApplyCCTrigger(ccSession(far))
+	if far.ApplyAction.Dupl {
+		t.Error("non-forwarding FAR must not be duplicated")
+	}
+}
+
+func TestApplyCCTriggerInactiveNoop(t *testing.T) {
+	// With LI inactive, the trigger must not touch the session (and not panic on
+	// a nil tunnel).
+	far := &smfctx.FAR{ApplyAction: smfctx.ApplyAction{Forw: true}}
+	ApplyCCTrigger(ccSession(far))
+	if far.ApplyAction.Dupl {
+		t.Error("LI inactive: DUPL must not be set")
+	}
+	ApplyCCTrigger(&smfctx.SMContext{}) // nil tunnel, must not panic
 }
 
 // TestEncodeAllEvents verifies every SMF xIRI a reporter can produce encodes
