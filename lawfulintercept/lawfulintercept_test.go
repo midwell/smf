@@ -10,9 +10,19 @@ import (
 	"github.com/omec-project/li/iri"
 	"github.com/omec-project/li/store"
 	"github.com/omec-project/li/types"
+	"github.com/omec-project/li/x2x3"
 	"github.com/omec-project/openapi/v2/models"
 	smfctx "github.com/omec-project/smf/context"
 )
+
+// captureSender records the xIRI PDUs delivered, standing in for the X2 client
+// so tests can assert per-warrant delivery isolation.
+type captureSender struct{ pdus []*x2x3.PDU }
+
+func (c *captureSender) Send(p *x2x3.PDU) error {
+	c.pdus = append(c.pdus, p)
+	return nil
+}
 
 // targetSM is a fully-identified PDU-session context used across the tests.
 func targetSM() *smfctx.SMContext {
@@ -201,6 +211,43 @@ func TestApplyCCTriggerInactiveNoop(t *testing.T) {
 		t.Error("LI inactive: DUPL must not be set")
 	}
 	ApplyCCTrigger(&smfctx.SMContext{}) // nil tunnel, must not panic
+}
+
+// TestDeliveryIsolation checks multi-agency isolation on the SMF IRI path: two
+// agencies tasking the same target each receive exactly their own xIRI tagged
+// with their own XID (no cross-delivery), and a CC-only warrant never leaks into
+// IRI (X2) delivery.
+func TestDeliveryIsolation(t *testing.T) {
+	const (
+		xidA  = "aaaaaaaa-0000-0000-0000-000000000001"
+		xidB  = "bbbbbbbb-0000-0000-0000-000000000002"
+		xidCC = "cccccccc-0000-0000-0000-000000000003"
+	)
+	target := types.TargetIdentifier{Type: types.TargetSUPI, Value: "262019876543210"}
+	st := store.New()
+	st.Activate(types.InterceptTask{XID: xidA, Target: target, Products: []types.ProductType{types.ProductIRI}, State: types.TaskActive})
+	st.Activate(types.InterceptTask{XID: xidB, Target: target, Products: []types.ProductType{types.ProductIRI}, State: types.TaskActive})
+	st.Activate(types.InterceptTask{XID: xidCC, Target: target, Products: []types.ProductType{types.ProductCC}, State: types.TaskActive})
+
+	cap := &captureSender{}
+	active.Store(&subsystem{store: st, client: cap, iriCtx: iri.NewContext()})
+	t.Cleanup(func() { active.Store(nil) })
+
+	ReportEstablishment(targetSM())
+
+	if len(cap.pdus) != 2 {
+		t.Fatalf("delivered %d xIRI PDUs, want 2 (the two IRI agencies; CC-only excluded)", len(cap.pdus))
+	}
+	count := map[[16]byte]int{}
+	for _, p := range cap.pdus {
+		count[p.XID]++
+	}
+	if count[parseXID(xidA)] != 1 || count[parseXID(xidB)] != 1 {
+		t.Errorf("each IRI agency must receive its own xIRI exactly once; XID counts = %v", count)
+	}
+	if count[parseXID(xidCC)] != 0 {
+		t.Error("CC-only warrant leaked into IRI (X2) delivery")
+	}
 }
 
 // TestEncodeAllEvents verifies every SMF xIRI a reporter can produce encodes

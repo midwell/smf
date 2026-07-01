@@ -35,9 +35,15 @@ type Config struct {
 	CACert   string //                            the LI CA trust anchor
 }
 
+// sender delivers an xIRI/xCC PDU to an MDF. *x2x3.Client satisfies it; tests
+// inject a capturing implementation to assert per-warrant delivery isolation.
+type sender interface {
+	Send(*x2x3.PDU) error
+}
+
 type subsystem struct {
 	store  *store.Store
-	client *x2x3.Client
+	client sender
 	iriCtx *liasn1.Context
 	neID   string
 }
