@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -76,7 +77,12 @@ func Init(cfg Config) error {
 	if cfg.AdmfURL != "" {
 		sub.reporter = x1.NewReporter(cfg.AdmfURL, cfg.AdmfID, cfg.NEID, mat.ClientTLS())
 	}
-	x1srv := x1.NewServer(st, cfg.NEID)
+	// OnActivate/OnDeactivate scan already-established sessions when a warrant is
+	// (de)tasked mid-session (tasks 4.7/4.8): emit the "start with established PDU
+	// session" xIRI and (de)activate CC duplication on live sessions.
+	x1srv := x1.NewServer(st, cfg.NEID,
+		x1.OnActivate(sub.reportStartOfInterception),
+		x1.OnDeactivate(sub.reportDeactivation))
 	// Bind the X1 listener synchronously so a bind/permission failure is reported
 	// to the caller, rather than being swallowed in a goroutine while LI already
 	// looks enabled (active.Store below) — otherwise no X1 tasking can be received.
@@ -138,18 +144,24 @@ func ReportRelease(sc *smfctx.SMContext) {
 // It walks the session's whole data-path pool, so duplication is applied on
 // every UPF serving the target (multi-slice / UPF scaling), covering task 4.6.
 //
-// SCOPE: this runs only from SendPFCPRules, which the FSM invokes once, at
-// PDU-session establishment — so it triggers CC only for sessions established
-// after tasking. Triggering CC on a session that is ALREADY active when the
-// warrant arrives, and clearing on mid-session deactivation, needs an
-// X1-activation hook that flips far.State to RULE_UPDATE and re-sends a PFCP
-// modification; that is tracked as tasks 4.7/4.8 and is not yet implemented.
+// SCOPE: this runs from SendPFCPRules at PDU-session establishment, so it triggers
+// CC for sessions established after tasking. The complementary case — a warrant
+// (de)tasked while the session is already up — is handled by the X1
+// OnActivate/OnDeactivate hooks (reportStartOfInterception / reportDeactivation),
+// which re-evaluate CC and re-send a PFCP modification (tasks 4.7/4.8).
 func ApplyCCTrigger(sc *smfctx.SMContext) {
 	sub := active.Load()
 	if sub == nil || sc == nil || sc.Tunnel == nil {
 		return
 	}
 	cc := sub.ccTasked(sc)
+	forEachForwardingFAR(sc, func(far *smfctx.FAR) { setDuplication(far, cc) })
+}
+
+// forEachForwardingFAR invokes fn for every forwarding FAR across all of sc's
+// data paths — the ones actually carrying the target's user-plane traffic, on
+// every UPF serving the session. Caller holds sc.SMLock; sc.Tunnel must be non-nil.
+func forEachForwardingFAR(sc *smfctx.SMContext, fn func(*smfctx.FAR)) {
 	for _, dp := range sc.Tunnel.DataPathPool {
 		for node := dp.FirstDPNode; node != nil; node = node.Next() {
 			for _, tun := range []*smfctx.GTPTunnel{node.UpLinkTunnel, node.DownLinkTunnel} {
@@ -157,10 +169,8 @@ func ApplyCCTrigger(sc *smfctx.SMContext) {
 					continue
 				}
 				for _, pdr := range tun.PDR {
-					// Duplicate only forwarding FARs — the ones actually carrying
-					// the target's user-plane traffic.
 					if pdr != nil && pdr.FAR != nil && pdr.FAR.ApplyAction.Forw {
-						setDuplication(pdr.FAR, cc)
+						fn(pdr.FAR)
 					}
 				}
 			}
@@ -190,6 +200,122 @@ func (s *subsystem) ccTasked(sc *smfctx.SMContext) bool {
 		}
 	}
 	return false
+}
+
+// sessionModifier sends a PFCP session modification carrying sc's current FAR
+// state. It is injected by the service layer (SetSessionModifier) because this
+// package is imported by smf/producer and so cannot call
+// producer.SendPfcpSessionModifyReq directly. While nil (e.g. in tests) the
+// mid-session CC hooks still update FAR state but send nothing.
+var sessionModifier func(*smfctx.SMContext) error
+
+// SetSessionModifier installs the PFCP-modification hook used by mid-session CC
+// (de)activation. Call once at start-up, before the X1 server accepts tasking.
+func SetSessionModifier(fn func(*smfctx.SMContext) error) {
+	sessionModifier = fn
+}
+
+// reportStartOfInterception is the X1 OnActivate hook: when a warrant is tasked
+// for a UE that already has a live PDU session, emit the "start with established
+// PDU session" xIRI (if IRI is wanted) and switch on CC duplication (if CC is
+// wanted). It runs on live sessions the target already has; sessions established
+// later are handled at establishment by ReportEstablishment / ApplyCCTrigger.
+func (s *subsystem) reportStartOfInterception(task types.InterceptTask) {
+	wantIRI := task.WantsProduct(types.ProductIRI)
+	s.scanSessions(task, func(sc *smfctx.SMContext) any {
+		var event any
+		if wantIRI {
+			event = smfStartOfInterception(sc)
+		}
+		if s.applyCC(sc) {
+			s.modifySession(sc)
+		}
+		return event
+	})
+}
+
+// reportDeactivation is the X1 OnDeactivate hook: when a warrant is removed, undo
+// the CC duplication it caused on the target's live sessions. It re-evaluates
+// against the remaining task set, so duplication is only cleared once no CC task
+// still targets the session (correct under overlapping multi-agency warrants).
+// IRI needs no undo, so a pure-IRI deactivation is a no-op.
+func (s *subsystem) reportDeactivation(task types.InterceptTask) {
+	if !task.WantsProduct(types.ProductCC) {
+		return
+	}
+	s.scanSessions(task, func(sc *smfctx.SMContext) any {
+		if s.applyCC(sc) {
+			s.modifySession(sc)
+		}
+		return nil
+	})
+}
+
+// scanSessions finds every live session targeted by task, then processes each in
+// a background goroutine (holding sc.SMLock) — off the X1 request goroutine, so a
+// slow PFCP round-trip never delays the X1 response. fn returns an xIRI event to
+// deliver after the lock is released, or nil. The target match is done under the
+// per-session lock because it reads the session's identity fields.
+func (s *subsystem) scanSessions(task types.InterceptTask, fn func(*smfctx.SMContext) any) {
+	var matched []*smfctx.SMContext
+	smfctx.RangeSMContexts(func(sc *smfctx.SMContext) bool {
+		sc.SMLock.Lock()
+		hit := sessionTargets(task, sc)
+		sc.SMLock.Unlock()
+		if hit {
+			matched = append(matched, sc)
+		}
+		return true
+	})
+	if len(matched) == 0 {
+		return
+	}
+	go func() {
+		for _, sc := range matched {
+			sc.SMLock.Lock()
+			event := fn(sc)
+			sc.SMLock.Unlock()
+			if event != nil {
+				s.deliverIRI([]types.InterceptTask{task}, event)
+			}
+		}
+	}()
+}
+
+// applyCC makes sc's forwarding FARs match whether the target is currently
+// CC-tasked, marking any FAR it changes RULE_UPDATE so a PFCP modification
+// re-sends it. It returns whether anything changed (a modification is due).
+// Caller holds sc.SMLock.
+func (s *subsystem) applyCC(sc *smfctx.SMContext) bool {
+	if sc.Tunnel == nil {
+		return false
+	}
+	want := s.ccTasked(sc)
+	changed := false
+	forEachForwardingFAR(sc, func(far *smfctx.FAR) {
+		if far.ApplyAction.Dupl == want {
+			return
+		}
+		setDuplication(far, want)
+		far.State = smfctx.RULE_UPDATE
+		changed = true
+	})
+	return changed
+}
+
+// modifySession fires the injected PFCP-modification hook for sc, silently (any
+// failure surfaces through normal PFCP handling, never a target-revealing log).
+// Caller holds sc.SMLock.
+func (s *subsystem) modifySession(sc *smfctx.SMContext) {
+	if sessionModifier != nil {
+		_ = sessionModifier(sc)
+	}
+}
+
+// sessionTargets reports whether task's target identifier matches one of sc's
+// identifiers. Caller holds sc.SMLock (targetsOf reads sc's identity fields).
+func sessionTargets(task types.InterceptTask, sc *smfctx.SMContext) bool {
+	return slices.Contains(targetsOf(sc), task.Target)
 }
 
 // deliverIRI encodes event once and delivers it as an X2 xIRI to every task in
@@ -267,6 +393,25 @@ func smfEstablishment(sc *smfctx.SMContext) iri.SMFPDUSessionEstablishment {
 		SNSSAI:         snssai(sc),
 		DNN:            iri.DNN(sc.Dnn),
 		RequestType:    iri.SMRequestInitial,
+		AccessType:     iri.AccessThreeGPP,
+	}
+}
+
+// smfStartOfInterception maps an SMContext to a TS 33.128
+// SMFStartOfInterceptionWithEstablishedPDUSession record (XIRIEvent [9]), emitted
+// when a warrant is activated for a UE whose PDU session is already up. Same shape
+// as the establishment record, but requestType marks the session as pre-existing.
+func smfStartOfInterception(sc *smfctx.SMContext) iri.SMFStartOfInterceptionWithEstablishedPDUSession {
+	return iri.SMFStartOfInterceptionWithEstablishedPDUSession{
+		SUPI:           supiChoice(sc),
+		PEI:            peiChoice(sc),
+		GPSI:           gpsiChoice(sc),
+		PDUSessionID:   iri.PDUSessionID(sc.PDUSessionID),
+		GTPTunnelID:    servingUPFTEID(sc),
+		PDUSessionType: iri.PDUSessionType(sc.SelectedPDUSessionType),
+		SNSSAI:         snssai(sc),
+		DNN:            iri.DNN(sc.Dnn),
+		RequestType:    iri.SMRequestExisting,
 		AccessType:     iri.AccessThreeGPP,
 	}
 }

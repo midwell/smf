@@ -40,6 +40,7 @@ import (
 	"github.com/omec-project/smf/pfcp/udp"
 	"github.com/omec-project/smf/pfcp/upf"
 	"github.com/omec-project/smf/polling"
+	"github.com/omec-project/smf/producer"
 	"github.com/omec-project/util/http2_util"
 	utilLogger "github.com/omec-project/util/logger"
 	"github.com/urfave/cli/v3"
@@ -154,6 +155,10 @@ func (smf *SMF) Start() {
 	// present; silent otherwise.
 	if li := factory.SmfConfig.Configuration.Li; li != nil {
 		kaTimeout, _ := time.ParseDuration(li.KeepaliveTimeout)
+		// Inject the PFCP session-modification hook the mid-session CC trigger
+		// needs (tasks 4.7/4.8). Done before Init mounts the X1 listener so the
+		// hook is in place before any tasking can arrive.
+		lawfulintercept.SetSessionModifier(producer.ModifySessionForLI)
 		if err := lawfulintercept.Init(lawfulintercept.Config{
 			X1Listen: li.X1Listen, MDF2: li.MDF2, NEID: li.NEID,
 			Cert: li.Cert, Key: li.Key, CACert: li.CACert,

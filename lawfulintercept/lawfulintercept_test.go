@@ -257,13 +257,106 @@ func TestEncodeAllEvents(t *testing.T) {
 	sc := targetSM()
 	ctx := iri.NewContext()
 	events := map[string]any{
-		"establishment": smfEstablishment(sc),
-		"modification":  smfModification(sc),
-		"release":       smfRelease(sc),
+		"establishment":         smfEstablishment(sc),
+		"modification":          smfModification(sc),
+		"release":               smfRelease(sc),
+		"start-of-interception": smfStartOfInterception(sc),
 	}
 	for name, ev := range events {
 		if _, err := iri.EncodeXIRI(ctx, ev); err != nil {
 			t.Errorf("encode %s: %v", name, err)
 		}
+	}
+}
+
+// subWith returns a subsystem backed by a store holding the given tasks (no X1
+// server, no client) — for exercising the mid-session helpers directly.
+func subWith(t *testing.T, tasks ...types.InterceptTask) *subsystem {
+	t.Helper()
+	st := store.New()
+	for _, task := range tasks {
+		if !st.Activate(task) {
+			t.Fatalf("activate %+v", task)
+		}
+	}
+	return &subsystem{store: st}
+}
+
+// TestApplyCCActivation covers the mid-session CC switch-on (task 4.8): a CC task
+// targeting a live session sets DUPL and marks the FAR RULE_UPDATE so a PFCP
+// modification re-sends it, and it is idempotent (a second call is a no-op).
+func TestApplyCCActivation(t *testing.T) {
+	target := types.TargetIdentifier{Type: types.TargetSUPI, Value: "262019876543210"}
+	sub := subWith(t, types.InterceptTask{
+		XID: "cc", Target: target,
+		Products: []types.ProductType{types.ProductCC}, State: types.TaskActive,
+	})
+
+	far := &smfctx.FAR{ApplyAction: smfctx.ApplyAction{Forw: true}, State: smfctx.RULE_CREATE}
+	sc := ccSession(far)
+
+	if !sub.applyCC(sc) {
+		t.Fatal("applyCC must report a change when switching duplication on")
+	}
+	if !far.ApplyAction.Dupl || far.State != smfctx.RULE_UPDATE {
+		t.Errorf("want DUPL set + RULE_UPDATE, got dupl=%v state=%v", far.ApplyAction.Dupl, far.State)
+	}
+	if sub.applyCC(sc) {
+		t.Error("applyCC must be idempotent: no change on the second call")
+	}
+}
+
+// TestApplyCCDeactivation covers the mid-session CC switch-off (task 4.8): with no
+// CC task left in the store, applyCC clears DUPL on a FAR that was duplicating and
+// marks it RULE_UPDATE so the clear is pushed to the UPF.
+func TestApplyCCDeactivation(t *testing.T) {
+	sub := subWith(t) // empty store: target is no longer CC-tasked
+
+	far := &smfctx.FAR{
+		ApplyAction:           smfctx.ApplyAction{Forw: true, Dupl: true},
+		DuplicatingParameters: &smfctx.DuplicatingParameters{},
+		State:                 smfctx.RULE_CREATE,
+	}
+	sc := ccSession(far)
+
+	if !sub.applyCC(sc) {
+		t.Fatal("applyCC must report a change when clearing duplication")
+	}
+	if far.ApplyAction.Dupl || far.DuplicatingParameters != nil || far.State != smfctx.RULE_UPDATE {
+		t.Errorf("want DUPL cleared + RULE_UPDATE, got dupl=%v params=%v state=%v",
+			far.ApplyAction.Dupl, far.DuplicatingParameters, far.State)
+	}
+}
+
+// TestApplyCCMultiAgency: while any CC task still targets the session, deactivating
+// one CC warrant must leave duplication on (no change reported).
+func TestApplyCCMultiAgency(t *testing.T) {
+	target := types.TargetIdentifier{Type: types.TargetSUPI, Value: "262019876543210"}
+	// One CC task remains after the other agency's warrant was removed.
+	sub := subWith(t, types.InterceptTask{
+		XID: "cc-b", Target: target,
+		Products: []types.ProductType{types.ProductCC}, State: types.TaskActive,
+	})
+
+	far := &smfctx.FAR{
+		ApplyAction:           smfctx.ApplyAction{Forw: true, Dupl: true},
+		DuplicatingParameters: &smfctx.DuplicatingParameters{},
+		State:                 smfctx.RULE_CREATE,
+	}
+	if sub.applyCC(ccSession(far)) {
+		t.Error("duplication must stay on while another CC warrant targets the session")
+	}
+	if !far.ApplyAction.Dupl {
+		t.Error("DUPL must remain set for the still-tasked target")
+	}
+}
+
+func TestSessionTargets(t *testing.T) {
+	sc := ccSession(&smfctx.FAR{}) // Supi = imsi-262019876543210
+	if !sessionTargets(types.InterceptTask{Target: types.TargetIdentifier{Type: types.TargetSUPI, Value: "262019876543210"}}, sc) {
+		t.Error("a SUPI target must match the session's SUPI")
+	}
+	if sessionTargets(types.InterceptTask{Target: types.TargetIdentifier{Type: types.TargetSUPI, Value: "111111111111111"}}, sc) {
+		t.Error("a non-matching SUPI must not match")
 	}
 }

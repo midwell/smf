@@ -90,3 +90,64 @@ func SendPFCPRules(smContext *context.SMContext) {
 		}
 	}
 }
+
+// ModifySessionForLI sends a PFCP session modification carrying the forwarding
+// FARs that the Lawful Interception CC trigger has just marked RULE_UPDATE
+// (duplication switched on or off for an already-established session). It groups
+// the changed FARs by serving UPF and sends one modification per live PFCP
+// session, mirroring SendPFCPRules' per-UPF fan-out. Caller holds smContext.SMLock.
+//
+// It is injected into the LI subsystem via lawfulintercept.SetSessionModifier
+// because smf/producer imports smf/lawfulintercept — the reverse call would be a
+// cycle. It is silent by design: no LI-specific logging.
+func ModifySessionForLI(smContext *context.SMContext) error {
+	if smContext == nil || smContext.Tunnel == nil {
+		return nil
+	}
+	type group struct {
+		nodeID  context.NodeID
+		port    uint16
+		farList []*context.FAR
+		seen    map[*context.FAR]bool
+	}
+	groups := map[string]*group{}
+	for _, dataPath := range smContext.Tunnel.DataPathPool {
+		if !dataPath.Activated {
+			continue
+		}
+		for node := dataPath.FirstDPNode; node != nil; node = node.Next() {
+			for _, tun := range []*context.GTPTunnel{node.UpLinkTunnel, node.DownLinkTunnel} {
+				if tun == nil {
+					continue
+				}
+				for _, pdr := range tun.PDR {
+					if pdr == nil || pdr.FAR == nil || pdr.FAR.State != context.RULE_UPDATE {
+						continue
+					}
+					ip := node.GetNodeIP()
+					g := groups[ip]
+					if g == nil {
+						g = &group{nodeID: node.UPF.NodeID, port: node.UPF.Port, seen: map[*context.FAR]bool{}}
+						groups[ip] = g
+					}
+					if !g.seen[pdr.FAR] {
+						g.seen[pdr.FAR] = true
+						g.farList = append(g.farList, pdr.FAR)
+					}
+				}
+			}
+		}
+	}
+	var firstErr error
+	for ip, g := range groups {
+		sessionContext, exist := smContext.PFCPContext[ip]
+		if !exist || sessionContext.RemoteSEID == 0 {
+			continue // no live PFCP session on this UPF yet — nothing to modify
+		}
+		if err := message.SendPfcpSessionModificationRequest(
+			g.nodeID, smContext, nil, g.farList, nil, nil, g.port); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
