@@ -164,7 +164,14 @@ func (smf *SMF) Start() {
 			Cert: li.Cert, Key: li.Key, CACert: li.CACert,
 			AdmfURL: li.AdmfURL, AdmfID: li.AdmfID, KeepaliveTimeout: kaTimeout,
 		}); err != nil {
-			logger.InitLog.Errorf("lawful interception init failed: %v", err)
+			// Do not name the subsystem or echo err (which carries LI-identifying
+			// text) on the general operator log: that would reveal to an unauthorized
+			// operator that this NE is LI-provisioned (review R23; li-security-isolation
+			// NE-level undetectability). A listener-bind failure is already reported to
+			// the ADMF over X1 from within Init; an earlier failure (e.g. bad LI
+			// credentials) has no X1 channel yet and, pending a restricted LI log sink,
+			// is surfaced only non-attributably here.
+			logger.InitLog.Errorln("an optional subsystem failed to initialise")
 		}
 	}
 

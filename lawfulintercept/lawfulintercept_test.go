@@ -113,6 +113,18 @@ func TestServingUPFTEIDNilTunnel(t *testing.T) {
 	}
 }
 
+func TestCorrelationOfNilTunnel(t *testing.T) {
+	// No PFCP session yet → a zero correlation ID (best-effort), never a panic.
+	// The populated value (serving UPF F-SEID, big-endian, matching the UPF's X3)
+	// is exercised end-to-end by the datapath integration test (task 5.5).
+	if corr := correlationOf(&smfctx.SMContext{}); corr != ([8]byte{}) {
+		t.Errorf("nil-tunnel correlation = % x, want zero", corr)
+	}
+	if seid := servingUPFSEID(&smfctx.SMContext{}); seid != 0 {
+		t.Errorf("nil-tunnel serving UPF SEID = %d, want 0", seid)
+	}
+}
+
 func TestParseXID(t *testing.T) {
 	x := parseXID("50b93d1e-1b53-4d63-aacb-e4d99811bc0b")
 	if x[0] != 0x50 || x[15] != 0x0b {
@@ -199,6 +211,58 @@ func TestApplyCCTriggerSkipsNonForwardingFAR(t *testing.T) {
 	ApplyCCTrigger(ccSession(far))
 	if far.ApplyAction.Dupl {
 		t.Error("non-forwarding FAR must not be duplicated")
+	}
+}
+
+// TestApplyCCTriggerMarksInstalledFARForUpdate covers R22: when the trigger flips
+// DUPL on an already-installed FAR (RULE_CREATE) — e.g. SendPFCPRules re-invoked
+// for an established session on a ULCL add / HO path-switch — it must mark the FAR
+// RULE_UPDATE, or the modification builder skips it and the flip never reaches the
+// UPF. An establishment FAR (RULE_INITIAL) must be left as-is (sent as Create).
+func TestApplyCCTriggerMarksInstalledFARForUpdate(t *testing.T) {
+	activateWith(t, types.InterceptTask{
+		XID:      "task-cc",
+		Target:   types.TargetIdentifier{Type: types.TargetSUPI, Value: "262019876543210"},
+		Products: []types.ProductType{types.ProductCC},
+		State:    types.TaskActive,
+	})
+
+	installed := &smfctx.FAR{ApplyAction: smfctx.ApplyAction{Forw: true}, State: smfctx.RULE_CREATE}
+	ApplyCCTrigger(ccSession(installed))
+	if !installed.ApplyAction.Dupl {
+		t.Fatal("installed FAR: DUPL not set")
+	}
+	if installed.State != smfctx.RULE_UPDATE {
+		t.Errorf("installed FAR State = %v, want RULE_UPDATE so the flip is sent (R22)", installed.State)
+	}
+
+	fresh := &smfctx.FAR{ApplyAction: smfctx.ApplyAction{Forw: true}, State: smfctx.RULE_INITIAL}
+	ApplyCCTrigger(ccSession(fresh))
+	if fresh.State != smfctx.RULE_INITIAL {
+		t.Errorf("establishment FAR State = %v, want RULE_INITIAL (sent as Create FAR)", fresh.State)
+	}
+}
+
+// TestReportReleaseDeduplicates covers R21: a teardown that reaches both the
+// update-initiated delete and the dedicated release handler must emit only one
+// SMFPDUSessionRelease xIRI.
+func TestReportReleaseDeduplicates(t *testing.T) {
+	cap := &captureSender{}
+	st := store.New()
+	st.Activate(types.InterceptTask{
+		XID:      "task-iri",
+		Target:   types.TargetIdentifier{Type: types.TargetSUPI, Value: "262019876543210"},
+		Products: []types.ProductType{types.ProductIRI},
+		State:    types.TaskActive,
+	})
+	active.Store(&subsystem{store: st, client: cap, iriCtx: iri.NewContext(), neID: "ne"})
+	t.Cleanup(func() { active.Store(nil) })
+
+	sc := targetSM()
+	ReportRelease(sc)
+	ReportRelease(sc) // second call for the same teardown must be a no-op
+	if len(cap.pdus) != 1 {
+		t.Fatalf("release emitted %d xIRI, want exactly 1 (dedupe)", len(cap.pdus))
 	}
 }
 

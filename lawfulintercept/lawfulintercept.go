@@ -9,6 +9,7 @@
 package lawfulintercept
 
 import (
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"net"
@@ -68,14 +69,31 @@ func Init(cfg Config) error {
 		return err
 	}
 	st := store.New()
-	sub := &subsystem{
-		store:  st,
-		client: x2x3.NewClient(cfg.MDF2, mat.ClientTLS()),
-		iriCtx: iri.NewContext(),
-		neID:   cfg.NEID,
-	}
+	var reporter *x1.Reporter
 	if cfg.AdmfURL != "" {
-		sub.reporter = x1.NewReporter(cfg.AdmfURL, cfg.AdmfID, cfg.NEID, mat.ClientTLS())
+		reporter = x1.NewReporter(cfg.AdmfURL, cfg.AdmfID, cfg.NEID, mat.ClientTLS())
+	}
+	// Deliver X2 asynchronously: the Report* hooks run on the PDU-session
+	// signalling goroutine while sc.SMLock is held, so a slow or unreachable MDF2
+	// must never block them — that is an availability risk and a target-observable
+	// timing side channel (review R3b; design D11 mandates async X2 delivery).
+	// Worker delivery failures surface to the ADMF over X1 (throttled, NE-level,
+	// no target id), never to a general log.
+	client := x2x3.NewAsyncSender(
+		x2x3.NewClient(cfg.MDF2, mat.ClientTLS()), 0,
+		func(error) {
+			if reporter != nil {
+				_ = reporter.ReportNEIssue(x1.NEIssueMDFUnreachable, "MDF2 X2 delivery failed")
+			}
+		},
+		nil, // drops are covered by the same MDF-unreachable report from the worker
+	)
+	sub := &subsystem{
+		store:    st,
+		client:   client,
+		iriCtx:   iri.NewContext(),
+		neID:     cfg.NEID,
+		reporter: reporter,
 	}
 	// OnActivate/OnDeactivate scan already-established sessions when a warrant is
 	// (de)tasked mid-session (tasks 4.7/4.8): emit the "start with established PDU
@@ -112,7 +130,7 @@ func ReportEstablishment(sc *smfctx.SMContext) {
 	if sub == nil || sc == nil {
 		return
 	}
-	sub.deliverIRI(sub.matchingTasks(sc), smfEstablishment(sc))
+	sub.deliverIRI(sub.matchingTasks(sc), correlationOf(sc), smfEstablishment(sc))
 }
 
 // ReportModification emits an SMFPDUSessionModification xIRI for sc if it
@@ -122,7 +140,7 @@ func ReportModification(sc *smfctx.SMContext) {
 	if sub == nil || sc == nil {
 		return
 	}
-	sub.deliverIRI(sub.matchingTasks(sc), smfModification(sc))
+	sub.deliverIRI(sub.matchingTasks(sc), correlationOf(sc), smfModification(sc))
 }
 
 // ReportRelease emits an SMFPDUSessionRelease xIRI for sc if it matches an
@@ -132,7 +150,14 @@ func ReportRelease(sc *smfctx.SMContext) {
 	if sub == nil || sc == nil {
 		return
 	}
-	sub.deliverIRI(sub.matchingTasks(sc), smfRelease(sc))
+	// A single teardown can reach both the update-initiated delete and the
+	// dedicated release handler; emit the release xIRI only once (review R21).
+	// Both call sites hold sc.SMLock, so this check-and-set is safe.
+	if sc.LiReleaseReported {
+		return
+	}
+	sc.LiReleaseReported = true
+	sub.deliverIRI(sub.matchingTasks(sc), correlationOf(sc), smfRelease(sc))
 }
 
 // ApplyCCTrigger is the SMF Content-of-Communication Triggering Function. When
@@ -155,7 +180,20 @@ func ApplyCCTrigger(sc *smfctx.SMContext) {
 		return
 	}
 	cc := sub.ccTasked(sc)
-	forEachForwardingFAR(sc, func(far *smfctx.FAR) { setDuplication(far, cc) })
+	forEachForwardingFAR(sc, func(far *smfctx.FAR) {
+		if far.ApplyAction.Dupl == cc {
+			return
+		}
+		setDuplication(far, cc)
+		// At establishment the FAR is still RULE_INITIAL and is sent as a Create
+		// FAR carrying DUPL. On a re-invocation of SendPFCPRules for an already-
+		// installed session (ULCL path add / HO path-switch) it is RULE_CREATE, so
+		// mark it RULE_UPDATE — otherwise the modification builder's state switch
+		// skips it and the DUPL flip is never sent to the UPF (review R22).
+		if far.State == smfctx.RULE_CREATE {
+			far.State = smfctx.RULE_UPDATE
+		}
+	})
 }
 
 // forEachForwardingFAR invokes fn for every forwarding FAR across all of sc's
@@ -274,9 +312,10 @@ func (s *subsystem) scanSessions(task types.InterceptTask, fn func(*smfctx.SMCon
 		for _, sc := range matched {
 			sc.SMLock.Lock()
 			event := fn(sc)
+			corr := correlationOf(sc) // read under the lock (reads sc.PFCPContext)
 			sc.SMLock.Unlock()
 			if event != nil {
-				s.deliverIRI([]types.InterceptTask{task}, event)
+				s.deliverIRI([]types.InterceptTask{task}, corr, event)
 			}
 		}
 	}()
@@ -321,7 +360,7 @@ func sessionTargets(task types.InterceptTask, sc *smfctx.SMContext) bool {
 // deliverIRI encodes event once and delivers it as an X2 xIRI to every task in
 // tasks that wants IRI product. It is silent on any error (encoding or
 // delivery) so that interception can never be inferred from SMF behaviour.
-func (s *subsystem) deliverIRI(tasks []types.InterceptTask, event any) {
+func (s *subsystem) deliverIRI(tasks []types.InterceptTask, corr [8]byte, event any) {
 	if len(tasks) == 0 {
 		return
 	}
@@ -333,18 +372,54 @@ func (s *subsystem) deliverIRI(tasks []types.InterceptTask, event any) {
 		if !t.WantsProduct(types.ProductIRI) {
 			continue
 		}
-		if err := s.client.Send(&x2x3.PDU{
+		// Delivery is asynchronous (see Init): Send enqueues and returns, so this
+		// signalling path never blocks on the MDF; delivery failures are reported
+		// to the ADMF over X1 from the delivery worker, not here. The correlation
+		// ID lets the MDF join this xIRI to the session's xCC (review R20 / D12).
+		_ = s.client.Send(&x2x3.PDU{
 			Type:          x2x3.PDUTypeX2,
 			PayloadFormat: x2x3.PayloadFormat3GPP33128,
 			Direction:     x2x3.DirectionNotApplicable,
 			XID:           parseXID(t.XID),
+			CorrelationID: corr,
 			Payload:       payload,
-		}); err != nil && s.reporter != nil {
-			// MDF delivery failed — surface to the ADMF over X1 (throttled,
-			// NE-level, no target id), never to general logs.
-			_ = s.reporter.ReportNEIssue(x1.NEIssueMDFUnreachable, "MDF2 X2 delivery failed")
-		}
+		})
 	}
+}
+
+// correlationOf returns the X2 correlation identifier for sc's session: the
+// serving UPF's F-SEID encoded big-endian — the same value and byte order the UPF
+// stamps on the session's X3 xCC, so the MDF can join a session's xIRI and xCC
+// (review R20 / design D12). Best-effort: zero before the PFCP session is
+// established (the UPF-assigned SEID is not yet known), matching servingUPFTEID's
+// best-effort caveat. Caller holds sc.SMLock.
+func correlationOf(sc *smfctx.SMContext) [8]byte {
+	var corr [8]byte
+	binary.BigEndian.PutUint64(corr[:], servingUPFSEID(sc))
+	return corr
+}
+
+// servingUPFSEID returns the serving UPF's assigned F-SEID for sc's default data
+// path (the SMF's RemoteSEID for that UPF's PFCP session), or 0 if not yet
+// established. Uses the same default-path selector as servingUPFTEID so a
+// multi-path (ULCL) session anchors deterministically on the N3 UPF.
+func servingUPFSEID(sc *smfctx.SMContext) uint64 {
+	if sc.Tunnel == nil {
+		return 0
+	}
+	dp := sc.Tunnel.DataPathPool.GetDefaultPath()
+	if dp == nil {
+		return 0
+	}
+	node := dp.FirstDPNode
+	if node == nil || node.UPF == nil {
+		return 0
+	}
+	key := node.UPF.NodeID.ResolveNodeIdToIp().String()
+	if pfcpCtx, ok := sc.PFCPContext[key]; ok && pfcpCtx != nil {
+		return pfcpCtx.RemoteSEID
+	}
+	return 0
 }
 
 // matchingTasks returns the active tasks targeting any of sc's identifiers,

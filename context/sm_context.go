@@ -124,6 +124,11 @@ type SMContext struct {
 	// encountered a cycle via *context.GTPTunnel
 	Tunnel *UPTunnel `json:"-" yaml:"tunnel" bson:"-"`
 
+	// LiReleaseReported guards the Lawful Interception release xIRI against a
+	// double emit when a teardown traverses both the update-initiated delete and
+	// the dedicated release handler (review R21). Transient; not serialized.
+	LiReleaseReported bool `json:"-" yaml:"-" bson:"-"`
+
 	BPManager *BPManager `json:"bpManager,omitempty" yaml:"bpManager" bson:"bpManager,omitempty"` // ignore
 
 	DNNInfo *SnssaiSmfDnnInfo `json:"dnnInfo,omitempty" yaml:"dnnInfo" bson:"dnnInfo,omitempty"`
