@@ -39,7 +39,7 @@ type Config struct {
 	CACert   string //                            the LI CA trust anchor
 
 	AdmfURL          string        // ADMF X1 endpoint for NE-initiated issue reports (empty = disabled)
-	AdmfID           string        // the responsible ADMF's identifier (for reports)
+	AdmfID           string        // the responsible ADMF's identifier: authenticates inbound X1 peers and addresses outbound reports (empty accepts any certified ADMF)
 	KeepaliveTimeout time.Duration // purge tasking if no X1 message within this (0 = disabled)
 }
 
@@ -98,7 +98,11 @@ func Init(cfg Config) error {
 	// OnActivate/OnDeactivate scan already-established sessions when a warrant is
 	// (de)tasked mid-session (tasks 4.7/4.8): emit the "start with established PDU
 	// session" xIRI and (de)activate CC duplication on live sessions.
+	// WithADMF holds X1 peers to the responsible ADMF's identity: a certificate
+	// from the LI CA authenticates a peer, but only this identifier may task us
+	// (TS 103 221-1 clause 8.2.4 + error 1040).
 	x1srv := x1.NewServer(st, cfg.NEID,
+		x1.WithADMF(cfg.AdmfID),
 		x1.OnActivate(sub.reportStartOfInterception),
 		x1.OnDeactivate(sub.reportDeactivation))
 	// Bind the X1 listener synchronously so a bind/permission failure is reported
