@@ -144,8 +144,13 @@ func ModifySessionForLI(smContext *context.SMContext) error {
 		if !exist || sessionContext.RemoteSEID == 0 {
 			continue // no live PFCP session on this UPF yet — nothing to modify
 		}
+		// Only FARs are carried: LI flips the DUPL bit on existing forwarding FARs
+		// (marked RULE_UPDATE), so there is nothing to create or remove.
 		if err := message.SendPfcpSessionModificationRequest(
-			g.nodeID, smContext, nil, g.farList, nil, nil, g.port); err != nil && firstErr == nil {
+			g.nodeID, smContext,
+			nil, g.farList, nil, nil, // create/update: PDR, FAR, BAR, QER
+			nil, nil, nil, // remove: PDR, FAR, QER
+			g.port); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
