@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/omec-project/li/types"
 	"github.com/omec-project/li/x1"
@@ -71,6 +72,16 @@ type triggerRegistry struct {
 	installed map[string]types.XID
 }
 
+// liKeepaliveInterval is how often each triggered POI is told this triggering
+// function is still here.
+//
+// It must be comfortably shorter than the POI's own fail-safe window, since that
+// window is what protects against a triggering function that has died: too slow
+// and healthy tasking lapses, too fast and it costs a needless request. The POI's
+// timeout is its own configuration, so this is deliberately well inside any
+// sensible value rather than derived from it.
+const liKeepaliveInterval = 60 * time.Second
+
 // newTriggerRegistry builds the CC-TF's endpoints from configuration. A UPF with
 // no configured triggering endpoint cannot be tasked, so CC for a session it
 // serves is reported as a fault rather than silently skipped.
@@ -87,7 +98,26 @@ func newTriggerRegistry(cfg Config, clientTLS *tls.Config) *triggerRegistry {
 			did: newUUID(),
 		}
 	}
+
+	go reg.keepalive()
+
 	return reg
+}
+
+// keepalive tells every triggered POI, periodically, that this triggering function
+// is still present — which is what lets a POI safely purge tasking when it is not.
+// Failures are ignored here: a POI that cannot be reached will lapse its own
+// tasking, which is the outcome intended, and the trigger path reports the fault
+// when it next tries to task it.
+func (r *triggerRegistry) keepalive() {
+	ticker := time.NewTicker(liKeepaliveInterval)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		for _, endpoint := range r.endpoints {
+			_ = endpoint.req.Keepalive()
+		}
+	}
 }
 
 // upfSession is one UPF serving a session, with the detection criterion for that
