@@ -518,6 +518,12 @@ func HandlePfcpSessionEstablishmentResponse(msg *udp.Message) {
 			// content (review R32). At most once per session; silent no-op unless LI
 			// is configured. SMLock is held for the whole handler.
 			lawfulintercept.ReportEstablishment(smContext)
+			// Lawful Interception CC-TF: task this UPF's CC-POI for the session it
+			// has just created. The trigger's packet detection criterion is the
+			// F-SEID assigned by this response, so this is the earliest point it can
+			// be sent — the duplication instruction itself rode out with the request
+			// (design D14). The X1 exchange runs off this goroutine.
+			lawfulintercept.TriggerCC(smContext)
 
 			smContext.SBIPFCPCommunicationChan <- smf_context.SessionEstablishSuccess
 			smContext.SubPfcpLog.Infoln("PFCP Session Establishment accepted")

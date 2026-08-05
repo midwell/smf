@@ -86,9 +86,25 @@ type Li struct {
 	Key      string `yaml:"key"`      // its private key
 	CACert   string `yaml:"caCert"`   // the LI CA trust anchor
 
+	// MDF3 is the X3 destination this SMF, as CC Triggering Function, provisions at
+	// each UPF it triggers. The UPF is told where to deliver content over LI_T3 and
+	// carries no MDF3 address of its own.
+	MDF3 string `yaml:"mdf3"`
+	// UPFTriggers lists the LI_T3 triggering endpoints of the UPFs whose CC-POIs
+	// this SMF may task. Keyed by N4 node address because the trigger must reach
+	// the UPF serving the session; the NE identifier cannot be derived from the URL.
+	UPFTriggers []LiUPFTrigger `yaml:"upfTriggers"`
+
 	AdmfURL          string `yaml:"admfUrl"`          // ADMF X1 endpoint for NE-initiated issue reports (optional)
 	AdmfID           string `yaml:"admfId"`           // responsible ADMF identifier (for reports)
 	KeepaliveTimeout string `yaml:"keepaliveTimeout"` // duration; purge tasking if no X1 message within it (optional)
+}
+
+// LiUPFTrigger is one UPF's LI_T3 triggering endpoint.
+type LiUPFTrigger struct {
+	NodeID string `yaml:"nodeId"` // the UPF's N4 node address
+	X1URL  string `yaml:"x1Url"`  // its LI_T3 endpoint, e.g. https://upf-1:8443/X1/NE
+	NEID   string `yaml:"neId"`   // the identifier its certificate is bound to
 }
 
 type StaticIpInfo struct {

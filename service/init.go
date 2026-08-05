@@ -159,9 +159,16 @@ func (smf *SMF) Start() {
 		// needs (tasks 4.7/4.8). Done before Init mounts the X1 listener so the
 		// hook is in place before any tasking can arrive.
 		lawfulintercept.SetSessionModifier(producer.ModifySessionForLI)
+		triggers := make([]lawfulintercept.UPFTrigger, 0, len(li.UPFTriggers))
+		for _, t := range li.UPFTriggers {
+			triggers = append(triggers, lawfulintercept.UPFTrigger{
+				NodeID: t.NodeID, X1URL: t.X1URL, NEID: t.NEID,
+			})
+		}
 		if err := lawfulintercept.Init(lawfulintercept.Config{
 			X1Listen: li.X1Listen, MDF2: li.MDF2, NEID: li.NEID,
 			Cert: li.Cert, Key: li.Key, CACert: li.CACert,
+			MDF3: li.MDF3, UPFTriggers: triggers,
 			AdmfURL: li.AdmfURL, AdmfID: li.AdmfID, KeepaliveTimeout: kaTimeout,
 		}); err != nil {
 			// Do not name the subsystem or echo err (which carries LI-identifying

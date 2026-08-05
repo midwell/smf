@@ -40,6 +40,16 @@ type Config struct {
 	Key      string //                            its private key
 	CACert   string //                            the LI CA trust anchor
 
+	// MDF3 is the X3 delivery destination this CC-TF provisions at each triggered
+	// CC-POI (TS 33.128 table 6.2.3-6: the trigger names destinations by DID, which
+	// the triggering function configures beforehand). The UPF no longer carries an
+	// MDF3 address of its own.
+	MDF3 string
+	// UPFTriggers lists the LI_T3 triggering endpoints of the UPFs this SMF may
+	// serve sessions with. A UPF absent from this list cannot be tasked, so CC on a
+	// session it serves is reported to the LIPF as a fault rather than skipped.
+	UPFTriggers []UPFTrigger
+
 	AdmfURL          string        // ADMF X1 endpoint for NE-initiated issue reports (empty = disabled)
 	AdmfID           string        // the responsible ADMF's identifier: authenticates inbound X1 peers and addresses outbound reports (empty accepts any certified ADMF)
 	KeepaliveTimeout time.Duration // purge tasking if no X1 message within this (0 = disabled)
@@ -51,12 +61,26 @@ type sender interface {
 	Send(*x2x3.PDU) error
 }
 
+// taskIssueReporter reports a fault with one interception task to the LIPF
+// (TS 33.128 clause 5.2.6). An interface, like sender above, so tests can assert
+// what the LIPF would be told without standing up an ADMF.
+type taskIssueReporter interface {
+	ReportTaskIssue(xid, reportType, details string) error
+}
+
 type subsystem struct {
 	store    *store.Store
 	client   sender
 	iriCtx   *liasn1.Context
 	neID     string
 	reporter *x1.Reporter // nil when NE-initiated reporting is not configured
+	// taskReporter reports per-task faults; nil when no ADMF is configured.
+	taskReporter taskIssueReporter
+	// triggers is the CC Triggering Function's state: one X1 client per UPF, plus
+	// the trigger tasks installed there. Nil when no triggering endpoints are
+	// configured, in which case CC duplication is still applied but the UPF is
+	// never told whose warrant it serves — so it delivers nothing.
+	triggers *triggerRegistry
 }
 
 // active holds the running subsystem, or nil when LI is not configured.
@@ -96,6 +120,14 @@ func Init(cfg Config) error {
 		iriCtx:   iri.NewContext(),
 		neID:     cfg.NEID,
 		reporter: reporter,
+	}
+	// Assign the interface only when a reporter exists: a typed-nil would pass the
+	// nil check in reportTaskIssue and then panic on use.
+	if reporter != nil {
+		sub.taskReporter = reporter
+	}
+	if len(cfg.UPFTriggers) > 0 {
+		sub.triggers = newTriggerRegistry(cfg, mat.ClientTLS())
 	}
 	// OnActivate/OnDeactivate scan already-established sessions when a warrant is
 	// (de)tasked mid-session (tasks 4.7/4.8): emit the "start with established PDU
@@ -303,6 +335,9 @@ func (s *subsystem) reportStartOfInterception(task types.InterceptTask) {
 		if s.applyCC(sc) {
 			s.modifySession(sc)
 		}
+		// Task the serving UPFs for this warrant too: the FARs now duplicate, but
+		// without a trigger the copies carry no warrant identity (review R34).
+		s.triggerCC(sc)
 		return event
 	})
 }
@@ -322,6 +357,10 @@ func (s *subsystem) reportDeactivation(task types.InterceptTask) {
 		}
 		return nil
 	})
+	// Withdraw this warrant's triggers wherever they were installed. Unlike the
+	// FAR state, which is re-evaluated against the remaining task set, a trigger
+	// belongs to exactly one warrant and goes with it.
+	s.untriggerWarrant(task.XID)
 }
 
 // scanSessions finds every live session targeted by task, then processes each in

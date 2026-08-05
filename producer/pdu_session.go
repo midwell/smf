@@ -473,8 +473,10 @@ func HandlePDUSessionSMContextUpdate(eventData interface{}) error {
 			smContext.SubPduSessLog.Infoln("PDUSessionSMContextUpdate, send PFCP Deletion")
 
 			// Lawful Interception IRI-POI: an update-initiated release of the PDU
-			// session — emit an SMFPDUSessionRelease xIRI for a tasked target.
+			// session — emit an SMFPDUSessionRelease xIRI for a tasked target, and
+			// withdraw the CC-TF's triggers from the UPFs that served it.
 			lawfulintercept.ReportRelease(smContext)
+			lawfulintercept.UntriggerCC(smContext)
 			smContext.ChangeState(smf_context.SmStatePfcpRelease)
 			smContext.SubCtxLog.Debugln("PDUSessionSMContextUpdate, SMContextState Change State:", smContext.SMContextState.String())
 
@@ -630,9 +632,11 @@ func HandlePDUSessionSMContextRelease(eventData interface{}) error {
 	smContext.SubPduSessLog.Infof("PDUSessionSMContextRelease, PDU Session SMContext Release received")
 
 	// Lawful Interception IRI-POI: emit an SMFPDUSessionRelease xIRI for a tasked
-	// target before the session state is torn down. Silent no-op unless LI is
-	// configured.
+	// target before the session state is torn down, and withdraw the CC-TF's
+	// triggers from the UPFs that served it (TS 33.128 clause 6.2.3.3.1). Silent
+	// no-op unless LI is configured.
 	lawfulintercept.ReportRelease(smContext)
+	lawfulintercept.UntriggerCC(smContext)
 
 	// Send Policy delete
 	metrics.IncrementSvcPcfMsgStats(smf_context.SMF_Self().NfInstanceID, string(svcmsgtypes.SmPolicyAssociationDelete), "Out", "", "")
