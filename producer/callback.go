@@ -16,6 +16,7 @@ import (
 	"github.com/omec-project/openapi/v2/utils"
 	"github.com/omec-project/smf/consumer"
 	smfContext "github.com/omec-project/smf/context"
+	"github.com/omec-project/smf/lawfulintercept"
 	"github.com/omec-project/smf/logger"
 	"github.com/omec-project/smf/qos"
 	"github.com/omec-project/smf/transaction"
@@ -278,6 +279,8 @@ func BuildPfcpParam(smContext *smfContext.SMContext) *pfcpParam {
 			}
 			ulFAR := ulPDR.FAR
 			if ulFAR != nil {
+				// Replaces the whole ApplyAction, so a tasked session's content
+				// duplication is cleared here; re-evaluated below (review R31).
 				ulFAR.ApplyAction = smfContext.ApplyAction{Forw: true}
 				ulFAR.ForwardingParameters = &smfContext.ForwardingParameters{
 					DestinationInterface: smfContext.DestinationInterface{
@@ -286,6 +289,11 @@ func BuildPfcpParam(smContext *smfContext.SMContext) *pfcpParam {
 					NetworkInstance: []byte(smContext.Dnn),
 				}
 			}
+
+			// Reactivating forwarding above dropped the duplication bit; restore it
+			// from the current task state before the rules are sent. Silent no-op
+			// when LI is inactive.
+			lawfulintercept.ApplyCCTrigger(smContext)
 
 			// Append to PFCP param lists
 			pfcpParam.pdrList = append(pfcpParam.pdrList, ulPDR)

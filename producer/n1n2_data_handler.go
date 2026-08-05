@@ -16,6 +16,7 @@ import (
 	"github.com/omec-project/openapi/v2/models"
 	"github.com/omec-project/smf/consumer"
 	"github.com/omec-project/smf/context"
+	"github.com/omec-project/smf/lawfulintercept"
 	"github.com/omec-project/smf/smferrors"
 	"github.com/omec-project/smf/transaction"
 	"github.com/omec-project/smf/util"
@@ -552,6 +553,16 @@ func HandleUpdateN2Msg(txn *transaction.Transaction, response *models.UpdateSmCo
 				smContext.SubPduSessLog.Errorf("PDUSessionSMContextUpdate, handle PDUSessionResourceSetupResponseTransfer failed: %+v", err)
 			}
 		}
+
+		// The downlink FAR only becomes a forwarding FAR here, and the assignment
+		// above replaces its whole ApplyAction — including clearing Dupl. Both
+		// matter for Lawful Interception: content duplication is only ever applied
+		// to forwarding FARs, so at establishment the downlink one is skipped and
+		// the interception would carry uplink only; and on an already-tasked session
+		// this would silently switch downlink duplication back off. Re-evaluating
+		// here puts the FAR's duplication state right before it is sent, in the same
+		// modification. Silent and a no-op when LI is inactive. (Review R31.)
+		lawfulintercept.ApplyCCTrigger(smContext)
 
 		pfcpParam.pdrList = append(pfcpParam.pdrList, pdrList...)
 		pfcpParam.farList = append(pfcpParam.farList, farList...)

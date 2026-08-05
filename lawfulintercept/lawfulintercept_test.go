@@ -243,6 +243,66 @@ func TestApplyCCTriggerMarksInstalledFARForUpdate(t *testing.T) {
 	}
 }
 
+// TestApplyCCTriggerRecoversAfterFARReactivation covers R31. Several SMF paths
+// reconfigure a FAR by replacing its whole ApplyAction — the downlink FAR becoming
+// a forwarding FAR once the RAN tunnel is known, a data-notification reactivating
+// the uplink FAR, a ULCL path activation — and each of those assignments sets
+// Dupl false.
+//
+// Two consequences, both silent. A downlink FAR is not a forwarding FAR at
+// establishment, so the trigger skips it and the interception carries uplink only
+// until something re-evaluates. And on a session already tasked, the same
+// assignment switches duplication back off. The trigger is authoritative over
+// DUPL, so calling it after any such reconfiguration restores the correct state;
+// this pins that it actually does.
+func TestApplyCCTriggerRecoversAfterFARReactivation(t *testing.T) {
+	activateWith(t, types.InterceptTask{
+		XID:      "task-cc",
+		Target:   types.TargetIdentifier{Type: types.TargetSUPI, Value: "262019876543210"},
+		Products: []types.ProductType{types.ProductCC},
+		State:    types.TaskActive,
+	})
+
+	// A downlink FAR as created at establishment: buffering, not forwarding.
+	far := &smfctx.FAR{
+		ApplyAction: smfctx.ApplyAction{Buff: true, Nocp: true},
+		State:       smfctx.RULE_INITIAL,
+	}
+	sc := ccSession(far)
+
+	ApplyCCTrigger(sc)
+	if far.ApplyAction.Dupl {
+		t.Error("a buffering FAR must not be duplicated")
+	}
+
+	// The RAN tunnel arrives and the FAR becomes forwarding, the assignment
+	// clearing Dupl as the real code does.
+	far.ApplyAction = smfctx.ApplyAction{Forw: true}
+	far.State = smfctx.RULE_UPDATE
+
+	ApplyCCTrigger(sc)
+	if !far.ApplyAction.Dupl {
+		t.Fatal("downlink FAR: DUPL not applied once it became forwarding — the MDF would receive uplink only")
+	}
+	if far.DuplicatingParameters == nil {
+		t.Error("downlink FAR: Duplicating Parameters missing")
+	}
+
+	// And on an already-duplicating FAR, a reactivation that clears Dupl must be
+	// recovered rather than left off.
+	far.ApplyAction = smfContextApplyActionForwardOnly()
+	ApplyCCTrigger(sc)
+	if !far.ApplyAction.Dupl {
+		t.Error("duplication was not restored after the FAR was reactivated")
+	}
+}
+
+// smfContextApplyActionForwardOnly is the shape the SMF assigns when it
+// reactivates forwarding: everything else, including Dupl, reset to false.
+func smfContextApplyActionForwardOnly() smfctx.ApplyAction {
+	return smfctx.ApplyAction{Forw: true}
+}
+
 // TestReportReleaseDeduplicates covers R21: a teardown that reaches both the
 // update-initiated delete and the dedicated release handler must emit only one
 // SMFPDUSessionRelease xIRI.
