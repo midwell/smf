@@ -15,6 +15,7 @@ import (
 	"github.com/omec-project/smf/consumer"
 	smf_context "github.com/omec-project/smf/context"
 	"github.com/omec-project/smf/factory"
+	"github.com/omec-project/smf/lawfulintercept"
 	"github.com/omec-project/smf/logger"
 	"github.com/omec-project/smf/metrics"
 	"github.com/omec-project/smf/pfcp/ies"
@@ -510,6 +511,14 @@ func HandlePfcpSessionEstablishmentResponse(msg *udp.Message) {
 			return
 		}
 		if causeValue == ie.CauseRequestAccepted {
+			// Lawful Interception IRI-POI: the session now exists on the UPF, so its
+			// F-SEID (the X2 correlation identifier) and F-TEID are known — both were
+			// set above from this response. Emitting here rather than when the SBI
+			// create returns is what makes the record joinable to the session's
+			// content (review R32). At most once per session; silent no-op unless LI
+			// is configured. SMLock is held for the whole handler.
+			lawfulintercept.ReportEstablishment(smContext)
+
 			smContext.SBIPFCPCommunicationChan <- smf_context.SessionEstablishSuccess
 			smContext.SubPfcpLog.Infoln("PFCP Session Establishment accepted")
 		} else {

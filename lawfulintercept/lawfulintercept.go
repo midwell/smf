@@ -129,11 +129,29 @@ func Init(cfg Config) error {
 // ReportEstablishment emits an SMFPDUSessionEstablishment xIRI for sc if it
 // matches an active task. No-op and silent when LI is inactive or sc is not a
 // target.
+//
+// Call this once the UPF has answered the PFCP Session Establishment Request, not
+// when the SBI create returns. The record carries the session's F-TEID and its X2
+// correlation identifier is the F-SEID, and neither exists until the UPF has
+// assigned them — emitting at the SBI point produced a record with a zero TEID
+// and a zero correlation, so the one record that describes the session to the MDF
+// was the one record that could not be joined to that session's content
+// (review R32).
+//
+// Emitted at most once per session: a session spanning several UPFs draws an
+// establishment response from each. Caller holds sc.SMLock.
 func ReportEstablishment(sc *smfctx.SMContext) {
 	sub := active.Load()
 	if sub == nil || sc == nil {
 		return
 	}
+
+	if sc.LiEstablishmentReported {
+		return
+	}
+
+	sc.LiEstablishmentReported = true
+
 	sub.deliverIRI(sub.matchingTasks(sc), correlationOf(sc), smfEstablishment(sc))
 }
 

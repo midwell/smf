@@ -406,11 +406,11 @@ func HandlePDUSessionSMContextCreate(eventData interface{}) error {
 
 	smContext.SubPduSessLog.Infof("PDUSessionSMContextCreate, PDU session context create success ")
 
-	// Lawful Interception IRI-POI: the PDU session is established (data path
-	// activated, UE IP and serving UPF known), so emit an
-	// SMFPDUSessionEstablishment xIRI for a tasked target. Silent no-op unless LI
-	// is configured.
-	lawfulintercept.ReportEstablishment(smContext)
+	// The Lawful Interception establishment xIRI is deliberately NOT emitted here.
+	// This point does not wait for the UPF's PFCP Session Establishment Response,
+	// so the session's F-SEID and F-TEID do not exist yet, and a record emitted
+	// here carried zeroes for both — leaving it unjoinable to the session's own
+	// content. It is emitted from the response handler instead (review R32).
 
 	return nil
 	// TODO: UECM registration

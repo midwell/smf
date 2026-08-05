@@ -303,6 +303,30 @@ func smfContextApplyActionForwardOnly() smfctx.ApplyAction {
 	return smfctx.ApplyAction{Forw: true}
 }
 
+// TestReportEstablishmentEmitsOnce covers R32's guard. The record is now emitted
+// from the PFCP establishment-response handler, which runs once per UPF, so a
+// session spanning several UPFs would otherwise produce one record per response.
+func TestReportEstablishmentEmitsOnce(t *testing.T) {
+	cap := &captureSender{}
+	st := store.New()
+	st.Activate(types.InterceptTask{
+		XID:      "task-iri",
+		Target:   types.TargetIdentifier{Type: types.TargetSUPI, Value: "262019876543210"},
+		Products: []types.ProductType{types.ProductIRI},
+		State:    types.TaskActive,
+	})
+	active.Store(&subsystem{store: st, client: cap, iriCtx: iri.NewContext(), neID: "ne"})
+	t.Cleanup(func() { active.Store(nil) })
+
+	sc := targetSM()
+	ReportEstablishment(sc)
+	ReportEstablishment(sc) // a second UPF's response must not emit again
+
+	if len(cap.pdus) != 1 {
+		t.Errorf("establishment emitted %d records, want exactly 1", len(cap.pdus))
+	}
+}
+
 // TestReportReleaseDeduplicates covers R21: a teardown that reaches both the
 // update-initiated delete and the dedicated release handler must emit only one
 // SMFPDUSessionRelease xIRI.

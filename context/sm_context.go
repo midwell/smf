@@ -129,6 +129,13 @@ type SMContext struct {
 	// the dedicated release handler (review R21). Transient; not serialized.
 	LiReleaseReported bool `json:"-" yaml:"-" bson:"-"`
 
+	// LiEstablishmentReported guards the Lawful Interception establishment xIRI,
+	// which is emitted when the UPF answers the PFCP Session Establishment Request
+	// — the point at which the session's F-SEID and F-TEID first exist. A session
+	// spanning several UPFs draws a response from each, so without this the record
+	// would be emitted once per UPF (review R32). Transient; not serialized.
+	LiEstablishmentReported bool `json:"-" yaml:"-" bson:"-"`
+
 	BPManager *BPManager `json:"bpManager,omitempty" yaml:"bpManager" bson:"bpManager,omitempty"` // ignore
 
 	DNNInfo *SnssaiSmfDnnInfo `json:"dnnInfo,omitempty" yaml:"dnnInfo" bson:"dnnInfo,omitempty"`
