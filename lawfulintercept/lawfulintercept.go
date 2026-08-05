@@ -168,6 +168,15 @@ func Init(cfg Config) error {
 		go x1srv.WatchKeepalive(cfg.KeepaliveTimeout)
 	}
 	active.Store(sub)
+	// Tasking lives in memory, so this element has just discarded every warrant it
+	// held. Nothing else tells the ADMF that — it goes on believing the
+	// interceptions it provisioned are running — and the standard's audit path is a
+	// query it has to think to make. Saying so on the way up is the one push signal
+	// available (review R38).
+	if reporter != nil && st.Len() == 0 {
+		_ = reporter.ReportNEIssue(x1.NEIssueTaskingAbsent,
+			"network function started with interception enabled and no tasking present")
+	}
 	return nil
 }
 
