@@ -12,6 +12,8 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"io"
+	"log"
 	"net"
 	"net/http"
 	"slices"
@@ -115,7 +117,18 @@ func Init(cfg Config) error {
 		}
 		return fmt.Errorf("lawful interception: X1 listen on %s: %w", cfg.X1Listen, err)
 	}
-	srv := &http.Server{Handler: x1srv, TLSConfig: mat.ServerTLS()}
+	srv := &http.Server{
+		Handler:   x1srv,
+		TLSConfig: mat.ServerTLS(),
+		// net/http writes server errors to the default logger when ErrorLog is
+		// unset, so a failed handshake on this interface printed "http: TLS
+		// handshake error from <addr>: remote error: tls: bad certificate" to the
+		// general operator log — publishing the LI domain's address and marking
+		// this NF as running a mutually-authenticated listener nothing else in its
+		// configuration explains. Discard it; faults on the LI plane go to the ADMF
+		// over X1 (design D11), the only channel entitled to know (review R35).
+		ErrorLog: log.New(io.Discard, "", 0),
+	}
 	// Certificates come from TLSConfig, so the file arguments are empty.
 	go func() { _ = srv.ServeTLS(ln, "", "") }()
 	// Keepalive fail-safe: purge tasking if the ADMF goes silent (TS 103 221-1).
