@@ -230,13 +230,28 @@ func (s *subsystem) installTriggers(ref string, tasks []types.InterceptTask, upf
 				continue
 			}
 
-			err := endpoint.req.ActivateTask(x1.Trigger{
+			trigger := x1.Trigger{
 				XID:           xid,
 				ProductID:     t.XID,
 				CorrelationID: correlation,
 				SEID:          u.seid,
 				DIDs:          []string{endpoint.did},
-			})
+			}
+
+			err := endpoint.req.ActivateTask(trigger)
+			if err != nil {
+				// A refusal may mean the POI has lost the destination we provisioned —
+				// it restarts independently of us, and its destinations do not survive
+				// that. Re-provision and try once more before concluding the
+				// interception cannot be arranged: the alternative is content dropped
+				// at the POI for as long as this process happens to live (review R37).
+				endpoint.forgetDestination()
+
+				if again := s.ensureDestination(endpoint); again == nil {
+					err = endpoint.req.ActivateTask(trigger)
+				}
+			}
+
 			if err != nil {
 				// Drop the bookkeeping so a later establishment or modification
 				// retries, and tell the LIPF this warrant is producing no content.
@@ -282,6 +297,15 @@ func (s *subsystem) deactivate(byNode map[string][]types.XID) {
 			_ = endpoint.req.DeactivateTask(xid)
 		}
 	}
+}
+
+// forgetDestination drops the belief that this POI still holds our destination, so
+// the next trigger re-provisions it. A POI restart is a routine event and takes its
+// destination registry with it.
+func (e *upfEndpoint) forgetDestination() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.destinationReady = false
 }
 
 // ensureDestination provisions this CC-TF's MDF3 destination at the UPF, once.

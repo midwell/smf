@@ -25,6 +25,10 @@ type fakePOI struct {
 	refuse   bool // answer every request with an error
 	srv      *httptest.Server
 	requests int
+	// refuseUntilProvisioned models a POI that has restarted: it refuses a trigger
+	// naming a destination it does not hold, and accepts once one is created again.
+	refuseUntilProvisioned bool
+	provisioned            bool
 }
 
 func newFakePOI(t *testing.T) *fakePOI {
@@ -38,6 +42,14 @@ func newFakePOI(t *testing.T) *fakePOI {
 		p.bodies = append(p.bodies, string(body))
 		p.requests++
 		refuse := p.refuse
+		if p.refuseUntilProvisioned {
+			switch {
+			case strings.Contains(string(body), "CreateDestinationRequest"):
+				p.provisioned = true
+			case !p.provisioned:
+				refuse = true
+			}
+		}
 		p.mu.Unlock()
 
 		if refuse {
@@ -366,6 +378,49 @@ func TestTakeForSessionAndWarrant(t *testing.T) {
 		if !strings.HasPrefix(key, "warrant-b|") {
 			t.Errorf("a non-warrant-b trigger survived: %q", key)
 		}
+	}
+}
+
+// TestInstallTriggersReprovisionsAfterRestart is review R37: a POI restarts
+// independently of this triggering function and takes the destination we
+// provisioned with it. Believing otherwise meant every later trigger named a
+// destination the POI no longer knew, so it duplicated the subject's traffic and
+// discarded every copy while we were told interception was running.
+func TestInstallTriggersReprovisionsAfterRestart(t *testing.T) {
+	poi := newFakePOI(t)
+	s := triggerSubsystem(poi, "10.0.1.5")
+	s.taskReporter = &recordingTaskReporter{}
+
+	warrant := types.InterceptTask{
+		XID:      "11111111-1111-4111-8111-111111111111",
+		Products: []types.ProductType{types.ProductCC},
+	}
+
+	// First session: destination provisioned, trigger accepted.
+	s.installTriggers("session-1", []types.InterceptTask{warrant},
+		[]upfSession{{nodeID: "10.0.1.5", seid: 42}}, 7)
+
+	if n := poi.countMessages("CreateDestinationRequest"); n != 1 {
+		t.Fatalf("CreateDestination sent %d times, want 1", n)
+	}
+
+	// The POI restarts: it has forgotten the destination, so it now refuses a
+	// trigger naming it — which is the only way we can find out.
+	poi.mu.Lock()
+	poi.refuseUntilProvisioned = true
+	poi.mu.Unlock()
+
+	s.installTriggers("session-2", []types.InterceptTask{warrant},
+		[]upfSession{{nodeID: "10.0.1.5", seid: 43}}, 9)
+
+	// We must have re-provisioned rather than given up.
+	if n := poi.countMessages("CreateDestinationRequest"); n != 2 {
+		t.Errorf("CreateDestination sent %d times, want a second after the refusal", n)
+	}
+
+	// And the interception must now be installed, not abandoned.
+	if len(s.triggers.installed) != 2 {
+		t.Errorf("installed = %d, want both sessions tasked after the retry", len(s.triggers.installed))
 	}
 }
 
