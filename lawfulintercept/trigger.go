@@ -104,6 +104,22 @@ func newTriggerRegistry(cfg Config, clientTLS *tls.Config) *triggerRegistry {
 	return reg
 }
 
+// reconcile withdraws tasking a POI still holds from a previous life of this
+// process.
+//
+// This is the case the keepalive fail-safe cannot cover. That fail-safe protects
+// against a triggering function that is *gone*; one that has *restarted* is
+// present, resumes keepalives within the minute, and so leaves behind triggers
+// belonging to warrants the new process knows nothing about — and therefore can
+// never withdraw, not even when the warrant is revoked (review R40).
+//
+// Withdrawing everything found is safe because of the authorisation model, not by
+// assumption: a POI accepts tasking from exactly one triggering function
+// (x1.WithADMF at the POI), so whatever it holds came from this one. **If a POI is
+// ever allowed more than one triggering function, this needs provenance instead.**
+//
+// Run once, at startup, off the caller's goroutine: it is network I/O against every
+// configured POI, and nothing else waits on it.
 // keepalive tells every triggered POI, periodically, that this triggering function
 // is still present — which is what lets a POI safely purge tasking when it is not.
 // Failures are ignored here: a POI that cannot be reached will lapse its own
@@ -116,6 +132,37 @@ func (r *triggerRegistry) keepalive() {
 	for range ticker.C {
 		for _, endpoint := range r.endpoints {
 			_ = endpoint.req.Keepalive()
+		}
+	}
+}
+
+func (s *subsystem) reconcileTriggers() {
+	if s.triggers == nil {
+		return
+	}
+
+	for _, endpoint := range s.triggers.endpoints {
+		xids, err := endpoint.req.TaskXIDs()
+		if err != nil {
+			// The POI may simply not be up yet. Leaving stale tasking in place is the
+			// thing to avoid, so this is worth telling the LIPF about — naming no
+			// warrant, because which warrants they were is precisely what was lost.
+			s.reportTaskIssue("", "could not reconcile content tasking with a UPF after restart")
+
+			continue
+		}
+
+		for _, xid := range xids {
+			// Skip anything this process has itself installed. Reconciliation runs
+			// concurrently with ordinary triggering, so a session establishing right
+			// now would otherwise have its brand-new trigger withdrawn by the cleanup.
+			if s.triggers.holds(xid) {
+				continue
+			}
+
+			// Nothing here knows about this one, which after a restart means all of
+			// it. Withdrawing is the only way it ever stops.
+			_ = endpoint.req.DeactivateTask(xid)
 		}
 	}
 }
@@ -398,6 +445,22 @@ func (r *triggerRegistry) claim(key string) (types.XID, bool) {
 	xid := types.XID(newUUID())
 	r.installed[key] = xid
 	return xid, true
+}
+
+// holds reports whether this process installed the given trigger. The registry is
+// keyed by (warrant, session, UPF), so this is a scan — it runs once per
+// reconciliation, over a set the size of the live interceptions.
+func (r *triggerRegistry) holds(xid types.XID) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for _, installed := range r.installed {
+		if installed == xid {
+			return true
+		}
+	}
+
+	return false
 }
 
 // release forgets a trigger that could not be installed, so a later attempt

@@ -29,6 +29,9 @@ type fakePOI struct {
 	// naming a destination it does not hold, and accepts once one is created again.
 	refuseUntilProvisioned bool
 	provisioned            bool
+	// holds is the tasking this POI reports when asked, which is how a restarted
+	// triggering function discovers what it left behind.
+	holds []string
 }
 
 func newFakePOI(t *testing.T) *fakePOI {
@@ -51,6 +54,24 @@ func newFakePOI(t *testing.T) *fakePOI {
 			}
 		}
 		p.mu.Unlock()
+
+		if strings.Contains(string(body), "GetAllDetailsRequest") {
+			p.mu.Lock()
+			held := append([]string(nil), p.holds...)
+			p.mu.Unlock()
+
+			var details string
+			for _, xid := range held {
+				details += `<x1:taskResponseDetails><x1:taskDetails><x1:xId>` + xid +
+					`</x1:xId></x1:taskDetails><x1:taskStatus>Active</x1:taskStatus></x1:taskResponseDetails>`
+			}
+
+			_, _ = w.Write([]byte(`<?xml version="1.0"?><x1:X1Response xmlns:x1="http://uri.etsi.org/03221/X1/2017/10">` +
+				`<x1:x1ResponseMessage>` + details + `<x1:oK>AcknowledgedAndCompleted</x1:oK>` +
+				`</x1:x1ResponseMessage></x1:X1Response>`))
+
+			return
+		}
 
 		if refuse {
 			_, _ = w.Write([]byte(`<?xml version="1.0"?><X1Response xmlns="http://uri.etsi.org/03221/X1/2017/10">` +
@@ -421,6 +442,60 @@ func TestInstallTriggersReprovisionsAfterRestart(t *testing.T) {
 	// And the interception must now be installed, not abandoned.
 	if len(s.triggers.installed) != 2 {
 		t.Errorf("installed = %d, want both sessions tasked after the retry", len(s.triggers.installed))
+	}
+}
+
+// TestReconcileWithdrawsTaskingFromAPreviousLife is review R40: after a restart
+// this process has no record of the triggers it installed, while the POI still
+// holds them — and tasking nobody can withdraw does not stop, not even when the
+// warrant is revoked. The keepalive fail-safe cannot cover it, because a restarted
+// triggering function is alive.
+func TestReconcileWithdrawsTaskingFromAPreviousLife(t *testing.T) {
+	poi := newFakePOI(t)
+	poi.mu.Lock()
+	poi.holds = []string{"aaaaaaaa-1111-4111-8111-111111111111", "bbbbbbbb-2222-4222-8222-222222222222"}
+	poi.mu.Unlock()
+
+	s := triggerSubsystem(poi, "10.0.1.5")
+	s.taskReporter = &recordingTaskReporter{}
+
+	s.reconcileTriggers()
+
+	// Both must be withdrawn: this process installed neither.
+	if n := poi.countMessages("DeactivateTaskRequest"); n != 2 {
+		t.Errorf("sent %d deactivations, want 2 — stale tasking would keep running", n)
+	}
+}
+
+// TestReconcileLeavesThisProcesssOwnTasking guards the race the ownership check
+// exists for: reconciliation runs alongside ordinary triggering, so a session
+// establishing at that moment must not have its brand-new trigger cleaned up.
+func TestReconcileLeavesThisProcesssOwnTasking(t *testing.T) {
+	poi := newFakePOI(t)
+	s := triggerSubsystem(poi, "10.0.1.5")
+	s.taskReporter = &recordingTaskReporter{}
+
+	warrant := types.InterceptTask{
+		XID:      "11111111-1111-4111-8111-111111111111",
+		Products: []types.ProductType{types.ProductCC},
+	}
+	s.installTriggers("session-1", []types.InterceptTask{warrant},
+		[]upfSession{{nodeID: "10.0.1.5", seid: 42}}, 7)
+
+	// The POI reports exactly what this process just installed.
+	var mine []string
+	for _, xid := range s.triggers.installed {
+		mine = append(mine, string(xid))
+	}
+
+	poi.mu.Lock()
+	poi.holds = mine
+	poi.mu.Unlock()
+
+	s.reconcileTriggers()
+
+	if n := poi.countMessages("DeactivateTaskRequest"); n != 0 {
+		t.Errorf("sent %d deactivations for tasking this process installed itself", n)
 	}
 }
 

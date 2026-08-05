@@ -128,6 +128,10 @@ func Init(cfg Config) error {
 	}
 	if len(cfg.UPFTriggers) > 0 {
 		sub.triggers = newTriggerRegistry(cfg, mat.ClientTLS())
+		// A POI may still hold triggers from this process's previous life, which it
+		// has no record of and could never withdraw — including after the warrant is
+		// revoked (review R40).
+		go sub.reconcileTriggers()
 	}
 	// OnActivate/OnDeactivate scan already-established sessions when a warrant is
 	// (de)tasked mid-session (tasks 4.7/4.8): emit the "start with established PDU
