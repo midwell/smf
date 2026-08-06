@@ -39,7 +39,7 @@ func newFakePOI(t *testing.T) *fakePOI {
 
 	p := &fakePOI{}
 	p.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, _ := io.ReadAll(r.Body)
+		body, _ := io.ReadAll(r.Body) //nolint:errcheck // test
 
 		p.mu.Lock()
 		p.bodies = append(p.bodies, string(body))
@@ -66,6 +66,7 @@ func newFakePOI(t *testing.T) *fakePOI {
 					`</x1:xId></x1:taskDetails><x1:taskStatus>Active</x1:taskStatus></x1:taskResponseDetails>`
 			}
 
+			//nolint:errcheck // test handler write
 			_, _ = w.Write([]byte(`<?xml version="1.0"?><x1:X1Response xmlns:x1="http://uri.etsi.org/03221/X1/2017/10">` +
 				`<x1:x1ResponseMessage>` + details + `<x1:oK>AcknowledgedAndCompleted</x1:oK>` +
 				`</x1:x1ResponseMessage></x1:X1Response>`))
@@ -74,6 +75,7 @@ func newFakePOI(t *testing.T) *fakePOI {
 		}
 
 		if refuse {
+			//nolint:errcheck // test handler write
 			_, _ = w.Write([]byte(`<?xml version="1.0"?><X1Response xmlns="http://uri.etsi.org/03221/X1/2017/10">` +
 				`<x1ResponseMessage><errorInformation><errorCode>1000</errorCode>` +
 				`<errorDescription>refused</errorDescription></errorInformation></x1ResponseMessage></X1Response>`))
@@ -81,6 +83,7 @@ func newFakePOI(t *testing.T) *fakePOI {
 			return
 		}
 
+		//nolint:errcheck // test handler write
 		_, _ = w.Write([]byte(`<?xml version="1.0"?><X1Response xmlns="http://uri.etsi.org/03221/X1/2017/10">` +
 			`<x1ResponseMessage><oK>AcknowledgedAndCompleted</oK></x1ResponseMessage></X1Response>`))
 	}))
@@ -111,12 +114,12 @@ func (p *fakePOI) countMessages(msgType string) int {
 
 // triggerSubsystem builds a subsystem whose only configured capability is CC
 // triggering, pointed at poi.
-func triggerSubsystem(poi *fakePOI, nodeID string) *subsystem {
+func triggerSubsystem(poi *fakePOI) *subsystem {
 	cfg := Config{
 		NEID: "smf-1",
 		MDF3: "10.0.60.122:42069",
 		UPFTriggers: []UPFTrigger{
-			{NodeID: nodeID, X1URL: poi.srv.URL, NEID: "upf-1"},
+			{NodeID: "10.0.1.5", X1URL: poi.srv.URL, NEID: "upf-1"},
 		},
 	}
 
@@ -132,7 +135,7 @@ func triggerSubsystem(poi *fakePOI, nodeID string) *subsystem {
 // destination it references.
 func TestInstallTriggersSendsWarrantIdentity(t *testing.T) {
 	poi := newFakePOI(t)
-	s := triggerSubsystem(poi, "10.0.1.5")
+	s := triggerSubsystem(poi)
 
 	warrant := types.InterceptTask{
 		XID:      "11111111-1111-4111-8111-111111111111",
@@ -186,7 +189,7 @@ func TestInstallTriggersSendsWarrantIdentity(t *testing.T) {
 // session would make it deliver every packet twice.
 func TestInstallTriggersIsIdempotent(t *testing.T) {
 	poi := newFakePOI(t)
-	s := triggerSubsystem(poi, "10.0.1.5")
+	s := triggerSubsystem(poi)
 
 	warrant := types.InterceptTask{
 		XID:      "11111111-1111-4111-8111-111111111111",
@@ -256,7 +259,7 @@ func TestInstallTriggersReportsRefusal(t *testing.T) {
 	poi := newFakePOI(t)
 	poi.refuse = true
 
-	s := triggerSubsystem(poi, "10.0.1.5")
+	s := triggerSubsystem(poi)
 	rec := &recordingTaskReporter{}
 	s.taskReporter = rec
 
@@ -290,7 +293,7 @@ func TestInstallTriggersRetriesAfterFailure(t *testing.T) {
 	poi := newFakePOI(t)
 	poi.refuse = true
 
-	s := triggerSubsystem(poi, "10.0.1.5")
+	s := triggerSubsystem(poi)
 	s.taskReporter = &recordingTaskReporter{}
 
 	warrant := types.InterceptTask{
@@ -321,7 +324,7 @@ func TestInstallTriggersRetriesAfterFailure(t *testing.T) {
 // authorised and will produce nothing, so it must not pass silently.
 func TestInstallTriggersReportsMissingEndpoint(t *testing.T) {
 	poi := newFakePOI(t)
-	s := triggerSubsystem(poi, "10.0.1.5")
+	s := triggerSubsystem(poi)
 	rec := &recordingTaskReporter{}
 	s.taskReporter = rec
 
@@ -409,7 +412,7 @@ func TestTakeForSessionAndWarrant(t *testing.T) {
 // discarded every copy while we were told interception was running.
 func TestInstallTriggersReprovisionsAfterRestart(t *testing.T) {
 	poi := newFakePOI(t)
-	s := triggerSubsystem(poi, "10.0.1.5")
+	s := triggerSubsystem(poi)
 	s.taskReporter = &recordingTaskReporter{}
 
 	warrant := types.InterceptTask{
@@ -456,7 +459,7 @@ func TestReconcileWithdrawsTaskingFromAPreviousLife(t *testing.T) {
 	poi.holds = []string{"aaaaaaaa-1111-4111-8111-111111111111", "bbbbbbbb-2222-4222-8222-222222222222"}
 	poi.mu.Unlock()
 
-	s := triggerSubsystem(poi, "10.0.1.5")
+	s := triggerSubsystem(poi)
 	s.taskReporter = &recordingTaskReporter{}
 
 	s.reconcileTriggers()
@@ -472,7 +475,7 @@ func TestReconcileWithdrawsTaskingFromAPreviousLife(t *testing.T) {
 // establishing at that moment must not have its brand-new trigger cleaned up.
 func TestReconcileLeavesThisProcesssOwnTasking(t *testing.T) {
 	poi := newFakePOI(t)
-	s := triggerSubsystem(poi, "10.0.1.5")
+	s := triggerSubsystem(poi)
 	s.taskReporter = &recordingTaskReporter{}
 
 	warrant := types.InterceptTask{
@@ -508,8 +511,6 @@ type taskReport struct {
 	xid, reportType, details string
 }
 
-func (r *recordingTaskReporter) ReportTaskIssue(xid, reportType, details string) error {
+func (r *recordingTaskReporter) NotifyTask(xid, reportType, details string) {
 	r.reports = append(r.reports, taskReport{xid, reportType, details})
-
-	return nil
 }

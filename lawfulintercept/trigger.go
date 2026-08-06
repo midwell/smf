@@ -131,6 +131,9 @@ func (r *triggerRegistry) keepalive() {
 
 	for range ticker.C {
 		for _, endpoint := range r.endpoints {
+			// Best-effort: a missed keepalive is transient, and a POI that has really
+			// gone away trips its own fail-safe; nothing here to act on per tick.
+			//nolint:errcheck // periodic keepalive; a single miss is not actionable
 			_ = endpoint.req.Keepalive()
 		}
 	}
@@ -150,7 +153,7 @@ func (s *subsystem) reconcileTriggers() {
 			// element-level issue, not a task one: a task report has to name an XID,
 			// and which warrants they were is precisely what was lost.
 			if s.reporter != nil {
-				_ = s.reporter.ReportNEIssue(x1.NEIssueReconcileFailed,
+				s.reporter.Notify(x1.NEIssueReconcileFailed,
 					"could not establish what content tasking a UPF still holds after restart")
 			}
 
@@ -167,6 +170,7 @@ func (s *subsystem) reconcileTriggers() {
 
 			// Nothing here knows about this one, which after a restart means all of
 			// it. Withdrawing is the only way it ever stops.
+			//nolint:errcheck // best-effort withdrawal; a stale trigger that resists is covered by the reconcile fault report
 			_ = endpoint.req.DeactivateTask(xid)
 		}
 	}
@@ -376,6 +380,7 @@ func (s *subsystem) deactivate(byNode map[string][]types.XID) {
 			continue
 		}
 		for _, xid := range xids {
+			//nolint:errcheck // best-effort withdrawal; a stale trigger that resists is covered by the reconcile fault report
 			_ = endpoint.req.DeactivateTask(xid)
 		}
 	}
@@ -426,7 +431,7 @@ func (s *subsystem) ensureDestination(endpoint *upfEndpoint) error {
 // the target, and never reaches a general log.
 func (s *subsystem) reportTaskIssue(warrant types.XID, details string) {
 	if s.taskReporter != nil {
-		_ = s.taskReporter.ReportTaskIssue(string(warrant), x1.TaskReportTerminatingFault, details)
+		s.taskReporter.NotifyTask(string(warrant), x1.TaskReportTerminatingFault, details)
 	}
 }
 
@@ -539,6 +544,7 @@ func (s *subsystem) untriggerWarrant(warrant types.XID) {
 // XID and a DID.
 func newUUID() string {
 	var b [16]byte
+	//nolint:errcheck // crypto/rand.Read never returns an error
 	_, _ = rand.Read(b[:])
 	b[6] = (b[6] & 0x0f) | 0x40 // version 4
 	b[8] = (b[8] & 0x3f) | 0x80 // RFC 4122 variant

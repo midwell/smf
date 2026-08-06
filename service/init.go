@@ -154,7 +154,7 @@ func (smf *SMF) Start() {
 	// Lawful Interception IRI-POI: start only when the opt-in Li config is
 	// present; silent otherwise.
 	if li := factory.SmfConfig.Configuration.Li; li != nil {
-		kaTimeout, _ := time.ParseDuration(li.KeepaliveTimeout)
+		kaTimeout, _ := time.ParseDuration(li.KeepaliveTimeout) //nolint:errcheck // empty or invalid duration yields 0 = keepalive disabled
 		// Inject the PFCP session-modification hook the mid-session CC trigger
 		// needs (tasks 4.7/4.8). Done before Init mounts the X1 listener so the
 		// hook is in place before any tasking can arrive.

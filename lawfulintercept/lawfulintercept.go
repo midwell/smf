@@ -9,6 +9,7 @@
 package lawfulintercept
 
 import (
+	"context"
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
@@ -62,7 +63,7 @@ type sender interface {
 // (TS 33.128 clause 5.2.6). An interface, like sender above, so tests can assert
 // what the LIPF would be told without standing up an ADMF.
 type taskIssueReporter interface {
-	ReportTaskIssue(xid, reportType, details string) error
+	NotifyTask(xid, reportType, details string)
 }
 
 type subsystem struct {
@@ -106,7 +107,7 @@ func Init(cfg Config) error {
 		x2x3.NewClient(cfg.MDF2, mat.ClientTLS()), 0,
 		func(error) {
 			if reporter != nil {
-				_ = reporter.ReportNEIssue(x1.NEIssueMDFUnreachable, "MDF2 X2 delivery failed")
+				reporter.Notify(x1.NEIssueMDFUnreachable, "MDF2 X2 delivery failed")
 			}
 		},
 		nil, // drops are covered by the same MDF-unreachable report from the worker
@@ -146,17 +147,19 @@ func Init(cfg Config) error {
 		x1.OnDeactivate(sub.reportDeactivation),
 		x1.OnAuthFailure(func(code int) {
 			if sub.reporter != nil {
-				_ = sub.reporter.ReportNEIssue(x1.NEIssueX1AuthFailed,
+				sub.reporter.Notify(x1.NEIssueX1AuthFailed,
 					fmt.Sprintf("X1 provisioning refused: peer failed authentication (error %d)", code))
 			}
 		}))
 	// Bind the X1 listener synchronously so a bind/permission failure is reported
 	// to the caller, rather than being swallowed in a goroutine while LI already
 	// looks enabled (active.Store below) — otherwise no X1 tasking can be received.
-	ln, err := net.Listen("tcp", cfg.X1Listen)
+	// ListenConfig.Listen rather than net.Listen so the listen carries a context
+	// (the linter's noctx rule); the bind is otherwise unchanged.
+	ln, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", cfg.X1Listen)
 	if err != nil {
 		if sub.reporter != nil {
-			_ = sub.reporter.ReportNEIssue(x1.NEIssueX1ListenFailed, "X1 listener bind failed")
+			sub.reporter.Notify(x1.NEIssueX1ListenFailed, "X1 listener bind failed")
 		}
 		return fmt.Errorf("lawful interception: X1 listen on %s: %w", cfg.X1Listen, err)
 	}
@@ -166,7 +169,9 @@ func Init(cfg Config) error {
 	// peer can hold connections open until this element can no longer be untasked
 	// (review R42).
 	srv := x1.NewListener(x1srv, mat.ServerTLS())
-	// Certificates come from TLSConfig, so the file arguments are empty.
+	// Certificates come from TLSConfig, so the file arguments are empty. ServeTLS
+	// blocks until the listener closes; the bind already succeeded above.
+	//nolint:errcheck // serve-until-close; a bind failure already surfaced above
 	go func() { _ = srv.ServeTLS(ln, "", "") }()
 	// Keepalive fail-safe: purge tasking if the ADMF goes silent (TS 103 221-1).
 	if cfg.KeepaliveTimeout > 0 {
@@ -179,7 +184,7 @@ func Init(cfg Config) error {
 	// query it has to think to make. Saying so on the way up is the one push signal
 	// available (review R38).
 	if reporter != nil && st.Len() == 0 {
-		_ = reporter.ReportNEIssue(x1.NEIssueTaskingAbsent,
+		reporter.Notify(x1.NEIssueTaskingAbsent,
 			"network function started with interception enabled and no tasking present")
 	}
 	return nil
@@ -435,6 +440,7 @@ func (s *subsystem) applyCC(sc *smfctx.SMContext) bool {
 // Caller holds sc.SMLock.
 func (s *subsystem) modifySession(sc *smfctx.SMContext) {
 	if sessionModifier != nil {
+		//nolint:errcheck // failure surfaces through normal PFCP handling, never a target-revealing log
 		_ = sessionModifier(sc)
 	}
 }
@@ -464,6 +470,7 @@ func (s *subsystem) deliverIRI(tasks []types.InterceptTask, corr [8]byte, event 
 		// signalling path never blocks on the MDF; delivery failures are reported
 		// to the ADMF over X1 from the delivery worker, not here. The correlation
 		// ID lets the MDF join this xIRI to the session's xCC (review R20 / D12).
+		//nolint:errcheck // async enqueue; delivery failures report via the worker, not here
 		_ = s.client.Send(&x2x3.PDU{
 			Type:          x2x3.PDUTypeX2,
 			PayloadFormat: x2x3.PayloadFormat3GPP33128,

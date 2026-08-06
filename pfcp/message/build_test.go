@@ -273,7 +273,7 @@ func TestBuildEstablishmentWithDuplicatingParameters(t *testing.T) {
 		t.Fatalf("build: %v", err)
 	}
 	buf := make([]byte, msg.MarshalLen())
-	if err := msg.MarshalTo(buf); err != nil {
+	if err = msg.MarshalTo(buf); err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
 	req, err := pfcp_message.ParseSessionEstablishmentRequest(buf)
