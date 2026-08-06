@@ -144,10 +144,15 @@ func (s *subsystem) reconcileTriggers() {
 	for _, endpoint := range s.triggers.endpoints {
 		xids, err := endpoint.req.TaskXIDs()
 		if err != nil {
-			// The POI may simply not be up yet. Leaving stale tasking in place is the
-			// thing to avoid, so this is worth telling the LIPF about — naming no
-			// warrant, because which warrants they were is precisely what was lost.
-			s.reportTaskIssue("", "could not reconcile content tasking with a UPF after restart")
+			// The POI may simply not be up yet — on a whole-cluster restart it very
+			// likely is not. Worth telling the LIPF either way, because tasking may
+			// have been left behind that this process cannot withdraw. Reported as an
+			// element-level issue, not a task one: a task report has to name an XID,
+			// and which warrants they were is precisely what was lost.
+			if s.reporter != nil {
+				_ = s.reporter.ReportNEIssue(x1.NEIssueReconcileFailed,
+					"could not establish what content tasking a UPF still holds after restart")
+			}
 
 			continue
 		}
