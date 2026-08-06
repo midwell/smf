@@ -12,10 +12,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
-	"io"
-	"log"
 	"net"
-	"net/http"
 	"slices"
 	"strings"
 	"sync/atomic"
@@ -139,10 +136,20 @@ func Init(cfg Config) error {
 	// WithADMF holds X1 peers to the responsible ADMF's identity: a certificate
 	// from the LI CA authenticates a peer, but only this identifier may task us
 	// (TS 103 221-1 clause 8.2.4 + error 1040).
+	// A peer that fails that check is refused, and — since this plane deliberately
+	// logs nothing — would otherwise be refused in complete silence. The ADMF is the
+	// only party entitled to hear that someone is trying to task its network
+	// elements under an identity that is not theirs (review R44).
 	x1srv := x1.NewServer(st, cfg.NEID,
 		x1.WithADMF(cfg.AdmfID),
 		x1.OnActivate(sub.reportStartOfInterception),
-		x1.OnDeactivate(sub.reportDeactivation))
+		x1.OnDeactivate(sub.reportDeactivation),
+		x1.OnAuthFailure(func(code int) {
+			if sub.reporter != nil {
+				_ = sub.reporter.ReportNEIssue(x1.NEIssueX1AuthFailed,
+					fmt.Sprintf("X1 provisioning refused: peer failed authentication (error %d)", code))
+			}
+		}))
 	// Bind the X1 listener synchronously so a bind/permission failure is reported
 	// to the caller, rather than being swallowed in a goroutine while LI already
 	// looks enabled (active.Store below) — otherwise no X1 tasking can be received.
@@ -153,18 +160,12 @@ func Init(cfg Config) error {
 		}
 		return fmt.Errorf("lawful interception: X1 listen on %s: %w", cfg.X1Listen, err)
 	}
-	srv := &http.Server{
-		Handler:   x1srv,
-		TLSConfig: mat.ServerTLS(),
-		// net/http writes server errors to the default logger when ErrorLog is
-		// unset, so a failed handshake on this interface printed "http: TLS
-		// handshake error from <addr>: remote error: tls: bad certificate" to the
-		// general operator log — publishing the LI domain's address and marking
-		// this NF as running a mutually-authenticated listener nothing else in its
-		// configuration explains. Discard it; faults on the LI plane go to the ADMF
-		// over X1 (design D11), the only channel entitled to know (review R35).
-		ErrorLog: log.New(io.Discard, "", 0),
-	}
+	// NewListener supplies the properties every X1 endpoint needs and none of the
+	// three network functions should be trusted to remember separately: a discarded
+	// error log (review R35) and per-phase timeouts, without which an unauthenticated
+	// peer can hold connections open until this element can no longer be untasked
+	// (review R42).
+	srv := x1.NewListener(x1srv, mat.ServerTLS())
 	// Certificates come from TLSConfig, so the file arguments are empty.
 	go func() { _ = srv.ServeTLS(ln, "", "") }()
 	// Keepalive fail-safe: purge tasking if the ADMF goes silent (TS 103 221-1).
