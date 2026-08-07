@@ -508,3 +508,48 @@ func TestSessionTargets(t *testing.T) {
 		t.Error("a non-matching SUPI must not match")
 	}
 }
+
+// TestEstablishmentReportsTheRealRequestAndAccessType: both fields are mandatory
+// in the TS 33.128 establishment record and both used to be hard-coded, so every
+// session reached the law-enforcement agency described as an initial request over
+// 3GPP access — hiding an emergency session, and misstating whether the UE asked
+// for a new session or resumed an existing one.
+func TestEstablishmentReportsTheRealRequestAndAccessType(t *testing.T) {
+	cases := []struct {
+		request models.RequestType
+		access  models.AccessType
+		wantReq iri.FiveGSMRequestType
+		wantAcc iri.AccessType
+	}{
+		{models.REQUESTTYPE_INITIAL_REQUEST, models.ACCESSTYPE__3_GPP_ACCESS, iri.SMRequestInitial, iri.AccessThreeGPP},
+		{models.REQUESTTYPE_EXISTING_PDU_SESSION, models.ACCESSTYPE__3_GPP_ACCESS, iri.SMRequestExisting, iri.AccessThreeGPP},
+		{models.REQUESTTYPE_INITIAL_EMERGENCY_REQUEST, models.ACCESSTYPE__3_GPP_ACCESS, iri.SMRequestInitialEmergency, iri.AccessThreeGPP},
+		{models.REQUESTTYPE_EXISTING_EMERGENCY_PDU_SESSION, models.ACCESSTYPE_NON_3_GPP_ACCESS, iri.SMRequestExistingEmergency, iri.AccessNonThreeGPP},
+		// An unset request type is the closest thing to "initial" available, but the
+		// access type must still be reported as configured.
+		{"", models.ACCESSTYPE_NON_3_GPP_ACCESS, iri.SMRequestInitial, iri.AccessNonThreeGPP},
+	}
+
+	for _, c := range cases {
+		sc := targetSM()
+		sc.RequestType = c.request
+		sc.AnType = c.access
+
+		rec := smfEstablishment(sc)
+		if rec.RequestType != c.wantReq {
+			t.Errorf("RequestType for %q = %d, want %d", c.request, rec.RequestType, c.wantReq)
+		}
+		if rec.AccessType != c.wantAcc {
+			t.Errorf("AccessType for %q = %d, want %d", c.access, rec.AccessType, c.wantAcc)
+		}
+
+		// The modification and start-of-interception records carry the same access
+		// type; their request types are fixed by what the record means.
+		if got := smfModification(sc).AccessType; got != c.wantAcc {
+			t.Errorf("modification AccessType for %q = %d, want %d", c.access, got, c.wantAcc)
+		}
+		if got := smfStartOfInterception(sc).AccessType; got != c.wantAcc {
+			t.Errorf("start-of-interception AccessType for %q = %d, want %d", c.access, got, c.wantAcc)
+		}
+	}
+}

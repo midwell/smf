@@ -4,9 +4,7 @@
 package lawfulintercept
 
 import (
-	"crypto/rand"
 	"crypto/tls"
-	"fmt"
 	"net"
 	"strconv"
 	"strings"
@@ -105,7 +103,7 @@ func newTriggerRegistry(cfg Config, clientTLS *tls.Config) *triggerRegistry {
 		reg.endpoints[key] = &upfEndpoint{
 			req: x1.NewRequester(t.X1URL, cfg.NEID, t.NEID, clientTLS),
 			// One destination per UPF, named by a DID this CC-TF allocates.
-			did: newUUID(),
+			did: x1.NewUUID(),
 		}
 	}
 
@@ -114,22 +112,6 @@ func newTriggerRegistry(cfg Config, clientTLS *tls.Config) *triggerRegistry {
 	return reg
 }
 
-// reconcile withdraws tasking a POI still holds from a previous life of this
-// process.
-//
-// This is the case the keepalive fail-safe cannot cover. That fail-safe protects
-// against a triggering function that is *gone*; one that has *restarted* is
-// present, resumes keepalives within the minute, and so leaves behind triggers
-// belonging to warrants the new process knows nothing about — and therefore can
-// never withdraw, not even when the warrant is revoked (review R40).
-//
-// Withdrawing everything found is safe because of the authorisation model, not by
-// assumption: a POI accepts tasking from exactly one triggering function
-// (x1.WithADMF at the POI), so whatever it holds came from this one. **If a POI is
-// ever allowed more than one triggering function, this needs provenance instead.**
-//
-// Run once, at startup, off the caller's goroutine: it is network I/O against every
-// configured POI, and nothing else waits on it.
 // keepalive tells every triggered POI, periodically, that this triggering function
 // is still present — which is what lets a POI safely purge tasking when it is not.
 // Failures are ignored here: a POI that cannot be reached will lapse its own
@@ -149,6 +131,22 @@ func (r *triggerRegistry) keepalive() {
 	}
 }
 
+// reconcileTriggers withdraws tasking a POI still holds from a previous life of
+// this process.
+//
+// This is the case the keepalive fail-safe cannot cover. That fail-safe protects
+// against a triggering function that is *gone*; one that has *restarted* is
+// present, resumes keepalives within the minute, and so leaves behind triggers
+// belonging to warrants the new process knows nothing about — and therefore can
+// never withdraw, not even when the warrant is revoked (review R40).
+//
+// Withdrawing everything found is safe because of the authorisation model, not by
+// assumption: a POI accepts tasking from exactly one triggering function
+// (x1.WithADMF at the POI), so whatever it holds came from this one. **If a POI is
+// ever allowed more than one triggering function, this needs provenance instead.**
+//
+// Run once, at startup, off the caller's goroutine: it is network I/O against every
+// configured POI, and nothing else waits on it.
 func (s *subsystem) reconcileTriggers() {
 	if s.triggers == nil {
 		return
@@ -288,72 +286,66 @@ func (s *subsystem) triggerCC(sc *smfctx.SMContext) {
 	// this SMF puts on the session's xIRI, so every UPF serving the session must
 	// stamp the same one for the MDF to join content to signalling (design D12).
 	// Only the detection criterion is per UPF.
-	correlation := servingUPFSEID(sc)
-	ref := sc.Ref
+	planned, unreachable := s.triggers.plan(sc.Ref, tasks, upfs, servingUPFSEID(sc))
 
-	go s.installTriggers(ref, tasks, upfs, correlation)
+	// A UPF we have no triggering endpoint for is carrying a tasked session's
+	// traffic and cannot be told whose warrant it serves. The interception is
+	// authorised and will produce nothing, which only the LIPF can resolve.
+	for _, warrant := range unreachable {
+		s.reportTaskIssue(warrant, "no triggering endpoint configured for a UPF serving the target")
+	}
+
+	if len(planned) == 0 {
+		return
+	}
+
+	go s.installTriggers(planned)
 }
 
-// installTriggers performs the X1 exchanges off the signalling path.
-func (s *subsystem) installTriggers(ref string, tasks []types.InterceptTask, upfs []upfSession, correlation uint64) {
-	for _, u := range upfs {
-		endpoint, ok := s.triggers.endpoints[u.nodeID]
-		if !ok {
-			// A UPF we have no triggering endpoint for is carrying a tasked
-			// session's traffic and cannot be told whose warrant it serves. The
-			// interception is authorised and will produce nothing, which only the
-			// LIPF can resolve.
-			for _, t := range tasks {
-				s.reportTaskIssue(t.XID, "no triggering endpoint configured for a UPF serving the target")
-			}
+// installTriggers performs the X1 exchanges off the signalling path. Every
+// trigger it is given has already been claimed in the registry by triggerCC, so
+// the withdrawal path can see it even before it exists at the POI.
+func (s *subsystem) installTriggers(planned []plannedTrigger) {
+	for _, p := range planned {
+		if err := s.ensureDestination(p.endpoint); err != nil {
+			s.triggers.release(p.key)
+			s.reportTaskIssue(p.warrant, "X3 delivery destination could not be provisioned at the UPF")
+
 			continue
 		}
 
-		if err := s.ensureDestination(endpoint); err != nil {
-			for _, t := range tasks {
-				s.reportTaskIssue(t.XID, "X3 delivery destination could not be provisioned at the UPF")
+		err := p.endpoint.req.ActivateTask(p.trigger)
+		if err != nil {
+			// A refusal may mean the POI has lost the destination we provisioned —
+			// it restarts independently of us, and its destinations do not survive
+			// that. Re-provision and try once more before concluding the
+			// interception cannot be arranged: the alternative is content dropped
+			// at the POI for as long as this process happens to live (review R37).
+			p.endpoint.forgetDestination()
+
+			if again := s.ensureDestination(p.endpoint); again == nil {
+				err = p.endpoint.req.ActivateTask(p.trigger)
 			}
+		}
+
+		if err != nil {
+			// Drop the bookkeeping so a later establishment or modification
+			// retries, and tell the LIPF this warrant is producing no content.
+			s.triggers.release(p.key)
+			s.reportTaskIssue(p.warrant, "the UPF refused or failed the content-interception trigger")
+
 			continue
 		}
 
-		for _, t := range tasks {
-			key := triggerKey(t.XID, ref, u.nodeID)
-			xid, fresh := s.triggers.claim(key)
-			if !fresh {
-				// Already tasked for this warrant, session and UPF. The detection
-				// criterion is the session's SEID, which does not change for the life
-				// of the PFCP session, so there is nothing a ModifyTask would update.
-				continue
-			}
-
-			trigger := x1.Trigger{
-				XID:           xid,
-				ProductID:     t.XID,
-				CorrelationID: correlation,
-				SEID:          u.seid,
-				DIDs:          []string{endpoint.did},
-			}
-
-			err := endpoint.req.ActivateTask(trigger)
-			if err != nil {
-				// A refusal may mean the POI has lost the destination we provisioned —
-				// it restarts independently of us, and its destinations do not survive
-				// that. Re-provision and try once more before concluding the
-				// interception cannot be arranged: the alternative is content dropped
-				// at the POI for as long as this process happens to live (review R37).
-				endpoint.forgetDestination()
-
-				if again := s.ensureDestination(endpoint); again == nil {
-					err = endpoint.req.ActivateTask(trigger)
-				}
-			}
-
-			if err != nil {
-				// Drop the bookkeeping so a later establishment or modification
-				// retries, and tell the LIPF this warrant is producing no content.
-				s.triggers.release(key)
-				s.reportTaskIssue(t.XID, "the UPF refused or failed the content-interception trigger")
-			}
+		// The session may have been released, or the warrant withdrawn, in the time
+		// this trigger took to install. That withdrawal ran against a registry entry
+		// whose trigger did not yet exist at the POI, so whatever it sent was refused
+		// and the trigger is now in place with nothing tracking it: reconciliation
+		// runs only at startup, and the POI's fail-safe only fires once this SMF
+		// stops answering it, so nothing would ever take it down. Withdraw it here.
+		if !s.triggers.stillHolds(p.key, p.trigger.XID) {
+			//nolint:errcheck // best-effort withdrawal; the POI's fail-safe is the last resort
+			_ = p.endpoint.req.DeactivateTask(p.trigger.XID)
 		}
 	}
 }
@@ -451,20 +443,91 @@ func triggerKey(warrant types.XID, ref, nodeID string) string {
 	return string(warrant) + "|" + ref + "|" + nodeID
 }
 
-// claim allocates the trigger XID for key, reporting whether this caller is the
-// one that must install it. Concurrent establishment and mid-session activation
-// can both reach the same triple, and tasking a POI twice for one session would
-// have it deliver each packet twice.
-func (r *triggerRegistry) claim(key string) (types.XID, bool) {
+// plannedTrigger is one trigger this CC-TF has claimed and is about to install.
+type plannedTrigger struct {
+	endpoint *upfEndpoint
+	key      string
+	// warrant is the XID of the warrant this trigger serves — what a task issue
+	// names, as opposed to trigger.XID, which is this CC-TF's own.
+	warrant types.XID
+	trigger x1.Trigger
+}
+
+// plan claims a trigger XID for every (warrant, session, UPF) triple that does
+// not already have one, and returns the triggers to install together with the
+// warrants whose serving UPF has no configured triggering endpoint.
+//
+// Claiming happens here rather than in the install goroutine because the caller
+// holds the session lock, and that is what orders it against untriggerCC taking
+// the same session's triggers away. Claiming later let a release that ran first
+// find nothing to withdraw, after which the install put a trigger at the POI that
+// nothing would ever remove — tasking outliving the session it was for, which is
+// exactly what must not exist.
+//
+// A triple that is already claimed is skipped: concurrent establishment and
+// mid-session activation can both reach it, and tasking a POI twice for one
+// session would have it deliver each packet twice. The detection criterion is the
+// session's SEID, which does not change for the life of the PFCP session, so there
+// is nothing a ModifyTask would update.
+//
+// A zero correlation identifier means the anchor's PFCP session does not exist
+// yet, so nothing can be planned: a trigger without it is refused by x1.Trigger,
+// and reporting that refusal to the LIPF would describe a session that is merely
+// still coming up as an interception that has failed. The anchor's establishment
+// response brings the CC-TF back here.
+func (r *triggerRegistry) plan(
+	ref string, tasks []types.InterceptTask, upfs []upfSession, correlation uint64,
+) (planned []plannedTrigger, unreachable []types.XID) {
+	if correlation == 0 {
+		return nil, nil
+	}
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if xid, ok := r.installed[key]; ok {
-		return xid, false
+	for _, u := range upfs {
+		endpoint, ok := r.endpoints[u.nodeID]
+		if !ok {
+			for _, t := range tasks {
+				unreachable = append(unreachable, t.XID)
+			}
+
+			continue
+		}
+
+		for _, t := range tasks {
+			key := triggerKey(t.XID, ref, u.nodeID)
+			if _, held := r.installed[key]; held {
+				continue
+			}
+
+			xid := types.XID(x1.NewUUID())
+			r.installed[key] = xid
+			planned = append(planned, plannedTrigger{
+				endpoint: endpoint,
+				key:      key,
+				warrant:  t.XID,
+				trigger: x1.Trigger{
+					XID:           xid,
+					ProductID:     t.XID,
+					CorrelationID: correlation,
+					SEID:          u.seid,
+					DIDs:          []string{endpoint.did},
+				},
+			})
+		}
 	}
-	xid := types.XID(newUUID())
-	r.installed[key] = xid
-	return xid, true
+
+	return planned, unreachable
+}
+
+// stillHolds reports whether key is still claimed by xid — false once the session
+// has been released or the warrant withdrawn.
+func (r *triggerRegistry) stillHolds(key string, xid types.XID) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return r.installed[key] == xid
 }
 
 // holds reports whether this process installed the given trigger. The registry is
@@ -548,15 +611,4 @@ func (s *subsystem) untriggerWarrant(warrant types.XID) {
 	}
 
 	go s.deactivate(byNode)
-}
-
-// newUUID returns a random RFC 4122 v4 UUID, the form TS 103 221-1 requires of an
-// XID and a DID.
-func newUUID() string {
-	var b [16]byte
-	//nolint:errcheck // crypto/rand.Read never returns an error
-	_, _ = rand.Read(b[:])
-	b[6] = (b[6] & 0x0f) | 0x40 // version 4
-	b[8] = (b[8] & 0x3f) | 0x80 // RFC 4122 variant
-	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }

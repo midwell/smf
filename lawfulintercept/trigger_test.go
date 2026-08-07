@@ -142,7 +142,7 @@ func TestInstallTriggersSendsWarrantIdentity(t *testing.T) {
 		Products: []types.ProductType{types.ProductCC},
 	}
 
-	s.installTriggers("session-ref-1",
+	s.installFor("session-ref-1",
 		[]types.InterceptTask{warrant},
 		[]upfSession{{nodeID: "10.0.1.5", seid: 14426627323429955319}},
 		0x2632898145f4d191)
@@ -197,8 +197,8 @@ func TestInstallTriggersIsIdempotent(t *testing.T) {
 	}
 	upfs := []upfSession{{nodeID: "10.0.1.5", seid: 42}}
 
-	s.installTriggers("session-ref-1", []types.InterceptTask{warrant}, upfs, 7)
-	s.installTriggers("session-ref-1", []types.InterceptTask{warrant}, upfs, 7)
+	s.installFor("session-ref-1", []types.InterceptTask{warrant}, upfs, 7)
+	s.installFor("session-ref-1", []types.InterceptTask{warrant}, upfs, 7)
 
 	if n := poi.countMessages("ActivateTaskRequest"); n != 1 {
 		t.Errorf("ActivateTask sent %d times for one session, want once", n)
@@ -230,7 +230,7 @@ func TestInstallTriggersPerUPFAndWarrant(t *testing.T) {
 	}
 	upfs := []upfSession{{nodeID: "10.0.1.5", seid: 42}, {nodeID: "10.0.1.6", seid: 43}}
 
-	s.installTriggers("session-ref-1", warrants, upfs, 7)
+	s.installFor("session-ref-1", warrants, upfs, 7)
 
 	// 2 warrants x 2 UPFs.
 	if n := poi.countMessages("ActivateTaskRequest"); n != 4 {
@@ -268,7 +268,7 @@ func TestInstallTriggersReportsRefusal(t *testing.T) {
 		Products: []types.ProductType{types.ProductCC},
 	}
 
-	s.installTriggers("session-ref-1", []types.InterceptTask{warrant},
+	s.installFor("session-ref-1", []types.InterceptTask{warrant},
 		[]upfSession{{nodeID: "10.0.1.5", seid: 42}}, 7)
 
 	if len(rec.reports) != 1 {
@@ -302,7 +302,7 @@ func TestInstallTriggersRetriesAfterFailure(t *testing.T) {
 	}
 	upfs := []upfSession{{nodeID: "10.0.1.5", seid: 42}}
 
-	s.installTriggers("session-ref-1", []types.InterceptTask{warrant}, upfs, 7)
+	s.installFor("session-ref-1", []types.InterceptTask{warrant}, upfs, 7)
 
 	if len(s.triggers.installed) != 0 {
 		t.Fatalf("a refused trigger was recorded as installed: %+v", s.triggers.installed)
@@ -312,7 +312,7 @@ func TestInstallTriggersRetriesAfterFailure(t *testing.T) {
 	poi.refuse = false
 	poi.mu.Unlock()
 
-	s.installTriggers("session-ref-1", []types.InterceptTask{warrant}, upfs, 7)
+	s.installFor("session-ref-1", []types.InterceptTask{warrant}, upfs, 7)
 
 	if len(s.triggers.installed) != 1 {
 		t.Errorf("installed = %d after a successful retry, want 1", len(s.triggers.installed))
@@ -334,7 +334,7 @@ func TestInstallTriggersReportsMissingEndpoint(t *testing.T) {
 	}
 
 	// A UPF absent from the configured triggering endpoints.
-	s.installTriggers("session-ref-1", []types.InterceptTask{warrant},
+	s.installFor("session-ref-1", []types.InterceptTask{warrant},
 		[]upfSession{{nodeID: "10.0.9.9", seid: 42}}, 7)
 
 	if poi.requests != 0 {
@@ -421,7 +421,7 @@ func TestInstallTriggersReprovisionsAfterRestart(t *testing.T) {
 	}
 
 	// First session: destination provisioned, trigger accepted.
-	s.installTriggers("session-1", []types.InterceptTask{warrant},
+	s.installFor("session-1", []types.InterceptTask{warrant},
 		[]upfSession{{nodeID: "10.0.1.5", seid: 42}}, 7)
 
 	if n := poi.countMessages("CreateDestinationRequest"); n != 1 {
@@ -434,7 +434,7 @@ func TestInstallTriggersReprovisionsAfterRestart(t *testing.T) {
 	poi.refuseUntilProvisioned = true
 	poi.mu.Unlock()
 
-	s.installTriggers("session-2", []types.InterceptTask{warrant},
+	s.installFor("session-2", []types.InterceptTask{warrant},
 		[]upfSession{{nodeID: "10.0.1.5", seid: 43}}, 9)
 
 	// We must have re-provisioned rather than given up.
@@ -482,7 +482,7 @@ func TestReconcileLeavesThisProcesssOwnTasking(t *testing.T) {
 		XID:      "11111111-1111-4111-8111-111111111111",
 		Products: []types.ProductType{types.ProductCC},
 	}
-	s.installTriggers("session-1", []types.InterceptTask{warrant},
+	s.installFor("session-1", []types.InterceptTask{warrant},
 		[]upfSession{{nodeID: "10.0.1.5", seid: 42}}, 7)
 
 	// The POI reports exactly what this process just installed.
@@ -513,4 +513,87 @@ type taskReport struct {
 
 func (r *recordingTaskReporter) NotifyTask(xid, reportType, details string) {
 	r.reports = append(r.reports, taskReport{xid, reportType, details})
+}
+
+// installFor mirrors what triggerCC does — claim the triggers under the caller's
+// lock, then install them — so a test can drive both halves synchronously. The
+// two are separate in production only because the X1 exchange must not run on the
+// signalling path.
+func (s *subsystem) installFor(ref string, tasks []types.InterceptTask, upfs []upfSession, correlation uint64) {
+	planned, unreachable := s.triggers.plan(ref, tasks, upfs, correlation)
+	for _, warrant := range unreachable {
+		s.reportTaskIssue(warrant, "no triggering endpoint configured for a UPF serving the target")
+	}
+	s.installTriggers(planned)
+}
+
+// TestTriggerInstalledAfterReleaseIsWithdrawn: the X1 exchange runs off the
+// signalling path, so a short-lived session can be released while its trigger is
+// still being installed. The withdrawal then runs against a registry entry whose
+// trigger does not exist at the POI yet, and used to withdraw nothing — leaving a
+// trigger in place that reconciliation (startup only) and the POI's own fail-safe
+// (this SMF is alive and sending keepalives) would both never reach. Tasking
+// nobody can withdraw is exactly what must not exist, so the install must notice
+// and take it down itself.
+func TestTriggerInstalledAfterReleaseIsWithdrawn(t *testing.T) {
+	poi := newFakePOI(t)
+	s := triggerSubsystem(poi)
+
+	warrant := types.InterceptTask{
+		XID:      "11111111-1111-4111-8111-111111111111",
+		Products: []types.ProductType{types.ProductCC},
+	}
+	upfs := []upfSession{{nodeID: "10.0.1.5", seid: 0x2632898145f4d191}}
+
+	// Claim, as triggerCC does under the session lock.
+	planned, unreachable := s.triggers.plan("session-ref-1", []types.InterceptTask{warrant}, upfs, 7)
+	if len(unreachable) != 0 || len(planned) != 1 {
+		t.Fatalf("plan() = %d triggers, %d unreachable; want 1, 0", len(planned), len(unreachable))
+	}
+
+	// The session is released before the install goroutine gets to run its X1
+	// exchange — the ordering the session lock permits and this guards against.
+	if byNode := s.triggers.takeForSession("session-ref-1"); len(byNode) != 1 {
+		t.Fatalf("takeForSession returned %d UPFs, want 1", len(byNode))
+	}
+
+	s.installTriggers(planned)
+
+	if n := poi.countMessages("ActivateTaskRequest"); n != 1 {
+		t.Fatalf("ActivateTaskRequest count = %d, want 1", n)
+	}
+	if n := poi.countMessages("DeactivateTaskRequest"); n != 1 {
+		t.Errorf("DeactivateTaskRequest count = %d, want 1 — a trigger installed after "+
+			"its session was released must be withdrawn by the install itself", n)
+	}
+	if !strings.Contains(strings.Join(poi.sent(), ""), string(planned[0].trigger.XID)) {
+		t.Error("the withdrawal did not name the trigger that was installed")
+	}
+}
+
+// TestTriggerNotInstalledBeforeCorrelationExists: the correlation identifier is
+// the anchor's F-SEID, and until the anchor's PFCP session exists there is none.
+// A trigger without it is refused by x1.Trigger, so sending one would report a
+// fault to the LIPF that is not one — the anchor's establishment response brings
+// the CC-TF back here.
+func TestTriggerNotInstalledBeforeCorrelationExists(t *testing.T) {
+	poi := newFakePOI(t)
+	s := triggerSubsystem(poi)
+	rec := &recordingTaskReporter{}
+	s.taskReporter = rec
+
+	warrant := types.InterceptTask{
+		XID:      "11111111-1111-4111-8111-111111111111",
+		Products: []types.ProductType{types.ProductCC},
+	}
+	upfs := []upfSession{{nodeID: "10.0.1.5", seid: 0x2632898145f4d191}}
+
+	s.installFor("session-ref-1", []types.InterceptTask{warrant}, upfs, 0)
+
+	if n := poi.countMessages("ActivateTaskRequest"); n != 0 {
+		t.Errorf("sent %d triggers with no correlation identifier, want 0", n)
+	}
+	if len(rec.reports) != 0 {
+		t.Errorf("reported %v to the LIPF; a session whose anchor is not up yet is not a fault", rec.reports)
+	}
 }

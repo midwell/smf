@@ -103,10 +103,16 @@ type SMContext struct {
 	AMFProfile         models.NFProfileDiscovery `json:"amfProfile,omitempty" yaml:"amfProfile" bson:"amfProfile,omitempty"`
 	SelectedPCFProfile models.NFProfileDiscovery `json:"selectedPCFProfile,omitempty" yaml:"selectedPCFProfile" bson:"selectedPCFProfile,omitempty"`
 	AnType             models.AccessType         `json:"anType" yaml:"anType" bson:"anType"`
-	RatType            models.RatType            `json:"ratType,omitempty" yaml:"ratType" bson:"ratType,omitempty"`
-	PresenceInLadn     models.PresenceState      `json:"presenceInLadn,omitempty" yaml:"presenceInLadn" bson:"presenceInLadn,omitempty"` // ignore
-	HoState            models.HoState            `json:"hoState,omitempty" yaml:"hoState" bson:"hoState,omitempty"`
-	DnnConfiguration   models.DnnConfiguration   `json:"dnnConfiguration,omitempty" yaml:"dnnConfiguration" bson:"dnnConfiguration,omitempty"` // ?
+	// RequestType is the 5GSM request type the AMF supplied when creating this
+	// context — whether the UE asked for a new PDU session or for an existing one,
+	// and whether it was an emergency request. It is a mandatory field of the
+	// Lawful Interception establishment record, which previously reported every
+	// session as an initial request because nothing retained the real value.
+	RequestType      models.RequestType      `json:"requestType,omitempty" yaml:"requestType" bson:"requestType,omitempty"`
+	RatType          models.RatType          `json:"ratType,omitempty" yaml:"ratType" bson:"ratType,omitempty"`
+	PresenceInLadn   models.PresenceState    `json:"presenceInLadn,omitempty" yaml:"presenceInLadn" bson:"presenceInLadn,omitempty"` // ignore
+	HoState          models.HoState          `json:"hoState,omitempty" yaml:"hoState" bson:"hoState,omitempty"`
+	DnnConfiguration models.DnnConfiguration `json:"dnnConfiguration,omitempty" yaml:"dnnConfiguration" bson:"dnnConfiguration,omitempty"` // ?
 
 	Snssai         *models.Snssai       `json:"snssai" yaml:"snssai" bson:"snssai"`
 	HplmnSnssai    *models.Snssai       `json:"hplmnSnssai,omitempty" yaml:"hplmnSnssai" bson:"hplmnSnssai,omitempty"`
@@ -388,6 +394,7 @@ func (smContext *SMContext) SetCreateData(createData *models.SmContextCreateData
 	smContext.HplmnSnssai = createData.HplmnSnssai
 	smContext.ServingNetwork = createData.GetServingNetwork()
 	smContext.AnType = createData.GetAnType()
+	smContext.RequestType = createData.GetRequestType()
 	smContext.RatType = createData.GetRatType()
 	smContext.PresenceInLadn = createData.GetPresenceInLadn()
 	smContext.UeLocation = createData.UeLocation

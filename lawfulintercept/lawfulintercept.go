@@ -26,6 +26,7 @@ import (
 	"github.com/omec-project/li/types"
 	"github.com/omec-project/li/x1"
 	"github.com/omec-project/li/x2x3"
+	"github.com/omec-project/openapi/v2/models"
 	smfctx "github.com/omec-project/smf/context"
 )
 
@@ -174,8 +175,10 @@ func Init(cfg Config) error {
 	//nolint:errcheck // serve-until-close; a bind failure already surfaced above
 	go func() { _ = srv.ServeTLS(ln, "", "") }()
 	// Keepalive fail-safe: purge tasking if the ADMF goes silent (TS 103 221-1).
+	// A nil stop channel: the fail-safe runs for as long as this element can hold
+	// tasking, which is the whole point of it.
 	if cfg.KeepaliveTimeout > 0 {
-		go x1srv.WatchKeepalive(cfg.KeepaliveTimeout)
+		go x1srv.WatchKeepalive(cfg.KeepaliveTimeout, nil)
 	}
 	active.Store(sub)
 	// Tasking lives in memory, so this element has just discarded every warrant it
@@ -565,8 +568,8 @@ func smfEstablishment(sc *smfctx.SMContext) iri.SMFPDUSessionEstablishment {
 		PDUSessionType: iri.PDUSessionType(sc.SelectedPDUSessionType),
 		SNSSAI:         snssai(sc),
 		DNN:            iri.DNN(sc.Dnn),
-		RequestType:    iri.SMRequestInitial,
-		AccessType:     iri.AccessThreeGPP,
+		RequestType:    requestType(sc),
+		AccessType:     accessType(sc),
 	}
 }
 
@@ -585,7 +588,7 @@ func smfStartOfInterception(sc *smfctx.SMContext) iri.SMFStartOfInterceptionWith
 		SNSSAI:         snssai(sc),
 		DNN:            iri.DNN(sc.Dnn),
 		RequestType:    iri.SMRequestExisting,
-		AccessType:     iri.AccessThreeGPP,
+		AccessType:     accessType(sc),
 	}
 }
 
@@ -598,7 +601,7 @@ func smfModification(sc *smfctx.SMContext) iri.SMFPDUSessionModification {
 		GPSI:         gpsiChoice(sc),
 		SNSSAI:       snssai(sc),
 		RequestType:  iri.SMRequestModification,
-		AccessType:   iri.AccessThreeGPP,
+		AccessType:   accessType(sc),
 		PDUSessionID: iri.PDUSessionID(sc.PDUSessionID),
 	}
 }
@@ -643,6 +646,34 @@ func servingUPFTEID(sc *smfctx.SMContext) iri.FTEID {
 		}
 	}
 	return f
+}
+
+// requestType maps the 5GSM request type the AMF supplied to the TS 33.128
+// enumeration. These records go to a law-enforcement agency, so reporting every
+// session as an initial request — which is what a hard-coded value amounted to —
+// misstates whether the UE asked for a new session or resumed an existing one,
+// and hides an emergency session entirely.
+func requestType(sc *smfctx.SMContext) iri.FiveGSMRequestType {
+	switch sc.RequestType {
+	case models.REQUESTTYPE_EXISTING_PDU_SESSION:
+		return iri.SMRequestExisting
+	case models.REQUESTTYPE_INITIAL_EMERGENCY_REQUEST:
+		return iri.SMRequestInitialEmergency
+	case models.REQUESTTYPE_EXISTING_EMERGENCY_PDU_SESSION:
+		return iri.SMRequestExistingEmergency
+	default:
+		return iri.SMRequestInitial
+	}
+}
+
+// accessType maps the session's access network type to the TS 33.128
+// enumeration, for the same reason: a session over non-3GPP access was reported
+// as a 3GPP one.
+func accessType(sc *smfctx.SMContext) iri.AccessType {
+	if sc.AnType == models.ACCESSTYPE_NON_3_GPP_ACCESS {
+		return iri.AccessNonThreeGPP
+	}
+	return iri.AccessThreeGPP
 }
 
 // snssai maps the SMContext's S-NSSAI to the iri form (SST + optional SD). A nil

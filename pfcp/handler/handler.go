@@ -384,6 +384,18 @@ func HandlePfcpSessionSetDeletionResponse(msg *udp.Message) {
 	logger.PfcpLog.Warnln("PFCP Session Set Deletion Response handling is not implemented")
 }
 
+// establishmentAccepted reports whether a Session Establishment Response says the
+// UPF created the session. The anchor branch of the handler parses the cause for
+// its own purposes; this answers the same question for the UPFs that branch does
+// not cover, without disturbing it.
+func establishmentAccepted(rsp *message.SessionEstablishmentResponse) bool {
+	if rsp.Cause == nil {
+		return false
+	}
+	cause, err := rsp.Cause.Cause()
+	return err == nil && cause == ie.CauseRequestAccepted
+}
+
 func HandlePfcpSessionEstablishmentResponse(msg *udp.Message) {
 	rsp, ok := msg.PfcpMessage.(*message.SessionEstablishmentResponse)
 	if !ok {
@@ -517,13 +529,12 @@ func HandlePfcpSessionEstablishmentResponse(msg *udp.Message) {
 			// create returns is what makes the record joinable to the session's
 			// content (review R32). At most once per session; silent no-op unless LI
 			// is configured. SMLock is held for the whole handler.
+			//
+			// This one stays inside the anchor branch, unlike the CC trigger below:
+			// the record's correlation identifier is the *default path's* F-SEID, so
+			// emitting it on some other UPF's response would produce the one record
+			// describing the session with nothing to join it to.
 			lawfulintercept.ReportEstablishment(smContext)
-			// Lawful Interception CC-TF: task this UPF's CC-POI for the session it
-			// has just created. The trigger's packet detection criterion is the
-			// F-SEID assigned by this response, so this is the earliest point it can
-			// be sent — the duplication instruction itself rode out with the request
-			// (design D14). The X1 exchange runs off this goroutine.
-			lawfulintercept.TriggerCC(smContext)
 
 			smContext.SBIPFCPCommunicationChan <- smf_context.SessionEstablishSuccess
 			smContext.SubPfcpLog.Infoln("PFCP Session Establishment accepted")
@@ -534,6 +545,23 @@ func HandlePfcpSessionEstablishmentResponse(msg *udp.Message) {
 				SetUpfInactive(*rspNodeID, msg.PfcpMessage.MessageTypeName())
 			}
 		}
+	}
+
+	// Lawful Interception CC-TF: task the CC-POI of the UPF that has just created
+	// this session. The trigger's packet detection criterion is the F-SEID that
+	// response assigns, so this is the earliest point it can be sent — the
+	// duplication instruction itself rode out with the request (design D14).
+	//
+	// It sits outside the anchor branch above because a session can be served by
+	// more than one UPF, and only the anchor's response takes that branch. Inside
+	// it, an additional PSA — a ULCL branch, or a second node of a preconfigured
+	// path whose response lands after the anchor's — got its DUPL FAR but never its
+	// trigger, so it duplicated the target's traffic into content the CC-POI could
+	// not attribute and correctly dropped. Triggering is idempotent per (warrant,
+	// session, UPF), so the repeated calls cost a lookup. The X1 exchange runs off
+	// this goroutine.
+	if establishmentAccepted(rsp) {
+		lawfulintercept.TriggerCC(smContext)
 	}
 
 	if smf_context.SMF_Self().ULCLSupport && smContext.BPManager != nil {
