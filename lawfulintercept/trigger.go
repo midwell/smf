@@ -34,8 +34,10 @@ import (
 // UPF *serving the session*, and a session may be served by several, so these are
 // configured per UPF and resolved by the N4 node address.
 type UPFTrigger struct {
-	// NodeID is the UPF's N4 node address, in the form the SMF's PFCP context is
-	// keyed by (the resolved node IP).
+	// NodeID is the UPF's N4 node address. It may be an IP or a DNS name / FQDN
+	// (e.g. the UPF's Kubernetes Service name): it is resolved to an IP the same
+	// way the SMF resolves the session's own N4 NodeID, so the two match. A DNS
+	// name is preferred over a deploy-time ClusterIP.
 	NodeID string
 	// X1URL is that UPF's LI_T3 endpoint, e.g. https://upf-1:8443/X1/NE.
 	X1URL string
@@ -92,7 +94,15 @@ func newTriggerRegistry(cfg Config, clientTLS *tls.Config) *triggerRegistry {
 		installed: make(map[string]types.XID),
 	}
 	for _, t := range cfg.UPFTriggers {
-		reg.endpoints[t.NodeID] = &upfEndpoint{
+		// Key by the N4 address resolved to an IP — the same normalisation the
+		// session path applies (see sessionUPFs) — so NodeID may be given as the
+		// UPF's Service DNS name and still match. Without resolving here, a name in
+		// config would be compared as a literal string against the session's
+		// resolved IP and never match. A ClusterIP is stable for the Service's
+		// lifetime, so resolving once at startup is sufficient (the UPF Service must
+		// be resolvable when the SMF starts, which it is in a normal deployment).
+		key := smfctx.NewNodeID(t.NodeID).ResolveNodeIdToIp().String()
+		reg.endpoints[key] = &upfEndpoint{
 			req: x1.NewRequester(t.X1URL, cfg.NEID, t.NEID, clientTLS),
 			// One destination per UPF, named by a DID this CC-TF allocates.
 			did: newUUID(),
