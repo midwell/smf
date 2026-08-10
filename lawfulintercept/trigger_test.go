@@ -136,7 +136,7 @@ func (p *fakePOI) countMessages(msgType string) int {
 func triggerSubsystem(poi *fakePOI) *subsystem {
 	cfg := Config{
 		NEID: "smf-1",
-		MDF3: "10.0.60.122:42069",
+		MDF3: "192.0.2.1:42069",
 		UPFTriggers: []UPFTrigger{
 			{NodeID: "10.0.1.5", X1URL: poi.srv.URL, NEID: "upf-1"},
 		},
@@ -235,7 +235,7 @@ func TestInstallTriggersPerUPFAndWarrant(t *testing.T) {
 	poi := newFakePOI(t)
 	cfg := Config{
 		NEID: "smf-1",
-		MDF3: "10.0.60.122:42069",
+		MDF3: "192.0.2.1:42069",
 		UPFTriggers: []UPFTrigger{
 			{NodeID: "10.0.1.5", X1URL: poi.srv.URL, NEID: "upf-1"},
 			{NodeID: "10.0.1.6", X1URL: poi.srv.URL, NEID: "upf-2"},
@@ -636,7 +636,7 @@ func TestMatchEndpointFollowsAUPFThatChangesAddress(t *testing.T) {
 	smfctx.InsertDnsHostIp(name, net.ParseIP("10.0.1.5"))
 
 	reg := mustRegistry(Config{
-		NEID: "smf-1", MDF3: "10.0.60.122:42069",
+		NEID: "smf-1", MDF3: "192.0.2.1:42069",
 		UPFTriggers: []UPFTrigger{{NodeID: name, X1URL: "https://upf-1:8443/X1/NE", NEID: "upf-1"}},
 	})
 
@@ -664,7 +664,7 @@ func TestMatchEndpointFollowsAUPFThatChangesAddress(t *testing.T) {
 // UPF's warrant, delivering content under a warrant that does not cover it.
 func TestMatchEndpointNeverMatchesUnresolvableNodes(t *testing.T) {
 	reg := mustRegistry(Config{
-		NEID: "smf-1", MDF3: "10.0.60.122:42069",
+		NEID: "smf-1", MDF3: "192.0.2.1:42069",
 		UPFTriggers: []UPFTrigger{{NodeID: "upf-a.invalid", X1URL: "https://upf-a:8443/X1/NE", NEID: "upf-a"}},
 	})
 
@@ -683,7 +683,7 @@ func TestMatchEndpointPrefersIdentityOverResolution(t *testing.T) {
 	smfctx.InsertDnsHostIp(name, net.ParseIP("10.0.2.7"))
 
 	reg := mustRegistry(Config{
-		NEID: "smf-1", MDF3: "10.0.60.122:42069",
+		NEID: "smf-1", MDF3: "192.0.2.1:42069",
 		UPFTriggers: []UPFTrigger{
 			{NodeID: name, X1URL: "https://upf-named:8443/X1/NE", NEID: "upf-named"},
 			{NodeID: "10.0.2.7", X1URL: "https://upf-numeric:8443/X1/NE", NEID: "upf-numeric"},
@@ -706,7 +706,7 @@ func TestMatchEndpointPrefersIdentityOverResolution(t *testing.T) {
 // no fault raised.
 func TestTriggerRegistryRejectsAmbiguousNode(t *testing.T) {
 	_, err := newTriggerRegistry(Config{
-		NEID: "smf-1", MDF3: "10.0.60.122:42069",
+		NEID: "smf-1", MDF3: "192.0.2.1:42069",
 		UPFTriggers: []UPFTrigger{
 			{NodeID: "10.0.1.5", X1URL: "https://upf-1:8443/X1/NE", NEID: "upf-1"},
 			{NodeID: "10.0.1.5", X1URL: "https://upf-2:8443/X1/NE", NEID: "upf-2"},
@@ -729,7 +729,7 @@ func TestMatchEndpointIsDeterministic(t *testing.T) {
 	smfctx.InsertDnsHostIp("upf-two.test", net.ParseIP("10.0.3.3"))
 
 	reg := mustRegistry(Config{
-		NEID: "smf-1", MDF3: "10.0.60.122:42069",
+		NEID: "smf-1", MDF3: "192.0.2.1:42069",
 		UPFTriggers: []UPFTrigger{
 			{NodeID: "upf-one.test", X1URL: "https://upf-one:8443/X1/NE", NEID: "upf-one"},
 			{NodeID: "upf-two.test", X1URL: "https://upf-two:8443/X1/NE", NEID: "upf-two"},
