@@ -5,6 +5,7 @@ package lawfulintercept
 
 import (
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -13,7 +14,25 @@ import (
 
 	"github.com/omec-project/li/types"
 	"github.com/omec-project/li/x1"
+	smfctx "github.com/omec-project/smf/context"
 )
+
+// upfNode parses a UPF's N4 node identity the way the session path carries it —
+// unresolved, so a test can distinguish matching by identity from matching by
+// address (see matchEndpoint).
+func upfNode(s string) smfctx.NodeID { return *smfctx.NewNodeID(s) }
+
+// mustRegistry builds a registry from a configuration the test knows is valid.
+// Construction only fails on an ambiguous configuration, which the tests that care
+// about that assert on explicitly.
+func mustRegistry(cfg Config) *triggerRegistry {
+	reg, err := newTriggerRegistry(cfg, nil)
+	if err != nil {
+		panic(err)
+	}
+
+	return reg
+}
 
 // fakePOI is a triggered CC-POI: it records the X1 requests a CC-TF sends it and
 // answers as a conformant NE would. It lets the trigger path be exercised without
@@ -125,7 +144,7 @@ func triggerSubsystem(poi *fakePOI) *subsystem {
 
 	return &subsystem{
 		neID:     "smf-1",
-		triggers: newTriggerRegistry(cfg, nil),
+		triggers: mustRegistry(cfg),
 	}
 }
 
@@ -144,7 +163,7 @@ func TestInstallTriggersSendsWarrantIdentity(t *testing.T) {
 
 	s.installFor("session-ref-1",
 		[]types.InterceptTask{warrant},
-		[]upfSession{{nodeID: "10.0.1.5", seid: 14426627323429955319}},
+		[]upfSession{{node: upfNode("10.0.1.5"), seid: 14426627323429955319}},
 		0x2632898145f4d191)
 
 	if n := poi.countMessages("CreateDestinationRequest"); n != 1 {
@@ -195,7 +214,7 @@ func TestInstallTriggersIsIdempotent(t *testing.T) {
 		XID:      "11111111-1111-4111-8111-111111111111",
 		Products: []types.ProductType{types.ProductCC},
 	}
-	upfs := []upfSession{{nodeID: "10.0.1.5", seid: 42}}
+	upfs := []upfSession{{node: upfNode("10.0.1.5"), seid: 42}}
 
 	s.installFor("session-ref-1", []types.InterceptTask{warrant}, upfs, 7)
 	s.installFor("session-ref-1", []types.InterceptTask{warrant}, upfs, 7)
@@ -222,13 +241,13 @@ func TestInstallTriggersPerUPFAndWarrant(t *testing.T) {
 			{NodeID: "10.0.1.6", X1URL: poi.srv.URL, NEID: "upf-2"},
 		},
 	}
-	s := &subsystem{neID: "smf-1", triggers: newTriggerRegistry(cfg, nil)}
+	s := &subsystem{neID: "smf-1", triggers: mustRegistry(cfg)}
 
 	warrants := []types.InterceptTask{
 		{XID: "11111111-1111-4111-8111-111111111111", Products: []types.ProductType{types.ProductCC}},
 		{XID: "22222222-2222-4222-8222-222222222222", Products: []types.ProductType{types.ProductCC}},
 	}
-	upfs := []upfSession{{nodeID: "10.0.1.5", seid: 42}, {nodeID: "10.0.1.6", seid: 43}}
+	upfs := []upfSession{{node: upfNode("10.0.1.5"), seid: 42}, {node: upfNode("10.0.1.6"), seid: 43}}
 
 	s.installFor("session-ref-1", warrants, upfs, 7)
 
@@ -269,7 +288,7 @@ func TestInstallTriggersReportsRefusal(t *testing.T) {
 	}
 
 	s.installFor("session-ref-1", []types.InterceptTask{warrant},
-		[]upfSession{{nodeID: "10.0.1.5", seid: 42}}, 7)
+		[]upfSession{{node: upfNode("10.0.1.5"), seid: 42}}, 7)
 
 	if len(rec.reports) != 1 {
 		t.Fatalf("task issues reported = %d, want 1", len(rec.reports))
@@ -300,7 +319,7 @@ func TestInstallTriggersRetriesAfterFailure(t *testing.T) {
 		XID:      "11111111-1111-4111-8111-111111111111",
 		Products: []types.ProductType{types.ProductCC},
 	}
-	upfs := []upfSession{{nodeID: "10.0.1.5", seid: 42}}
+	upfs := []upfSession{{node: upfNode("10.0.1.5"), seid: 42}}
 
 	s.installFor("session-ref-1", []types.InterceptTask{warrant}, upfs, 7)
 
@@ -335,7 +354,7 @@ func TestInstallTriggersReportsMissingEndpoint(t *testing.T) {
 
 	// A UPF absent from the configured triggering endpoints.
 	s.installFor("session-ref-1", []types.InterceptTask{warrant},
-		[]upfSession{{nodeID: "10.0.9.9", seid: 42}}, 7)
+		[]upfSession{{node: upfNode("10.0.9.9"), seid: 42}}, 7)
 
 	if poi.requests != 0 {
 		t.Error("a request was sent for a UPF with no configured endpoint")
@@ -422,7 +441,7 @@ func TestInstallTriggersReprovisionsAfterRestart(t *testing.T) {
 
 	// First session: destination provisioned, trigger accepted.
 	s.installFor("session-1", []types.InterceptTask{warrant},
-		[]upfSession{{nodeID: "10.0.1.5", seid: 42}}, 7)
+		[]upfSession{{node: upfNode("10.0.1.5"), seid: 42}}, 7)
 
 	if n := poi.countMessages("CreateDestinationRequest"); n != 1 {
 		t.Fatalf("CreateDestination sent %d times, want 1", n)
@@ -435,7 +454,7 @@ func TestInstallTriggersReprovisionsAfterRestart(t *testing.T) {
 	poi.mu.Unlock()
 
 	s.installFor("session-2", []types.InterceptTask{warrant},
-		[]upfSession{{nodeID: "10.0.1.5", seid: 43}}, 9)
+		[]upfSession{{node: upfNode("10.0.1.5"), seid: 43}}, 9)
 
 	// We must have re-provisioned rather than given up.
 	if n := poi.countMessages("CreateDestinationRequest"); n != 2 {
@@ -483,7 +502,7 @@ func TestReconcileLeavesThisProcesssOwnTasking(t *testing.T) {
 		Products: []types.ProductType{types.ProductCC},
 	}
 	s.installFor("session-1", []types.InterceptTask{warrant},
-		[]upfSession{{nodeID: "10.0.1.5", seid: 42}}, 7)
+		[]upfSession{{node: upfNode("10.0.1.5"), seid: 42}}, 7)
 
 	// The POI reports exactly what this process just installed.
 	var mine []string
@@ -543,7 +562,7 @@ func TestTriggerInstalledAfterReleaseIsWithdrawn(t *testing.T) {
 		XID:      "11111111-1111-4111-8111-111111111111",
 		Products: []types.ProductType{types.ProductCC},
 	}
-	upfs := []upfSession{{nodeID: "10.0.1.5", seid: 0x2632898145f4d191}}
+	upfs := []upfSession{{node: upfNode("10.0.1.5"), seid: 0x2632898145f4d191}}
 
 	// Claim, as triggerCC does under the session lock.
 	planned, unreachable := s.triggers.plan("session-ref-1", []types.InterceptTask{warrant}, upfs, 7)
@@ -586,7 +605,7 @@ func TestTriggerNotInstalledBeforeCorrelationExists(t *testing.T) {
 		XID:      "11111111-1111-4111-8111-111111111111",
 		Products: []types.ProductType{types.ProductCC},
 	}
-	upfs := []upfSession{{nodeID: "10.0.1.5", seid: 0x2632898145f4d191}}
+	upfs := []upfSession{{node: upfNode("10.0.1.5"), seid: 0x2632898145f4d191}}
 
 	s.installFor("session-ref-1", []types.InterceptTask{warrant}, upfs, 0)
 
@@ -595,5 +614,137 @@ func TestTriggerNotInstalledBeforeCorrelationExists(t *testing.T) {
 	}
 	if len(rec.reports) != 0 {
 		t.Errorf("reported %v to the LIPF; a session whose anchor is not up yet is not a fault", rec.reports)
+	}
+}
+
+// ── Matching a session's UPF to its triggering endpoint (review R45) ──
+//
+// These four cover the CC-TF's join between two independently configured things:
+// the UPF named in li.upfTriggers, and the UPF actually serving a session. Getting
+// it wrong is invisible from outside the SMF — the warrant stays active, the
+// datapath keeps duplicating, and the content is dropped as unattributable — so
+// each of these asserts a property that produced silence rather than an error.
+
+// TestMatchEndpointFollowsAUPFThatChangesAddress is R45's regression test. The
+// registry used to store the address its configured NodeID resolved to at
+// construction, which froze a value that moves: recreating the UPF's Service gave
+// it a new address, the session path followed within the minute (the SMF refreshes
+// its DNS cache on a ticker) and the registry did not, so every CC warrant for that
+// UPF reported "no triggering endpoint" until the SMF was restarted.
+func TestMatchEndpointFollowsAUPFThatChangesAddress(t *testing.T) {
+	const name = "upf-moving.test"
+	smfctx.InsertDnsHostIp(name, net.ParseIP("10.0.1.5"))
+
+	reg := mustRegistry(Config{
+		NEID: "smf-1", MDF3: "10.0.60.122:42069",
+		UPFTriggers: []UPFTrigger{{NodeID: name, X1URL: "https://upf-1:8443/X1/NE", NEID: "upf-1"}},
+	})
+
+	if _, _, ok := reg.matchEndpoint(upfNode("10.0.1.5")); !ok {
+		t.Fatal("a session on the UPF's current address found no triggering endpoint")
+	}
+
+	// The Service is recreated with a different address; the SMF's cache catches up.
+	smfctx.InsertDnsHostIp(name, net.ParseIP("10.0.9.9"))
+
+	if _, _, ok := reg.matchEndpoint(upfNode("10.0.9.9")); !ok {
+		t.Error("the UPF changed address and its triggering endpoint became unreachable " +
+			"for the life of the process; content interception is silently dead until an SMF restart")
+	}
+	if _, _, ok := reg.matchEndpoint(upfNode("10.0.1.5")); ok {
+		t.Error("a session on the UPF's old address still matched; the endpoint is being " +
+			"selected from a stale address rather than the current one")
+	}
+}
+
+// TestMatchEndpointNeverMatchesUnresolvableNodes is the one with a security
+// consequence. Failed resolution yields 0.0.0.0, so matching on a resolved address
+// made every unresolvable name equal to every other — the defect upstream fixed for
+// gNB names in nodeInLinks (#613). Here it would hand one UPF's CC-POI a different
+// UPF's warrant, delivering content under a warrant that does not cover it.
+func TestMatchEndpointNeverMatchesUnresolvableNodes(t *testing.T) {
+	reg := mustRegistry(Config{
+		NEID: "smf-1", MDF3: "10.0.60.122:42069",
+		UPFTriggers: []UPFTrigger{{NodeID: "upf-a.invalid", X1URL: "https://upf-a:8443/X1/NE", NEID: "upf-a"}},
+	})
+
+	if _, _, ok := reg.matchEndpoint(upfNode("upf-b.invalid")); ok {
+		t.Error("a session on upf-b matched upf-a's triggering endpoint because neither name " +
+			"resolves; one UPF's content would be tasked under another's warrant")
+	}
+}
+
+// TestMatchEndpointPrefersIdentityOverResolution pins the ordering. Identity is
+// exact and needs no DNS, so it must be tried first: a node named the way the slice
+// topology names it must match its own endpoint even when another endpoint's
+// address happens to be what that name resolves to.
+func TestMatchEndpointPrefersIdentityOverResolution(t *testing.T) {
+	const name = "upf-named.test"
+	smfctx.InsertDnsHostIp(name, net.ParseIP("10.0.2.7"))
+
+	reg := mustRegistry(Config{
+		NEID: "smf-1", MDF3: "10.0.60.122:42069",
+		UPFTriggers: []UPFTrigger{
+			{NodeID: name, X1URL: "https://upf-named:8443/X1/NE", NEID: "upf-named"},
+			{NodeID: "10.0.2.7", X1URL: "https://upf-numeric:8443/X1/NE", NEID: "upf-numeric"},
+		},
+	})
+
+	key, _, ok := reg.matchEndpoint(upfNode(name))
+	if !ok {
+		t.Fatal("a session identifying its UPF by name found no endpoint")
+	}
+	if key != name {
+		t.Errorf("matched %q, want %q: an address match won over an exact identity match", key, name)
+	}
+}
+
+// TestTriggerRegistryRejectsAmbiguousNode covers the silent half of R45. Two
+// entries naming one node used to collapse into a single registry entry, the second
+// overwriting the first, so a two-UPF configuration presented as a one-UPF registry
+// and the displaced UPF's content was never attributable — with nothing logged and
+// no fault raised.
+func TestTriggerRegistryRejectsAmbiguousNode(t *testing.T) {
+	_, err := newTriggerRegistry(Config{
+		NEID: "smf-1", MDF3: "10.0.60.122:42069",
+		UPFTriggers: []UPFTrigger{
+			{NodeID: "10.0.1.5", X1URL: "https://upf-1:8443/X1/NE", NEID: "upf-1"},
+			{NodeID: "10.0.1.5", X1URL: "https://upf-2:8443/X1/NE", NEID: "upf-2"},
+		},
+	}, nil)
+	if err == nil {
+		t.Error("an ambiguous upfTriggers configuration was accepted; one UPF's endpoint " +
+			"silently replaces another's and its content cannot be attributed")
+	}
+}
+
+// TestMatchEndpointIsDeterministic guards the ambiguous case. Two configured nodes
+// can resolve to one address — transiently while a Service is recreated, or
+// permanently by mistake — and picking between them by Go's map order would send a
+// session's triggers to a different UPF from one establishment to the next, each
+// carrying the X3 destination with it. The final review found this same
+// nondeterminism in warrant selection at the CC-POI.
+func TestMatchEndpointIsDeterministic(t *testing.T) {
+	smfctx.InsertDnsHostIp("upf-one.test", net.ParseIP("10.0.3.3"))
+	smfctx.InsertDnsHostIp("upf-two.test", net.ParseIP("10.0.3.3"))
+
+	reg := mustRegistry(Config{
+		NEID: "smf-1", MDF3: "10.0.60.122:42069",
+		UPFTriggers: []UPFTrigger{
+			{NodeID: "upf-one.test", X1URL: "https://upf-one:8443/X1/NE", NEID: "upf-one"},
+			{NodeID: "upf-two.test", X1URL: "https://upf-two:8443/X1/NE", NEID: "upf-two"},
+		},
+	})
+
+	first, _, ok := reg.matchEndpoint(upfNode("10.0.3.3"))
+	if !ok {
+		t.Fatal("no endpoint matched an address both configured nodes resolve to")
+	}
+	for range 50 {
+		got, _, _ := reg.matchEndpoint(upfNode("10.0.3.3"))
+		if got != first {
+			t.Fatalf("matched %q then %q: the same session would be triggered at a "+
+				"different UPF on re-establishment", first, got)
+		}
 	}
 }

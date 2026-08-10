@@ -126,7 +126,22 @@ func Init(cfg Config) error {
 		sub.taskReporter = reporter
 	}
 	if len(cfg.UPFTriggers) > 0 {
-		sub.triggers = newTriggerRegistry(cfg, mat.ClientTLS())
+		var triggers *triggerRegistry
+		triggers, err = newTriggerRegistry(cfg, mat.ClientTLS())
+		if err != nil {
+			// A CC-TF whose triggering configuration is ambiguous cannot task the POI
+			// it displaced, so content for sessions that UPF serves would be
+			// duplicated and then dropped as unattributable. Refusing to start LI is
+			// the fail-closed choice, and the LIPF is told because the alternative is
+			// an ADMF that believes content interception is available when it is not.
+			if reporter != nil {
+				reporter.Notify(x1.NEIssueInvalidConfig,
+					"content triggering configuration is ambiguous; no content interception is possible")
+			}
+
+			return err
+		}
+		sub.triggers = triggers
 		// A POI may still hold triggers from this process's previous life, which it
 		// has no record of and could never withdraw — including after the warrant is
 		// revoked (review R40).

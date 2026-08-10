@@ -5,7 +5,9 @@ package lawfulintercept
 
 import (
 	"crypto/tls"
+	"fmt"
 	"net"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -32,10 +34,11 @@ import (
 // UPF *serving the session*, and a session may be served by several, so these are
 // configured per UPF and resolved by the N4 node address.
 type UPFTrigger struct {
-	// NodeID is the UPF's N4 node address. It may be an IP or a DNS name / FQDN
-	// (e.g. the UPF's Kubernetes Service name): it is resolved to an IP the same
-	// way the SMF resolves the session's own N4 NodeID, so the two match. A DNS
-	// name is preferred over a deploy-time ClusterIP.
+	// NodeID identifies the UPF's N4 node. It may be given exactly as the slice
+	// topology names it, in which case it matches by identity and no name
+	// resolution happens at all; or as any name or address that resolves to the
+	// same node, which is matched by resolving both at the moment of use. A DNS
+	// name is preferred over a deploy-time ClusterIP. See matchEndpoint.
 	NodeID string
 	// X1URL is that UPF's LI_T3 endpoint, e.g. https://upf-1:8443/X1/NE.
 	X1URL string
@@ -50,6 +53,9 @@ type UPFTrigger struct {
 type upfEndpoint struct {
 	req *x1.Requester
 	did string
+	// node is the configured NodeID, parsed. Held so a session's serving UPF can be
+	// matched by identity before anything is resolved (matchEndpoint).
+	node smfctx.NodeID
 
 	mu sync.Mutex
 	// destinationReady records that CreateDestination succeeded, since a trigger
@@ -61,8 +67,21 @@ type upfEndpoint struct {
 // triggerRegistry holds the CC-TF's per-UPF endpoints and the trigger tasks it has
 // installed.
 type triggerRegistry struct {
-	mdf3      string
-	endpoints map[string]*upfEndpoint // by UPF N4 node address
+	mdf3 string
+	// endpoints is keyed by the NodeID *as configured*, never by an address derived
+	// from it: the configured string is stable for the life of the process, so a
+	// trigger installed at a UPF is still found under the same key when it is
+	// withdrawn, even if that UPF's address changed in between. Written once during
+	// construction and read-only afterwards, so it needs no lock.
+	endpoints map[string]*upfEndpoint
+	// order is endpoints' keys, sorted, so matching iterates deterministically. Two
+	// configured nodes can resolve to one address — transiently, while a Service is
+	// being recreated, or permanently in a mistaken configuration — and choosing
+	// between them by Go's map order would send a session's triggers to a different
+	// UPF from one establishment to the next. The final review found that same
+	// nondeterminism in warrant selection at the CC-POI; it is worse here, because
+	// the trigger carries the X3 destination.
+	order []string
 
 	mu sync.Mutex
 	// installed maps a (warrant, session, UPF) triple to the XID this CC-TF
@@ -85,31 +104,85 @@ const liKeepaliveInterval = 60 * time.Second
 // newTriggerRegistry builds the CC-TF's endpoints from configuration. A UPF with
 // no configured triggering endpoint cannot be tasked, so CC for a session it
 // serves is reported as a fault rather than silently skipped.
-func newTriggerRegistry(cfg Config, clientTLS *tls.Config) *triggerRegistry {
+func newTriggerRegistry(cfg Config, clientTLS *tls.Config) (*triggerRegistry, error) {
 	reg := &triggerRegistry{
 		mdf3:      cfg.MDF3,
 		endpoints: make(map[string]*upfEndpoint, len(cfg.UPFTriggers)),
 		installed: make(map[string]types.XID),
 	}
 	for _, t := range cfg.UPFTriggers {
-		// Key by the N4 address resolved to an IP — the same normalisation the
-		// session path applies (see sessionUPFs) — so NodeID may be given as the
-		// UPF's Service DNS name and still match. Without resolving here, a name in
-		// config would be compared as a literal string against the session's
-		// resolved IP and never match. A ClusterIP is stable for the Service's
-		// lifetime, so resolving once at startup is sufficient (the UPF Service must
-		// be resolvable when the SMF starts, which it is in a normal deployment).
-		key := smfctx.NewNodeID(t.NodeID).ResolveNodeIdToIp().String()
-		reg.endpoints[key] = &upfEndpoint{
-			req: x1.NewRequester(t.X1URL, cfg.NEID, t.NEID, clientTLS),
+		// Key by the NodeID exactly as configured, and resolve nothing here. An
+		// earlier version keyed by the address the NodeID resolved to at this moment,
+		// which made a derived, mutable value permanent: a UPF that later changed
+		// address was never found again, and a name that did not resolve at the
+		// instant the SMF started was keyed "0.0.0.0" for the life of the process.
+		// Either way every CC warrant for that UPF reported "no triggering endpoint"
+		// until the SMF was restarted (review R45). Matching now happens per use, in
+		// matchEndpoint.
+		if _, dup := reg.endpoints[t.NodeID]; dup {
+			// Previously the second entry silently replaced the first, so a
+			// two-UPF configuration presented as a one-UPF registry and the
+			// displaced UPF's content was never attributable.
+			return nil, fmt.Errorf("upfTriggers names the same node twice: %q", t.NodeID)
+		}
+		reg.endpoints[t.NodeID] = &upfEndpoint{
+			node: *smfctx.NewNodeID(t.NodeID),
+			req:  x1.NewRequester(t.X1URL, cfg.NEID, t.NEID, clientTLS),
 			// One destination per UPF, named by a DID this CC-TF allocates.
 			did: x1.NewUUID(),
 		}
+		reg.order = append(reg.order, t.NodeID)
 	}
+	slices.Sort(reg.order)
 
 	go reg.keepalive()
 
-	return reg
+	return reg, nil
+}
+
+// matchEndpoint finds the triggering endpoint for the UPF serving a session.
+//
+// Identity is tried first and costs nothing: when `li.upfTriggers` names the node
+// the way the slice topology names it, the two NodeIDs are equal and no name is
+// ever resolved. That is upstream's own conclusion for the sibling comparison in
+// nodeInLinks (#613) — membership is identity, not reachability.
+//
+// Resolution remains as the fallback because these two values come from
+// *independent* configuration — the LI block and the slice topology — and need not
+// agree: a DNS name in the LI block has to match a session whose N4 node is an IP,
+// which is the case that made resolution necessary in the first place. So identity
+// alone cannot replace it, and address matching alone was what broke.
+//
+// The fix for review R45 is *when* this resolves, not whether: at the point of use
+// rather than once at construction. That is what makes a recreated Service, or a
+// name that was not yet resolvable at startup, recover on its own instead of
+// requiring an SMF restart. It is also cheap here — the trigger path runs a few
+// times per session, an IP literal short-circuits without touching DNS, and a name
+// reads the SMF's DNS cache that a 60-second refresh keeps current.
+//
+// An unresolvable node NEVER matches. Failed resolution yields net.IPv4zero, so
+// comparing it would make every unresolvable name equal to every other — precisely
+// the defect #613 fixed for gNB names, which here would task one UPF's CC-POI with
+// another UPF's warrant. Returning "no match" instead means the warrant is reported
+// to the LIPF as having no triggering endpoint, which is true and actionable.
+func (r *triggerRegistry) matchEndpoint(session smfctx.NodeID) (string, *upfEndpoint, bool) {
+	for _, key := range r.order {
+		if ep := r.endpoints[key]; ep.node.Equal(session) {
+			return key, ep, true
+		}
+	}
+
+	want := session.ResolveNodeIdToIp()
+	if want.Equal(net.IPv4zero) {
+		return "", nil, false
+	}
+	for _, key := range r.order {
+		if ep := r.endpoints[key]; ep.node.ResolveNodeIdToIp().Equal(want) {
+			return key, ep, true
+		}
+	}
+
+	return "", nil, false
 }
 
 // keepalive tells every triggered POI, periodically, that this triggering function
@@ -187,7 +260,9 @@ func (s *subsystem) reconcileTriggers() {
 // upfSession is one UPF serving a session, with the detection criterion for that
 // UPF's share of it.
 type upfSession struct {
-	nodeID string
+	// node is the serving UPF's N4 NodeID as the session carries it, passed on
+	// unresolved so matchEndpoint can compare identities before addresses.
+	node smfctx.NodeID
 	// seid is the F-SEID the UPF assigned to this session — the value it tags onto
 	// every packet it duplicates, and therefore the criterion that lets it match a
 	// copy to this trigger. It is per UPF, unlike the correlation identifier.
@@ -209,6 +284,12 @@ func sessionUPFs(sc *smfctx.SMContext) []upfSession {
 			if node.UPF == nil {
 				continue
 			}
+			// The PFCP context is keyed by the resolved address because that is how the
+			// SMF keys it everywhere (context/sm_context.go), so this lookup — and the
+			// dedupe that goes with it — has to use the same form. Only the value
+			// handed onward is the unresolved NodeID: matching a UPF to its triggering
+			// endpoint is this package's business, and doing it on an address frozen
+			// anywhere is what review R45 was.
 			key := node.UPF.NodeID.ResolveNodeIdToIp().String()
 			if seen[key] {
 				continue
@@ -221,7 +302,7 @@ func sessionUPFs(sc *smfctx.SMContext) []upfSession {
 				continue
 			}
 			seen[key] = true
-			out = append(out, upfSession{nodeID: key, seid: pfcpCtx.RemoteSEID})
+			out = append(out, upfSession{node: node.UPF.NodeID, seid: pfcpCtx.RemoteSEID})
 		}
 	}
 	return out
@@ -486,7 +567,7 @@ func (r *triggerRegistry) plan(
 	defer r.mu.Unlock()
 
 	for _, u := range upfs {
-		endpoint, ok := r.endpoints[u.nodeID]
+		nodeKey, endpoint, ok := r.matchEndpoint(u.node)
 		if !ok {
 			for _, t := range tasks {
 				unreachable = append(unreachable, t.XID)
@@ -496,7 +577,10 @@ func (r *triggerRegistry) plan(
 		}
 
 		for _, t := range tasks {
-			key := triggerKey(t.XID, ref, u.nodeID)
+			// Keyed by the matched *configured* node, not by whatever it currently
+			// resolves to, so withdrawal finds this trigger even if the UPF's address
+			// moves while the session is live.
+			key := triggerKey(t.XID, ref, nodeKey)
 			if _, held := r.installed[key]; held {
 				continue
 			}
