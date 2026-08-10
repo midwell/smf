@@ -132,14 +132,14 @@ type SMContext struct {
 
 	// LiReleaseReported guards the Lawful Interception release xIRI against a
 	// double emit when a teardown traverses both the update-initiated delete and
-	// the dedicated release handler (review R21). Transient; not serialized.
+	// the dedicated release handler. Transient; not serialized.
 	LiReleaseReported bool `json:"-" yaml:"-" bson:"-"`
 
 	// LiEstablishmentReported guards the Lawful Interception establishment xIRI,
 	// which is emitted when the UPF answers the PFCP Session Establishment Request
 	// — the point at which the session's F-SEID and F-TEID first exist. A session
 	// spanning several UPFs draws a response from each, so without this the record
-	// would be emitted once per UPF (review R32). Transient; not serialized.
+	// would be emitted once per UPF. Transient; not serialized.
 	LiEstablishmentReported bool `json:"-" yaml:"-" bson:"-"`
 
 	BPManager *BPManager `json:"bpManager,omitempty" yaml:"bpManager" bson:"bpManager,omitempty"` // ignore

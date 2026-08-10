@@ -561,7 +561,7 @@ func HandleUpdateN2Msg(txn *transaction.Transaction, response *models.UpdateSmCo
 		// the interception would carry uplink only; and on an already-tasked session
 		// this would silently switch downlink duplication back off. Re-evaluating
 		// here puts the FAR's duplication state right before it is sent, in the same
-		// modification. Silent and a no-op when LI is inactive. (Review R31.)
+		// modification. Silent and a no-op when LI is inactive.
 		lawfulintercept.ApplyCCTrigger(smContext)
 
 		pfcpParam.pdrList = append(pfcpParam.pdrList, pdrList...)

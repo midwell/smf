@@ -101,7 +101,7 @@ func Init(cfg Config) error {
 	// Deliver X2 asynchronously: the Report* hooks run on the PDU-session
 	// signalling goroutine while sc.SMLock is held, so a slow or unreachable MDF2
 	// must never block them — that is an availability risk and a target-observable
-	// timing side channel (review R3b; design D11 mandates async X2 delivery).
+	// timing side channel, so delivery is asynchronous by design.
 	// Worker delivery failures surface to the ADMF over X1 (throttled, NE-level,
 	// no target id), never to a general log.
 	client := x2x3.NewAsyncSender(
@@ -144,11 +144,11 @@ func Init(cfg Config) error {
 		sub.triggers = triggers
 		// A POI may still hold triggers from this process's previous life, which it
 		// has no record of and could never withdraw — including after the warrant is
-		// revoked (review R40).
+		// revoked.
 		go sub.reconcileTriggers()
 	}
 	// OnActivate/OnDeactivate scan already-established sessions when a warrant is
-	// (de)tasked mid-session (tasks 4.7/4.8): emit the "start with established PDU
+	// (de)tasked mid-session: emit the "start with established PDU
 	// session" xIRI and (de)activate CC duplication on live sessions.
 	// WithADMF holds X1 peers to the responsible ADMF's identity: a certificate
 	// from the LI CA authenticates a peer, but only this identifier may task us
@@ -156,7 +156,7 @@ func Init(cfg Config) error {
 	// A peer that fails that check is refused, and — since this plane deliberately
 	// logs nothing — would otherwise be refused in complete silence. The ADMF is the
 	// only party entitled to hear that someone is trying to task its network
-	// elements under an identity that is not theirs (review R44).
+	// elements under an identity that is not theirs.
 	x1srv := x1.NewServer(st, cfg.NEID,
 		x1.WithADMF(cfg.AdmfID),
 		x1.OnActivate(sub.reportStartOfInterception),
@@ -181,9 +181,8 @@ func Init(cfg Config) error {
 	}
 	// NewListener supplies the properties every X1 endpoint needs and none of the
 	// three network functions should be trusted to remember separately: a discarded
-	// error log (review R35) and per-phase timeouts, without which an unauthenticated
-	// peer can hold connections open until this element can no longer be untasked
-	// (review R42).
+	// error log and per-phase timeouts, without which an unauthenticated peer can
+	// hold connections open until this element can no longer be untasked.
 	srv := x1.NewListener(x1srv, mat.ServerTLS())
 	// Certificates come from TLSConfig, so the file arguments are empty. ServeTLS
 	// blocks until the listener closes; the bind already succeeded above.
@@ -200,7 +199,7 @@ func Init(cfg Config) error {
 	// held. Nothing else tells the ADMF that — it goes on believing the
 	// interceptions it provisioned are running — and the standard's audit path is a
 	// query it has to think to make. Saying so on the way up is the one push signal
-	// available (review R38).
+	// available.
 	if reporter != nil && st.Len() == 0 {
 		reporter.Notify(x1.NEIssueTaskingAbsent,
 			"network function started with interception enabled and no tasking present")
@@ -217,8 +216,7 @@ func Init(cfg Config) error {
 // correlation identifier is the F-SEID, and neither exists until the UPF has
 // assigned them — emitting at the SBI point produced a record with a zero TEID
 // and a zero correlation, so the one record that describes the session to the MDF
-// was the one record that could not be joined to that session's content
-// (review R32).
+// was the one record that could not be joined to that session's content.
 //
 // Emitted at most once per session: a session spanning several UPFs draws an
 // establishment response from each. Caller holds sc.SMLock.
@@ -255,7 +253,7 @@ func ReportRelease(sc *smfctx.SMContext) {
 		return
 	}
 	// A single teardown can reach both the update-initiated delete and the
-	// dedicated release handler; emit the release xIRI only once (review R21).
+	// dedicated release handler; emit the release xIRI only once.
 	// Both call sites hold sc.SMLock, so this check-and-set is safe.
 	if sc.LiReleaseReported {
 		return
@@ -271,13 +269,13 @@ func ReportRelease(sc *smfctx.SMContext) {
 // traffic to the MDF3. No-op and silent when LI is inactive.
 //
 // It walks the session's whole data-path pool, so duplication is applied on
-// every UPF serving the target (multi-slice / UPF scaling), covering task 4.6.
+// every UPF serving the target (multi-slice / UPF scaling).
 //
 // SCOPE: this runs from SendPFCPRules at PDU-session establishment, so it triggers
 // CC for sessions established after tasking. The complementary case — a warrant
 // (de)tasked while the session is already up — is handled by the X1
 // OnActivate/OnDeactivate hooks (reportStartOfInterception / reportDeactivation),
-// which re-evaluate CC and re-send a PFCP modification (tasks 4.7/4.8).
+// which re-evaluate CC and re-send a PFCP modification.
 func ApplyCCTrigger(sc *smfctx.SMContext) {
 	sub := active.Load()
 	if sub == nil || sc == nil || sc.Tunnel == nil {
@@ -293,7 +291,7 @@ func ApplyCCTrigger(sc *smfctx.SMContext) {
 		// FAR carrying DUPL. On a re-invocation of SendPFCPRules for an already-
 		// installed session (ULCL path add / HO path-switch) it is RULE_CREATE, so
 		// mark it RULE_UPDATE — otherwise the modification builder's state switch
-		// skips it and the DUPL flip is never sent to the UPF (review R22).
+		// skips it and the DUPL flip is never sent to the UPF.
 		if far.State == smfctx.RULE_CREATE {
 			far.State = smfctx.RULE_UPDATE
 		}
@@ -373,7 +371,7 @@ func (s *subsystem) reportStartOfInterception(task types.InterceptTask) {
 			s.modifySession(sc)
 		}
 		// Task the serving UPFs for this warrant too: the FARs now duplicate, but
-		// without a trigger the copies carry no warrant identity (review R34).
+		// without a trigger the copies carry no warrant identity.
 		s.triggerCC(sc)
 		return event
 	})
@@ -487,7 +485,7 @@ func (s *subsystem) deliverIRI(tasks []types.InterceptTask, corr [8]byte, event 
 		// Delivery is asynchronous (see Init): Send enqueues and returns, so this
 		// signalling path never blocks on the MDF; delivery failures are reported
 		// to the ADMF over X1 from the delivery worker, not here. The correlation
-		// ID lets the MDF join this xIRI to the session's xCC (review R20 / D12).
+		// ID lets the MDF join this xIRI to the session's xCC.
 		//nolint:errcheck // async enqueue; delivery failures report via the worker, not here
 		_ = s.client.Send(&x2x3.PDU{
 			Type:          x2x3.PDUTypeX2,
@@ -505,8 +503,8 @@ func (s *subsystem) deliverIRI(tasks []types.InterceptTask, corr [8]byte, event 
 
 // correlationOf returns the X2 correlation identifier for sc's session: the
 // serving UPF's F-SEID encoded big-endian — the same value and byte order the UPF
-// stamps on the session's X3 xCC, so the MDF can join a session's xIRI and xCC
-// (review R20 / design D12). Best-effort: zero before the PFCP session is
+// stamps on the session's X3 xCC, so the MDF can join a session's xIRI and xCC.
+// Best-effort: zero before the PFCP session is
 // established (the UPF-assigned SEID is not yet known), matching servingUPFTEID's
 // best-effort caveat. Caller holds sc.SMLock.
 func correlationOf(sc *smfctx.SMContext) [8]byte {

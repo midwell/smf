@@ -26,7 +26,7 @@ import (
 // (as ProductID), the correlation identifier it uses on that session's own xIRI,
 // the packet detection criteria, and the X3 destination.
 //
-// Duplication and tasking therefore travel over different interfaces (design D14)
+// Duplication and tasking therefore travel over different interfaces
 // and are applied at slightly different moments — see triggerCC on the window
 // between them.
 
@@ -117,7 +117,7 @@ func newTriggerRegistry(cfg Config, clientTLS *tls.Config) (*triggerRegistry, er
 		// address was never found again, and a name that did not resolve at the
 		// instant the SMF started was keyed "0.0.0.0" for the life of the process.
 		// Either way every CC warrant for that UPF reported "no triggering endpoint"
-		// until the SMF was restarted (review R45). Matching now happens per use, in
+		// until the SMF was restarted. Matching now happens per use, in
 		// matchEndpoint.
 		if _, dup := reg.endpoints[t.NodeID]; dup {
 			// Previously the second entry silently replaced the first, so a
@@ -153,7 +153,7 @@ func newTriggerRegistry(cfg Config, clientTLS *tls.Config) (*triggerRegistry, er
 // which is the case that made resolution necessary in the first place. So identity
 // alone cannot replace it, and address matching alone was what broke.
 //
-// The fix for review R45 is *when* this resolves, not whether: at the point of use
+// What matters is *when* this resolves, not whether: at the point of use
 // rather than once at construction. That is what makes a recreated Service, or a
 // name that was not yet resolvable at startup, recover on its own instead of
 // requiring an SMF restart. It is also cheap here — the trigger path runs a few
@@ -211,7 +211,7 @@ func (r *triggerRegistry) keepalive() {
 // against a triggering function that is *gone*; one that has *restarted* is
 // present, resumes keepalives within the minute, and so leaves behind triggers
 // belonging to warrants the new process knows nothing about — and therefore can
-// never withdraw, not even when the warrant is revoked (review R40).
+// never withdraw, not even when the warrant is revoked.
 //
 // Withdrawing everything found is safe because of the authorisation model, not by
 // assumption: a POI accepts tasking from exactly one triggering function
@@ -289,7 +289,7 @@ func sessionUPFs(sc *smfctx.SMContext) []upfSession {
 			// dedupe that goes with it — has to use the same form. Only the value
 			// handed onward is the unresolved NodeID: matching a UPF to its triggering
 			// endpoint is this package's business, and doing it on an address frozen
-			// anywhere is what review R45 was.
+			// anywhere is the defect this avoids.
 			key := node.UPF.NodeID.ResolveNodeIdToIp().String()
 			if seen[key] {
 				continue
@@ -312,7 +312,7 @@ func sessionUPFs(sc *smfctx.SMContext) []upfSession {
 // active task that wants CC. Call it once the UPF has answered the PFCP Session
 // Establishment Request — the trigger's detection criterion is the SEID that
 // response assigns, exactly as ReportEstablishment needs it for the correlation
-// identifier (review R32). No-op and silent when LI is inactive or sc is untasked.
+// identifier. No-op and silent when LI is inactive or sc is untasked.
 // Caller holds sc.SMLock.
 func TriggerCC(sc *smfctx.SMContext) {
 	if sub := active.Load(); sub != nil && sc != nil {
@@ -332,7 +332,7 @@ func UntriggerCC(sc *smfctx.SMContext) {
 //
 // The X1 exchange runs in a goroutine: it is a synchronous HTTPS round trip, and
 // the caller holds sc.SMLock on the PDU-session signalling path, where a slow or
-// unreachable peer must never block (review R3b).
+// unreachable peer must never block.
 //
 // That leaves a brief window at establishment in which the UPF is already
 // duplicating (the DUPL FAR rode out with the establishment *request*) but is not
@@ -365,7 +365,7 @@ func (s *subsystem) triggerCC(sc *smfctx.SMContext) {
 
 	// The correlation identifier is the session's, not the UPF's: it is the value
 	// this SMF puts on the session's xIRI, so every UPF serving the session must
-	// stamp the same one for the MDF to join content to signalling (design D12).
+	// stamp the same one for the MDF to join content to signalling.
 	// Only the detection criterion is per UPF.
 	planned, unreachable := s.triggers.plan(sc.Ref, tasks, upfs, servingUPFSEID(sc))
 
@@ -401,7 +401,7 @@ func (s *subsystem) installTriggers(planned []plannedTrigger) {
 			// it restarts independently of us, and its destinations do not survive
 			// that. Re-provision and try once more before concluding the
 			// interception cannot be arranged: the alternative is content dropped
-			// at the POI for as long as this process happens to live (review R37).
+			// at the POI for as long as this process happens to live.
 			p.endpoint.forgetDestination()
 
 			if again := s.ensureDestination(p.endpoint); again == nil {

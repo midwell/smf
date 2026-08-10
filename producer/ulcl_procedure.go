@@ -298,7 +298,7 @@ func EstablishRANTunnelInfo(smContext *context.SMContext) {
 	defaultANUPFDLFAR := defaultANUPF.DownLinkTunnel.PDR["default"].FAR       // TODO: Iterate over all PDRs
 	activatingANUPFDLFAR := activatingANUPF.DownLinkTunnel.PDR["default"].FAR // TODO: Iterate over all PDRs
 	// Replaces the whole ApplyAction, clearing content duplication on a tasked
-	// session; re-evaluated once the forwarding parameters are set (review R31).
+	// session; re-evaluated once the forwarding parameters are set.
 	activatingANUPFDLFAR.ApplyAction = context.ApplyAction{
 		Buff: false,
 		Drop: false,

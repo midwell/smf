@@ -156,8 +156,8 @@ func (smf *SMF) Start() {
 	if li := factory.SmfConfig.Configuration.Li; li != nil {
 		kaTimeout, _ := time.ParseDuration(li.KeepaliveTimeout) //nolint:errcheck // empty or invalid duration yields 0 = keepalive disabled
 		// Inject the PFCP session-modification hook the mid-session CC trigger
-		// needs (tasks 4.7/4.8). Done before Init mounts the X1 listener so the
-		// hook is in place before any tasking can arrive.
+		// needs. Done before Init mounts the X1 listener so the hook is in place
+		// before any tasking can arrive.
 		lawfulintercept.SetSessionModifier(producer.ModifySessionForLI)
 		triggers := make([]lawfulintercept.UPFTrigger, 0, len(li.UPFTriggers))
 		for _, t := range li.UPFTriggers {
@@ -173,8 +173,8 @@ func (smf *SMF) Start() {
 		}); err != nil {
 			// Do not name the subsystem or echo err (which carries LI-identifying
 			// text) on the general operator log: that would reveal to an unauthorized
-			// operator that this NE is LI-provisioned (review R23; li-security-isolation
-			// NE-level undetectability). A listener-bind failure is already reported to
+			// operator that this NE is LI-provisioned, which network-element-level
+			// undetectability forbids. A listener-bind failure is already reported to
 			// the ADMF over X1 from within Init; an earlier failure (e.g. bad LI
 			// credentials) has no X1 channel yet and, pending a restricted LI log sink,
 			// is surfaced only non-attributably here.

@@ -280,7 +280,7 @@ func BuildPfcpParam(smContext *smfContext.SMContext) *pfcpParam {
 			ulFAR := ulPDR.FAR
 			if ulFAR != nil {
 				// Replaces the whole ApplyAction, so a tasked session's content
-				// duplication is cleared here; re-evaluated below (review R31).
+				// duplication is cleared here; re-evaluated below.
 				ulFAR.ApplyAction = smfContext.ApplyAction{Forw: true}
 				ulFAR.ForwardingParameters = &smfContext.ForwardingParameters{
 					DestinationInterface: smfContext.DestinationInterface{

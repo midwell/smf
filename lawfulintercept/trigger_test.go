@@ -148,7 +148,7 @@ func triggerSubsystem(poi *fakePOI) *subsystem {
 	}
 }
 
-// TestInstallTriggersSendsWarrantIdentity is the core of task 10.6: the trigger a
+// TestInstallTriggersSendsWarrantIdentity is the core of the triggering interface: the trigger a
 // CC-TF sends must carry the warrant XID, the session's correlation identifier and
 // the UPF's own SEID as the detection criterion, and must be preceded by the
 // destination it references.
@@ -424,7 +424,7 @@ func TestTakeForSessionAndWarrant(t *testing.T) {
 	}
 }
 
-// TestInstallTriggersReprovisionsAfterRestart is review R37: a POI restarts
+// TestInstallTriggersReprovisionsAfterRestart: a POI restarts
 // independently of this triggering function and takes the destination we
 // provisioned with it. Believing otherwise meant every later trigger named a
 // destination the POI no longer knew, so it duplicated the subject's traffic and
@@ -467,7 +467,7 @@ func TestInstallTriggersReprovisionsAfterRestart(t *testing.T) {
 	}
 }
 
-// TestReconcileWithdrawsTaskingFromAPreviousLife is review R40: after a restart
+// TestReconcileWithdrawsTaskingFromAPreviousLife: after a restart
 // this process has no record of the triggers it installed, while the POI still
 // holds them — and tasking nobody can withdraw does not stop, not even when the
 // warrant is revoked. The keepalive fail-safe cannot cover it, because a restarted
@@ -617,7 +617,7 @@ func TestTriggerNotInstalledBeforeCorrelationExists(t *testing.T) {
 	}
 }
 
-// ── Matching a session's UPF to its triggering endpoint (review R45) ──
+// ── Matching a session's UPF to its triggering endpoint ──
 //
 // These four cover the CC-TF's join between two independently configured things:
 // the UPF named in li.upfTriggers, and the UPF actually serving a session. Getting
@@ -625,7 +625,7 @@ func TestTriggerNotInstalledBeforeCorrelationExists(t *testing.T) {
 // datapath keeps duplicating, and the content is dropped as unattributable — so
 // each of these asserts a property that produced silence rather than an error.
 
-// TestMatchEndpointFollowsAUPFThatChangesAddress is R45's regression test. The
+// TestMatchEndpointFollowsAUPFThatChangesAddress is the regression test. The
 // registry used to store the address its configured NodeID resolved to at
 // construction, which froze a value that moves: recreating the UPF's Service gave
 // it a new address, the session path followed within the minute (the SMF refreshes
@@ -699,7 +699,7 @@ func TestMatchEndpointPrefersIdentityOverResolution(t *testing.T) {
 	}
 }
 
-// TestTriggerRegistryRejectsAmbiguousNode covers the silent half of R45. Two
+// TestTriggerRegistryRejectsAmbiguousNode covers the silent half of it. Two
 // entries naming one node used to collapse into a single registry entry, the second
 // overwriting the first, so a two-UPF configuration presented as a one-UPF registry
 // and the displaced UPF's content was never attributable — with nothing logged and

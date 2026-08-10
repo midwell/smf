@@ -116,7 +116,7 @@ func TestServingUPFTEIDNilTunnel(t *testing.T) {
 func TestCorrelationOfNilTunnel(t *testing.T) {
 	// No PFCP session yet → a zero correlation ID (best-effort), never a panic.
 	// The populated value (serving UPF F-SEID, big-endian, matching the UPF's X3)
-	// is exercised end-to-end by the datapath integration test (task 5.5).
+	// is exercised end-to-end by the datapath integration test.
 	if corr := correlationOf(&smfctx.SMContext{}); corr != ([8]byte{}) {
 		t.Errorf("nil-tunnel correlation = % x, want zero", corr)
 	}
@@ -214,7 +214,7 @@ func TestApplyCCTriggerSkipsNonForwardingFAR(t *testing.T) {
 	}
 }
 
-// TestApplyCCTriggerMarksInstalledFARForUpdate covers R22: when the trigger flips
+// TestApplyCCTriggerMarksInstalledFARForUpdate: when the trigger flips
 // DUPL on an already-installed FAR (RULE_CREATE) — e.g. SendPFCPRules re-invoked
 // for an established session on a ULCL add / HO path-switch — it must mark the FAR
 // RULE_UPDATE, or the modification builder skips it and the flip never reaches the
@@ -233,7 +233,7 @@ func TestApplyCCTriggerMarksInstalledFARForUpdate(t *testing.T) {
 		t.Fatal("installed FAR: DUPL not set")
 	}
 	if installed.State != smfctx.RULE_UPDATE {
-		t.Errorf("installed FAR State = %v, want RULE_UPDATE so the flip is sent (R22)", installed.State)
+		t.Errorf("installed FAR State = %v, want RULE_UPDATE so the flip is sent", installed.State)
 	}
 
 	fresh := &smfctx.FAR{ApplyAction: smfctx.ApplyAction{Forw: true}, State: smfctx.RULE_INITIAL}
@@ -243,7 +243,7 @@ func TestApplyCCTriggerMarksInstalledFARForUpdate(t *testing.T) {
 	}
 }
 
-// TestApplyCCTriggerRecoversAfterFARReactivation covers R31. Several SMF paths
+// TestApplyCCTriggerRecoversAfterFARReactivation. Several SMF paths
 // reconfigure a FAR by replacing its whole ApplyAction — the downlink FAR becoming
 // a forwarding FAR once the RAN tunnel is known, a data-notification reactivating
 // the uplink FAR, a ULCL path activation — and each of those assignments sets
@@ -303,7 +303,7 @@ func smfContextApplyActionForwardOnly() smfctx.ApplyAction {
 	return smfctx.ApplyAction{Forw: true}
 }
 
-// TestReportEstablishmentEmitsOnce covers R32's guard. The record is now emitted
+// TestReportEstablishmentEmitsOnce covers that guard. The record is now emitted
 // from the PFCP establishment-response handler, which runs once per UPF, so a
 // session spanning several UPFs would otherwise produce one record per response.
 func TestReportEstablishmentEmitsOnce(t *testing.T) {
@@ -327,7 +327,7 @@ func TestReportEstablishmentEmitsOnce(t *testing.T) {
 	}
 }
 
-// TestReportReleaseDeduplicates covers R21: a teardown that reaches both the
+// TestReportReleaseDeduplicates: a teardown that reaches both the
 // update-initiated delete and the dedicated release handler must emit only one
 // SMFPDUSessionRelease xIRI.
 func TestReportReleaseDeduplicates(t *testing.T) {
@@ -430,7 +430,7 @@ func subWith(t *testing.T, tasks ...types.InterceptTask) *subsystem {
 	return &subsystem{store: st}
 }
 
-// TestApplyCCActivation covers the mid-session CC switch-on (task 4.8): a CC task
+// TestApplyCCActivation covers the mid-session CC switch-on: a CC task
 // targeting a live session sets DUPL and marks the FAR RULE_UPDATE so a PFCP
 // modification re-sends it, and it is idempotent (a second call is a no-op).
 func TestApplyCCActivation(t *testing.T) {
@@ -454,7 +454,7 @@ func TestApplyCCActivation(t *testing.T) {
 	}
 }
 
-// TestApplyCCDeactivation covers the mid-session CC switch-off (task 4.8): with no
+// TestApplyCCDeactivation covers the mid-session CC switch-off: with no
 // CC task left in the store, applyCC clears DUPL on a FAR that was duplicating and
 // marks it RULE_UPDATE so the clear is pushed to the UPF.
 func TestApplyCCDeactivation(t *testing.T) {

@@ -410,7 +410,7 @@ func HandlePDUSessionSMContextCreate(eventData interface{}) error {
 	// This point does not wait for the UPF's PFCP Session Establishment Response,
 	// so the session's F-SEID and F-TEID do not exist yet, and a record emitted
 	// here carried zeroes for both — leaving it unjoinable to the session's own
-	// content. It is emitted from the response handler instead (review R32).
+	// content. It is emitted from the response handler instead.
 
 	return nil
 	// TODO: UECM registration

@@ -527,7 +527,7 @@ func HandlePfcpSessionEstablishmentResponse(msg *udp.Message) {
 			// F-SEID (the X2 correlation identifier) and F-TEID are known — both were
 			// set above from this response. Emitting here rather than when the SBI
 			// create returns is what makes the record joinable to the session's
-			// content (review R32). At most once per session; silent no-op unless LI
+			// content. At most once per session; silent no-op unless LI
 			// is configured. SMLock is held for the whole handler.
 			//
 			// This one stays inside the anchor branch, unlike the CC trigger below:
@@ -550,7 +550,7 @@ func HandlePfcpSessionEstablishmentResponse(msg *udp.Message) {
 	// Lawful Interception CC-TF: task the CC-POI of the UPF that has just created
 	// this session. The trigger's packet detection criterion is the F-SEID that
 	// response assigns, so this is the earliest point it can be sent — the
-	// duplication instruction itself rode out with the request (design D14).
+	// duplication instruction itself rode out with the request.
 	//
 	// It sits outside the anchor branch above because a session can be served by
 	// more than one UPF, and only the anchor's response takes that branch. Inside
