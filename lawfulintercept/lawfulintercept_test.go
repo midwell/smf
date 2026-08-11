@@ -160,7 +160,7 @@ func activateWith(t *testing.T, task types.InterceptTask) {
 func TestApplyCCTriggerSetsDuplication(t *testing.T) {
 	activateWith(t, types.InterceptTask{
 		XID:      "task-cc",
-		Targets:  []types.TargetIdentifier{types.TargetIdentifier{Type: types.TargetSUPI, Value: "262019876543210"}},
+		Targets:  []types.TargetIdentifier{{Type: types.TargetSUPI, Value: "262019876543210"}},
 		Products: []types.ProductType{types.ProductIRI, types.ProductCC},
 		State:    types.TaskActive,
 	})
@@ -182,7 +182,7 @@ func TestApplyCCTriggerClearsWhenNotCCTasked(t *testing.T) {
 	// was previously duplicating.
 	activateWith(t, types.InterceptTask{
 		XID:      "task-iri",
-		Targets:  []types.TargetIdentifier{types.TargetIdentifier{Type: types.TargetSUPI, Value: "262019876543210"}},
+		Targets:  []types.TargetIdentifier{{Type: types.TargetSUPI, Value: "262019876543210"}},
 		Products: []types.ProductType{types.ProductIRI},
 		State:    types.TaskActive,
 	})
@@ -201,7 +201,7 @@ func TestApplyCCTriggerClearsWhenNotCCTasked(t *testing.T) {
 func TestApplyCCTriggerSkipsNonForwardingFAR(t *testing.T) {
 	activateWith(t, types.InterceptTask{
 		XID:      "task-cc",
-		Targets:  []types.TargetIdentifier{types.TargetIdentifier{Type: types.TargetSUPI, Value: "262019876543210"}},
+		Targets:  []types.TargetIdentifier{{Type: types.TargetSUPI, Value: "262019876543210"}},
 		Products: []types.ProductType{types.ProductCC},
 		State:    types.TaskActive,
 	})
@@ -222,7 +222,7 @@ func TestApplyCCTriggerSkipsNonForwardingFAR(t *testing.T) {
 func TestApplyCCTriggerMarksInstalledFARForUpdate(t *testing.T) {
 	activateWith(t, types.InterceptTask{
 		XID:      "task-cc",
-		Targets:  []types.TargetIdentifier{types.TargetIdentifier{Type: types.TargetSUPI, Value: "262019876543210"}},
+		Targets:  []types.TargetIdentifier{{Type: types.TargetSUPI, Value: "262019876543210"}},
 		Products: []types.ProductType{types.ProductCC},
 		State:    types.TaskActive,
 	})
@@ -258,7 +258,7 @@ func TestApplyCCTriggerMarksInstalledFARForUpdate(t *testing.T) {
 func TestApplyCCTriggerRecoversAfterFARReactivation(t *testing.T) {
 	activateWith(t, types.InterceptTask{
 		XID:      "task-cc",
-		Targets:  []types.TargetIdentifier{types.TargetIdentifier{Type: types.TargetSUPI, Value: "262019876543210"}},
+		Targets:  []types.TargetIdentifier{{Type: types.TargetSUPI, Value: "262019876543210"}},
 		Products: []types.ProductType{types.ProductCC},
 		State:    types.TaskActive,
 	})
@@ -311,7 +311,7 @@ func TestReportEstablishmentEmitsOnce(t *testing.T) {
 	st := store.New()
 	st.Activate(types.InterceptTask{
 		XID:      "task-iri",
-		Targets:  []types.TargetIdentifier{types.TargetIdentifier{Type: types.TargetSUPI, Value: "262019876543210"}},
+		Targets:  []types.TargetIdentifier{{Type: types.TargetSUPI, Value: "262019876543210"}},
 		Products: []types.ProductType{types.ProductIRI},
 		State:    types.TaskActive,
 	})
@@ -335,7 +335,7 @@ func TestReportReleaseDeduplicates(t *testing.T) {
 	st := store.New()
 	st.Activate(types.InterceptTask{
 		XID:      "task-iri",
-		Targets:  []types.TargetIdentifier{types.TargetIdentifier{Type: types.TargetSUPI, Value: "262019876543210"}},
+		Targets:  []types.TargetIdentifier{{Type: types.TargetSUPI, Value: "262019876543210"}},
 		Products: []types.ProductType{types.ProductIRI},
 		State:    types.TaskActive,
 	})
@@ -501,10 +501,10 @@ func TestApplyCCMultiAgency(t *testing.T) {
 
 func TestSessionTargets(t *testing.T) {
 	sc := ccSession(&smfctx.FAR{}) // Supi = imsi-262019876543210
-	if !sessionTargets(types.InterceptTask{Targets: []types.TargetIdentifier{types.TargetIdentifier{Type: types.TargetSUPI, Value: "262019876543210"}}}, sc) {
+	if !sessionTargets(types.InterceptTask{Targets: []types.TargetIdentifier{{Type: types.TargetSUPI, Value: "262019876543210"}}}, sc) {
 		t.Error("a SUPI target must match the session's SUPI")
 	}
-	if sessionTargets(types.InterceptTask{Targets: []types.TargetIdentifier{types.TargetIdentifier{Type: types.TargetSUPI, Value: "111111111111111"}}}, sc) {
+	if sessionTargets(types.InterceptTask{Targets: []types.TargetIdentifier{{Type: types.TargetSUPI, Value: "111111111111111"}}}, sc) {
 		t.Error("a non-matching SUPI must not match")
 	}
 }
