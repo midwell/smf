@@ -14,7 +14,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net"
-	"slices"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -464,7 +463,7 @@ func (s *subsystem) modifySession(sc *smfctx.SMContext) {
 // sessionTargets reports whether task's target identifier matches one of sc's
 // identifiers. Caller holds sc.SMLock (targetsOf reads sc's identity fields).
 func sessionTargets(task types.InterceptTask, sc *smfctx.SMContext) bool {
-	return slices.Contains(targetsOf(sc), task.Target)
+	return task.TargetsAny(targetsOf(sc))
 }
 
 // deliverIRI encodes event once and delivers it as an X2 xIRI to every task in
