@@ -95,12 +95,30 @@ type Li struct {
 	// the UPF serving the session; the NE identifier cannot be derived from the URL.
 	UPFTriggers []LiUPFTrigger `yaml:"upfTriggers"`
 
+	// Destinations declares DID→endpoint mappings for delivery destinations agreed
+	// out of band. A task naming one of these DIDs is delivered to it exactly as if
+	// the ADMF had provisioned it with CreateDestination; a destination provisioned
+	// over X1 under the same DID takes precedence. Optional — an ADMF that
+	// provisions its own destinations needs none of these, and `mdf2` above still
+	// serves a task that names nothing resolvable.
+	Destinations []LiDestination `yaml:"destinations,omitempty"`
+
 	AdmfURL          string `yaml:"admfUrl"`          // ADMF X1 endpoint for NE-initiated issue reports (optional)
 	AdmfID           string `yaml:"admfId"`           // responsible ADMF identifier (for reports)
 	KeepaliveTimeout string `yaml:"keepaliveTimeout"` // duration; purge tasking if no X1 message within it (optional)
 }
 
 // LiUPFTrigger is one UPF's LI_T3 triggering endpoint.
+
+// LiDestination is one pre-shared delivery destination: the identifier an ADMF's tasks
+// reference it by, and where it points. Its three fields are the ones CreateDestination
+// carries, because the entry has to resolve identically to a provisioned one.
+type LiDestination struct {
+	DID          string `yaml:"did"`          // UUID, as the X1 schema requires of a DId
+	DeliveryType string `yaml:"deliveryType"` // X2Only | X3Only | X2andX3
+	Address      string `yaml:"address"`      // host:port
+}
+
 type LiUPFTrigger struct {
 	NodeID string `yaml:"nodeId"` // the UPF's N4 node address
 	X1URL  string `yaml:"x1Url"`  // its LI_T3 endpoint, e.g. https://upf-1:8443/X1/NE

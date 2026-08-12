@@ -48,9 +48,22 @@ type Config struct {
 	// session it serves is reported to the LIPF as a fault rather than skipped.
 	UPFTriggers []UPFTrigger
 
+	// Destinations are DID→endpoint mappings this element can resolve without their
+	// having been provisioned over X1, for destinations agreed out of band.
+	Destinations []Destination
+
 	AdmfURL          string        // ADMF X1 endpoint for NE-initiated issue reports (empty = disabled)
 	AdmfID           string        // the responsible ADMF's identifier: authenticates inbound X1 peers and addresses outbound reports (empty accepts any certified ADMF)
 	KeepaliveTimeout time.Duration // purge tasking if no X1 message within this (0 = disabled)
+}
+
+// Destination is one pre-shared delivery destination: a DID an ADMF's tasks reference,
+// and where it points. It resolves exactly as a destination provisioned over X1 does; a
+// provisioned entry for the same DID wins.
+type Destination struct {
+	DID          string
+	DeliveryType string // X2Only | X3Only | X2andX3
+	Address      string // host:port
 }
 
 // sender delivers an xIRI/xCC PDU to an MDF. *x2x3.Client satisfies it; tests
@@ -67,8 +80,15 @@ type taskIssueReporter interface {
 }
 
 type subsystem struct {
-	store    *store.Store
-	client   sender
+	store *store.Store
+	// senderFor returns the delivery client for one X2 destination address. It is a
+	// function rather than a single client because a task's destinations arrive over
+	// X1: two warrants may name two agencies' MDF2s, and delivering both to one address
+	// is cross-agency disclosure.
+	senderFor func(addr string) sender
+	// mdf2 is the configured X2 endpoint, used only for a task that names no
+	// destination this element can resolve.
+	mdf2     string
 	iriCtx   *liasn1.Context
 	neID     string
 	reporter *x1.Reporter // nil when NE-initiated reporting is not configured
@@ -103,8 +123,11 @@ func Init(cfg Config) error {
 	// timing side channel, so delivery is asynchronous by design.
 	// Worker delivery failures surface to the ADMF over X1 (throttled, NE-level,
 	// no target id), never to a general log.
-	client := x2x3.NewAsyncSender(
-		x2x3.NewClient(cfg.MDF2, mat.ClientTLS()), 0,
+	//
+	// One client per destination address, created on first use: a task carries the
+	// endpoints its product goes to, and TS 33.128 marks them mandatory, so this
+	// element cannot know them at startup.
+	pool := x2x3.NewPool(mat.ClientTLS(),
 		func(error) {
 			if reporter != nil {
 				reporter.Notify(x1.NEIssueMDFUnreachable, "MDF2 X2 delivery failed")
@@ -113,11 +136,12 @@ func Init(cfg Config) error {
 		nil, // drops are covered by the same MDF-unreachable report from the worker
 	)
 	sub := &subsystem{
-		store:    st,
-		client:   client,
-		iriCtx:   iri.NewContext(),
-		neID:     cfg.NEID,
-		reporter: reporter,
+		store:     st,
+		senderFor: func(addr string) sender { return pool.For(addr) },
+		mdf2:      cfg.MDF2,
+		iriCtx:    iri.NewContext(),
+		neID:      cfg.NEID,
+		reporter:  reporter,
 	}
 	// Assign the interface only when a reporter exists: a typed-nil would pass the
 	// nil check in reportTaskIssue and then panic on use.
@@ -158,6 +182,7 @@ func Init(cfg Config) error {
 	// elements under an identity that is not theirs.
 	x1srv := x1.NewServer(st, cfg.NEID,
 		x1.WithADMF(cfg.AdmfID),
+		x1.WithConfiguredDestinations(configuredDestinations(cfg.Destinations, reporter)...),
 		x1.OnActivate(sub.reportStartOfInterception),
 		x1.OnDeactivate(sub.reportDeactivation),
 		x1.OnAuthFailure(func(code int) {
@@ -481,23 +506,48 @@ func (s *subsystem) deliverIRI(tasks []types.InterceptTask, corr [8]byte, event 
 		if !t.WantsProduct(types.ProductIRI) {
 			continue
 		}
-		// Delivery is asynchronous (see Init): Send enqueues and returns, so this
-		// signalling path never blocks on the MDF; delivery failures are reported
-		// to the ADMF over X1 from the delivery worker, not here. The correlation
-		// ID lets the MDF join this xIRI to the session's xCC.
-		//nolint:errcheck // async enqueue; delivery failures report via the worker, not here
-		_ = s.client.Send(&x2x3.PDU{
-			Type:          x2x3.PDUTypeX2,
-			PayloadFormat: x2x3.PayloadFormat3GPP33128,
-			Direction:     x2x3.DirectionNotApplicable,
-			// A provisioned ProductID replaces the task XID in the PDU header
-			// (TS 103 221-1 clause 6.2.1.2), so product is labelled with the
-			// warrant an ADMF names rather than with the task carrying it.
-			XID:           parseXID(t.DeliveryXID()),
-			CorrelationID: corr,
-			Payload:       payload,
-		})
+		for _, addr := range s.x2Destinations(t) {
+			client := s.senderFor(addr)
+			if client == nil {
+				continue
+			}
+			// Delivery is asynchronous (see Init): Send enqueues and returns, so this
+			// signalling path never blocks on the MDF; delivery failures are reported
+			// to the ADMF over X1 from the delivery worker, not here. The correlation
+			// ID lets the MDF join this xIRI to the session's xCC.
+			//nolint:errcheck // async enqueue; delivery failures report via the worker, not here
+			_ = client.Send(&x2x3.PDU{
+				Type:          x2x3.PDUTypeX2,
+				PayloadFormat: x2x3.PayloadFormat3GPP33128,
+				Direction:     x2x3.DirectionNotApplicable,
+				// A provisioned ProductID replaces the task XID in the PDU header
+				// (TS 103 221-1 clause 6.2.1.2), so product is labelled with the
+				// warrant an ADMF names rather than with the task carrying it.
+				XID:           parseXID(t.DeliveryXID()),
+				CorrelationID: corr,
+				Payload:       payload,
+			})
+		}
 	}
+}
+
+// x2Destinations is where this task's xIRI goes.
+//
+// The task's own destinations first, which is what TS 33.128 requires — table 6.2.3-0A,
+// "ActivateTask message for SMF IRI-POI, CC-TF and IRI-TF", marks ListOfDIDs mandatory
+// and says the endpoints "shall be configured using the CreateDestination message …
+// prior to first use". The configured MDF2 serves only a task that named nothing this
+// element could resolve, which is the case every deployment predating that requirement
+// is in.
+func (s *subsystem) x2Destinations(t types.InterceptTask) []string {
+	if addrs := t.DeliveryAddresses(types.DeliveryX2); len(addrs) > 0 {
+		return addrs
+	}
+	if s.mdf2 == "" {
+		return nil
+	}
+
+	return []string{s.mdf2}
 }
 
 // correlationOf returns the X2 correlation identifier for sc's session: the
@@ -751,4 +801,33 @@ func afterPrefix(s string, prefixes ...string) string {
 		}
 	}
 	return ""
+}
+
+// configuredDestinations maps the pre-shared destinations from configuration onto the
+// form the X1 server resolves them in, and tells the ADMF about any it cannot use.
+//
+// An entry that does not resolve is not a small mistake: a task naming that DID falls
+// through to the configured default endpoint instead, so an operator's typo quietly sends
+// one agency's product to another's address. There is no general log to say so on — this
+// plane deliberately writes to none — and the count is all the ADMF needs, since the
+// entries themselves are the operator's configuration and not the ADMF's business.
+func configuredDestinations(dests []Destination, reporter *x1.Reporter) []x1.ConfiguredDestination {
+	out := make([]x1.ConfiguredDestination, 0, len(dests))
+	var rejected int
+	for _, d := range dests {
+		entry := x1.ConfiguredDestination{DID: d.DID, DeliveryType: d.DeliveryType, Address: d.Address}
+		if entry.Valid() != nil {
+			rejected++
+
+			continue
+		}
+		out = append(out, entry)
+	}
+	if rejected > 0 {
+		reporter.Notify(x1.NEIssueInvalidConfig, fmt.Sprintf(
+			"%d configured delivery destination(s) are unusable and were dropped; "+
+				"a task naming one will be delivered to the default endpoint instead", rejected))
+	}
+
+	return out
 }

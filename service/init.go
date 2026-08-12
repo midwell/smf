@@ -165,11 +165,18 @@ func (smf *SMF) Start() {
 				NodeID: t.NodeID, X1URL: t.X1URL, NEID: t.NEID,
 			})
 		}
+		dests := make([]lawfulintercept.Destination, 0, len(li.Destinations))
+		for _, d := range li.Destinations {
+			dests = append(dests, lawfulintercept.Destination{
+				DID: d.DID, DeliveryType: d.DeliveryType, Address: d.Address,
+			})
+		}
 		if err := lawfulintercept.Init(lawfulintercept.Config{
 			X1Listen: li.X1Listen, MDF2: li.MDF2, NEID: li.NEID,
 			Cert: li.Cert, Key: li.Key, CACert: li.CACert,
 			MDF3: li.MDF3, UPFTriggers: triggers,
-			AdmfURL: li.AdmfURL, AdmfID: li.AdmfID, KeepaliveTimeout: kaTimeout,
+			Destinations: dests,
+			AdmfURL:      li.AdmfURL, AdmfID: li.AdmfID, KeepaliveTimeout: kaTimeout,
 		}); err != nil {
 			// Do not name the subsystem or echo err (which carries LI-identifying
 			// text) on the general operator log: that would reveal to an unauthorized

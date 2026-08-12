@@ -5,6 +5,7 @@ package lawfulintercept
 
 import (
 	"bytes"
+	"sync"
 	"testing"
 
 	"github.com/omec-project/li/iri"
@@ -315,7 +316,7 @@ func TestReportEstablishmentEmitsOnce(t *testing.T) {
 		Products: []types.ProductType{types.ProductIRI},
 		State:    types.TaskActive,
 	})
-	active.Store(&subsystem{store: st, client: cap, iriCtx: iri.NewContext(), neID: "ne"})
+	active.Store(&subsystem{store: st, senderFor: func(string) sender { return cap }, mdf2: configuredMDF2, iriCtx: iri.NewContext(), neID: "ne"})
 	t.Cleanup(func() { active.Store(nil) })
 
 	sc := targetSM()
@@ -339,7 +340,7 @@ func TestReportReleaseDeduplicates(t *testing.T) {
 		Products: []types.ProductType{types.ProductIRI},
 		State:    types.TaskActive,
 	})
-	active.Store(&subsystem{store: st, client: cap, iriCtx: iri.NewContext(), neID: "ne"})
+	active.Store(&subsystem{store: st, senderFor: func(string) sender { return cap }, mdf2: configuredMDF2, iriCtx: iri.NewContext(), neID: "ne"})
 	t.Cleanup(func() { active.Store(nil) })
 
 	sc := targetSM()
@@ -378,7 +379,7 @@ func TestDeliveryIsolation(t *testing.T) {
 	st.Activate(types.InterceptTask{XID: xidCC, Targets: []types.TargetIdentifier{target}, Products: []types.ProductType{types.ProductCC}, State: types.TaskActive})
 
 	cap := &captureSender{}
-	active.Store(&subsystem{store: st, client: cap, iriCtx: iri.NewContext()})
+	active.Store(&subsystem{store: st, senderFor: func(string) sender { return cap }, mdf2: configuredMDF2, iriCtx: iri.NewContext()})
 	t.Cleanup(func() { active.Store(nil) })
 
 	ReportEstablishment(targetSM())
@@ -551,5 +552,104 @@ func TestEstablishmentReportsTheRealRequestAndAccessType(t *testing.T) {
 		if got := smfStartOfInterception(sc).AccessType; got != c.wantAcc {
 			t.Errorf("start-of-interception AccessType for %q = %d, want %d", c.access, got, c.wantAcc)
 		}
+	}
+}
+
+// configuredMDF2 stands in for the endpoint an SMF is configured with. It is deliberately
+// not any task's own destination in the tests below, so that "delivered to the task's
+// endpoint" and "delivered to configuration" are distinguishable outcomes — with one
+// address they are not, which is why this defect survived a passing suite.
+const configuredMDF2 = "10.0.60.99:42069"
+
+// addressCapture records what was delivered and where.
+type addressCapture struct {
+	mu   sync.Mutex
+	sent map[string][][16]byte
+}
+
+func newAddressCapture() *addressCapture {
+	return &addressCapture{sent: map[string][][16]byte{}}
+}
+
+func (c *addressCapture) senderFor(addr string) sender {
+	return senderFunc(func(p *x2x3.PDU) error {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		c.sent[addr] = append(c.sent[addr], p.XID)
+
+		return nil
+	})
+}
+
+type senderFunc func(*x2x3.PDU) error
+
+func (f senderFunc) Send(p *x2x3.PDU) error { return f(p) }
+
+// TestXIRIGoesToTheDestinationsTheTaskNamed is the SMF half of the conformance fix, and
+// the same assertion as the AMF's: two warrants provisioned to two agencies, and neither
+// agency receives the other's session.
+func TestXIRIGoesToTheDestinationsTheTaskNamed(t *testing.T) {
+	const (
+		xidA    = "aaaaaaaa-0000-0000-0000-000000000001"
+		xidB    = "bbbbbbbb-0000-0000-0000-000000000002"
+		agencyA = "10.0.60.122:42069"
+		agencyB = "10.0.60.123:42070"
+	)
+	target := types.TargetIdentifier{Type: types.TargetSUPI, Value: "262019876543210"}
+	st := store.New()
+	for _, c := range []struct{ xid, addr string }{{xidA, agencyA}, {xidB, agencyB}} {
+		st.Activate(types.InterceptTask{
+			XID: types.XID(c.xid), Targets: []types.TargetIdentifier{target},
+			Products:   []types.ProductType{types.ProductIRI},
+			Deliveries: []types.DeliveryEndpoint{{Type: types.DeliveryX2, Address: c.addr}},
+			State:      types.TaskActive,
+		})
+	}
+
+	capture := newAddressCapture()
+	active.Store(&subsystem{
+		store: st, senderFor: capture.senderFor, mdf2: configuredMDF2, iriCtx: iri.NewContext(),
+	})
+	t.Cleanup(func() { active.Store(nil) })
+
+	ReportEstablishment(targetSM())
+
+	for _, c := range []struct{ addr, xid string }{{agencyA, xidA}, {agencyB, xidB}} {
+		got := capture.sent[c.addr]
+		if len(got) != 1 {
+			t.Errorf("%s received %d records, want 1", c.addr, len(got))
+
+			continue
+		}
+		if got[0] != parseXID(types.XID(c.xid)) {
+			t.Errorf("%s received a record for a warrant it was not provisioned for", c.addr)
+		}
+	}
+	if n := len(capture.sent[configuredMDF2]); n != 0 {
+		t.Errorf("the configured endpoint received %d records, want 0: both tasks named a destination", n)
+	}
+}
+
+// The configured endpoint still serves a task that named nothing resolvable, which is
+// what every deployment predating the ListOfDIDs requirement relies on.
+func TestATaskNamingNoDestinationFallsBackToConfiguration(t *testing.T) {
+	st := store.New()
+	st.Activate(types.InterceptTask{
+		XID:      "aaaaaaaa-0000-0000-0000-000000000001",
+		Targets:  []types.TargetIdentifier{{Type: types.TargetSUPI, Value: "262019876543210"}},
+		Products: []types.ProductType{types.ProductIRI},
+		State:    types.TaskActive,
+	})
+
+	capture := newAddressCapture()
+	active.Store(&subsystem{
+		store: st, senderFor: capture.senderFor, mdf2: configuredMDF2, iriCtx: iri.NewContext(),
+	})
+	t.Cleanup(func() { active.Store(nil) })
+
+	ReportEstablishment(targetSM())
+
+	if n := len(capture.sent[configuredMDF2]); n != 1 {
+		t.Errorf("the configured endpoint received %d records, want 1", n)
 	}
 }
