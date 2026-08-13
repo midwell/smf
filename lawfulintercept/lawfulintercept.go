@@ -86,10 +86,11 @@ type subsystem struct {
 	// X1: two warrants may name two agencies' MDF2s, and delivering both to one address
 	// is cross-agency disclosure.
 	senderFor func(addr string) sender
-	// unreachable answers how many of the destinations this element has delivered to
-	// cannot currently be reached, and how many it has used at all — the delivery pool's
-	// own accounting. A function rather than the pool itself for the same reason senderFor
-	// is one: a test states a delivery condition without an MDF to take away.
+	// unreachable answers how many of the destinations this element's tasking currently
+	// names cannot be reached, and how many of them it has attempted at all — the delivery
+	// pool's accounting, scoped to what is in use (see destinationsInUse). A function
+	// rather than the pool itself for the same reason senderFor is one: a test states a
+	// delivery condition without an MDF to take away.
 	unreachable func() (unreachable, inUse int)
 	// mdf2 is the configured X2 endpoint, used only for a task that names no
 	// destination this element can resolve.
@@ -122,6 +123,10 @@ type subsystem struct {
 // UPF it triggers can reach its MDF3 is that element's status to report, and it has an X1
 // interface of its own to report it on.
 //
+// It asks only about the destinations this element's *current* tasking names — see
+// destinationsInUse — so a warrant's withdrawal takes its destination out of the answer with
+// it.
+//
 // A subsystem with no delivery accounting reports nothing rather than panicking on the X1
 // request path — an element that cannot say is not an element that is broken.
 func (s *subsystem) deliveryFault() *x1.X1Error {
@@ -130,6 +135,27 @@ func (s *subsystem) deliveryFault() *x1.X1Error {
 	}
 
 	return x1.MDFUnreachableProbe(s.unreachable)()
+}
+
+// destinationsInUse is where this element's xIRI currently goes: the X2 endpoints the tasking
+// it holds names, and the configured MDF2 for a task that names nothing this element can
+// resolve.
+//
+// It exists because a delivery client outlives the warrant that created it. A destination
+// whose last delivery failed and whose warrant was then deactivated can never be delivered to
+// again, so nothing would ever clear it — the element would report itself faulty for the life
+// of the process, including while holding no tasking at all. Scoping the question to what is
+// in use is what keeps that probe from sticking on.
+func (s *subsystem) destinationsInUse() []string {
+	var addrs []string
+	for _, t := range s.store.Snapshot() {
+		if !t.WantsProduct(types.ProductIRI) {
+			continue
+		}
+		addrs = append(addrs, s.x2Destinations(t)...)
+	}
+
+	return addrs
 }
 
 // active holds the running subsystem, or nil when LI is not configured.
@@ -167,14 +193,17 @@ func Init(cfg Config) error {
 		nil, // drops are covered by the same MDF-unreachable report from the worker
 	)
 	sub := &subsystem{
-		store:       st,
-		senderFor:   func(addr string) sender { return pool.For(addr) },
-		unreachable: pool.Unreachable,
-		mdf2:        cfg.MDF2,
-		iriCtx:      iri.NewContext(),
-		neID:        cfg.NEID,
-		reporter:    reporter,
+		store:     st,
+		senderFor: func(addr string) sender { return pool.For(addr) },
+		mdf2:      cfg.MDF2,
+		iriCtx:    iri.NewContext(),
+		neID:      cfg.NEID,
+		reporter:  reporter,
 	}
+	// Assigned after construction because it reads the subsystem it belongs to: the pool
+	// knows what each destination's last delivery established, and only the subsystem knows
+	// which destinations the tasking still names.
+	sub.unreachable = func() (int, int) { return pool.UnreachableAmong(sub.destinationsInUse()) }
 	// Assign the interface only when a reporter exists: a typed-nil would pass the
 	// nil check in reportTaskIssue and then panic on use.
 	if reporter != nil {

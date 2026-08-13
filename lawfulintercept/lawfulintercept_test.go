@@ -722,3 +722,53 @@ func TestDeliveryFaultWithNoAccountingIsSilent(t *testing.T) {
 		t.Errorf("an element with no delivery accounting reported a fault: %q", fault.ErrorDescription)
 	}
 }
+
+// TestDestinationsInUseFollowsTheTasking is what keeps the delivery probe from sticking on.
+//
+// A delivery client outlives the warrant that created it — nothing removes one — so a
+// destination whose last delivery failed and whose warrant was then deactivated could never
+// be delivered to again, and nothing would ever clear it. The element would report itself
+// faulty for the life of the process, including while holding no tasking at all, which is
+// precisely the failure that gets a status answer ignored.
+func TestDestinationsInUseFollowsTheTasking(t *testing.T) {
+	st := store.New()
+	sub := &subsystem{store: st, mdf2: "10.0.60.99:42069"}
+
+	if got := sub.destinationsInUse(); len(got) != 0 {
+		t.Errorf("an element holding no tasking delivers to %v, want nothing", got)
+	}
+
+	// A warrant naming its agency's own endpoint.
+	st.Activate(types.InterceptTask{
+		XID:      "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa",
+		Targets:  []types.TargetIdentifier{{Type: types.TargetSUPI, Value: "208930100007488"}},
+		Products: []types.ProductType{types.ProductIRI},
+		Deliveries: []types.DeliveryEndpoint{
+			{Type: types.DeliveryX2, Address: "10.0.60.122:42069"},
+		},
+	})
+	if got := sub.destinationsInUse(); len(got) != 1 || got[0] != "10.0.60.122:42069" {
+		t.Errorf("destinationsInUse() = %v, want the endpoint the warrant named", got)
+	}
+
+	// A warrant naming nothing this element can resolve is delivered to the configured
+	// endpoint, so that is where product goes and what the probe must ask about.
+	st.Activate(types.InterceptTask{
+		XID:      "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb",
+		Targets:  []types.TargetIdentifier{{Type: types.TargetSUPI, Value: "208930100007489"}},
+		Products: []types.ProductType{types.ProductIRI},
+	})
+	got := sub.destinationsInUse()
+	if len(got) != 2 {
+		t.Fatalf("destinationsInUse() = %v, want both warrants' endpoints", got)
+	}
+
+	// Both warrants end. Whatever their delivery clients last established, this element no
+	// longer delivers anywhere.
+	st.Deactivate("aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa")
+	st.Deactivate("bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb")
+	if got := sub.destinationsInUse(); len(got) != 0 {
+		t.Errorf("after every warrant was withdrawn the element still delivers to %v; a client "+
+			"left failing there would report a fault nothing could clear", got)
+	}
+}
