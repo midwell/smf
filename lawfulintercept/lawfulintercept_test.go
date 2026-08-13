@@ -5,6 +5,7 @@ package lawfulintercept
 
 import (
 	"bytes"
+	"net"
 	"strings"
 	"sync"
 	"testing"
@@ -38,6 +39,9 @@ func targetSM() *smfctx.SMContext {
 		PDUSessionID:           5,
 		SelectedPDUSessionType: 1, // IPv4
 		Snssai:                 &models.Snssai{Sst: 1, Sd: &sd},
+		// An established session has an address assigned, and it is the subject's
+		// own — not the serving UPF's, which servingUPFTEID reports separately.
+		PDUAddress: &smfctx.UeIpAddr{Ip: net.ParseIP("10.45.0.2")},
 	}
 }
 
@@ -770,5 +774,91 @@ func TestDestinationsInUseFollowsTheTasking(t *testing.T) {
 	if got := sub.destinationsInUse(); len(got) != 0 {
 		t.Errorf("after every warrant was withdrawn the element still delivers to %v; a client "+
 			"left failing there would report a fault nothing could clear", got)
+	}
+}
+
+// TestUEEndpointMapping covers the gap this change exists to close: the records
+// carried the serving UPF's tunnel endpoint but never the subject's own address,
+// so an agency could not tell what address the target was using. The two are
+// different fields and must not be confused.
+func TestUEEndpointMapping(t *testing.T) {
+	sc := targetSM()
+
+	est := smfEstablishment(sc)
+	if len(est.UEEndpoint) != 1 {
+		t.Fatalf("establishment uEEndpoint has %d entries, want 1", len(est.UEEndpoint))
+	}
+	v4, ok := est.UEEndpoint[0].(iri.IPv4Address)
+	if !ok {
+		t.Fatalf("establishment uEEndpoint[0] = %T, want iri.IPv4Address", est.UEEndpoint[0])
+	}
+	if !bytes.Equal(v4, iri.IPv4Address{10, 45, 0, 2}) {
+		t.Errorf("establishment uEEndpoint = % x, want 0a 2d 00 02", v4)
+	}
+
+	soi := smfStartOfInterception(sc)
+	if len(soi.UEEndpoint) != 1 {
+		t.Fatalf("start-of-interception uEEndpoint has %d entries, want 1", len(soi.UEEndpoint))
+	}
+	if !bytes.Equal(soi.UEEndpoint[0].(iri.IPv4Address), v4) {
+		t.Error("the two records disagree on the session's address")
+	}
+}
+
+// TestUEEndpointIsNotTheTunnelEndpoint: gTPTunnelID comes from the serving UPF,
+// uEEndpoint from the subject's session. Reporting the UPF's address as the
+// subject's would be worse than reporting nothing, because it looks like an answer.
+func TestUEEndpointIsNotTheTunnelEndpoint(t *testing.T) {
+	sc := targetSM()
+	est := smfEstablishment(sc)
+	tunnel := est.GTPTunnelID.IPv4Address
+	ue := []byte(est.UEEndpoint[0].(iri.IPv4Address))
+	if tunnel != nil && bytes.Equal(tunnel, ue) {
+		t.Errorf("uEEndpoint (% x) equals the tunnel endpoint (% x); they are different addresses", ue, tunnel)
+	}
+}
+
+// TestUEEndpointAbsentAddress: a session with no address assigned must omit the
+// optional field on the establishment record rather than emit an empty list, and
+// must not produce a start-of-interception record at all — its uEEndpoint is
+// mandatory, and an empty one asserts the session has no address.
+func TestUEEndpointAbsentAddress(t *testing.T) {
+	sc := targetSM()
+	sc.PDUAddress = nil
+
+	if got := ueEndpoint(sc); got != nil {
+		t.Errorf("ueEndpoint with no address = %#v, want nil", got)
+	}
+
+	est := smfEstablishment(sc)
+	if est.UEEndpoint != nil {
+		t.Errorf("establishment uEEndpoint = %#v, want nil (field omitted)", est.UEEndpoint)
+	}
+	if _, err := iri.EncodeXIRI(iri.NewContext(), est); err != nil {
+		t.Errorf("establishment must still encode without an address: %v", err)
+	}
+
+	// The mandatory-field record must be refused, not silently emitted empty.
+	if _, err := iri.EncodeXIRI(iri.NewContext(), smfStartOfInterception(sc)); err == nil {
+		t.Error("start-of-interception encoded with an empty uEEndpoint; want a refusal")
+	}
+}
+
+// TestUEEndpointIPv6 checks the v6 arm maps through, since PDUAddress carries
+// either family.
+func TestUEEndpointIPv6(t *testing.T) {
+	sc := targetSM()
+	sc.PDUAddress = &smfctx.UeIpAddr{Ip: net.ParseIP("2001:db8::1")}
+
+	est := smfEstablishment(sc)
+	if len(est.UEEndpoint) != 1 {
+		t.Fatalf("uEEndpoint has %d entries, want 1", len(est.UEEndpoint))
+	}
+	v6, ok := est.UEEndpoint[0].(iri.IPv6Address)
+	if !ok {
+		t.Fatalf("uEEndpoint[0] = %T, want iri.IPv6Address", est.UEEndpoint[0])
+	}
+	if len(v6) != 16 {
+		t.Errorf("IPv6Address is %d bytes, want 16", len(v6))
 	}
 }

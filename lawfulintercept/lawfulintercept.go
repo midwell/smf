@@ -475,7 +475,11 @@ func (s *subsystem) reportStartOfInterception(task types.InterceptTask) {
 	wantIRI := task.WantsProduct(types.ProductIRI)
 	s.scanSessions(task, func(sc *smfctx.SMContext) any {
 		var event any
-		if wantIRI {
+		// uEEndpoint is mandatory in this record, and an empty list would assert
+		// the session has no endpoint address. A session with no address assigned
+		// is not one this record can describe, so report nothing for it rather
+		// than something untrue — the CC work below is unaffected either way.
+		if wantIRI && ueEndpoint(sc) != nil {
 			event = smfStartOfInterception(sc)
 		}
 		if s.applyCC(sc) {
@@ -716,10 +720,26 @@ func smfEstablishment(sc *smfctx.SMContext) iri.SMFPDUSessionEstablishment {
 		GTPTunnelID:    servingUPFTEID(sc),
 		PDUSessionType: iri.PDUSessionType(sc.SelectedPDUSessionType),
 		SNSSAI:         snssai(sc),
+		UEEndpoint:     ueEndpoint(sc),
 		DNN:            iri.DNN(sc.Dnn),
 		RequestType:    requestType(sc),
 		AccessType:     accessType(sc),
 	}
+}
+
+// ueEndpoint is the address assigned to the subject's session — distinct from
+// servingUPFTEID, which carries the serving UPF's tunnel endpoint. Reporting only
+// the latter tells an agency which network element carried the traffic but not
+// which address the target was using, and the second is what an investigation
+// correlates against.
+//
+// Nil when no address has been assigned, so the record omits the field rather
+// than claiming the session has no endpoint address.
+func ueEndpoint(sc *smfctx.SMContext) []any {
+	if sc == nil || sc.PDUAddress == nil {
+		return nil
+	}
+	return iri.UEEndpoint(sc.PDUAddress.Ip)
 }
 
 // smfStartOfInterception maps an SMContext to a TS 33.128
@@ -735,6 +755,7 @@ func smfStartOfInterception(sc *smfctx.SMContext) iri.SMFStartOfInterceptionWith
 		GTPTunnelID:    servingUPFTEID(sc),
 		PDUSessionType: iri.PDUSessionType(sc.SelectedPDUSessionType),
 		SNSSAI:         snssai(sc),
+		UEEndpoint:     ueEndpoint(sc),
 		DNN:            iri.DNN(sc.Dnn),
 		RequestType:    iri.SMRequestExisting,
 		AccessType:     accessType(sc),
