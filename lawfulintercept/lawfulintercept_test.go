@@ -5,12 +5,14 @@ package lawfulintercept
 
 import (
 	"bytes"
+	"strings"
 	"sync"
 	"testing"
 
 	"github.com/omec-project/li/iri"
 	"github.com/omec-project/li/store"
 	"github.com/omec-project/li/types"
+	"github.com/omec-project/li/x1"
 	"github.com/omec-project/li/x2x3"
 	"github.com/omec-project/openapi/v2/models"
 	smfctx "github.com/omec-project/smf/context"
@@ -651,5 +653,72 @@ func TestATaskNamingNoDestinationFallsBackToConfiguration(t *testing.T) {
 
 	if n := len(capture.sent[configuredMDF2]); n != 1 {
 		t.Errorf("the configured endpoint received %d records, want 1", n)
+	}
+}
+
+// TestDeliveryFaultIsReportedOnBothEdges covers this element's contribution to its own
+// status answer, and all three assertions are the point rather than one of them.
+//
+// A probe stuck *off* leaves an element that has been failing to deliver for hours
+// answering that nothing is wrong — invisible, and the reason an ADMF can ask at all. A
+// probe stuck *on* makes every healthy element report itself faulty, which is noticed
+// immediately and discredits the whole field; that is how this library's predecessor probe
+// failed. So two of the three assertions below are about the probe staying quiet.
+func TestDeliveryFaultIsReportedOnBothEdges(t *testing.T) {
+	unreachable := 0
+	sub := &subsystem{unreachable: func() (int, int) { return unreachable, 2 }}
+
+	if fault := sub.deliveryFault(); fault != nil {
+		t.Errorf("with both destinations reachable the element reports itself faulty: %q",
+			fault.ErrorDescription)
+	}
+
+	unreachable = 1
+	fault := sub.deliveryFault()
+	if fault == nil {
+		t.Fatal("with a destination unreachable the element reports no fault; an ADMF cannot " +
+			"tell it apart from one delivering every record")
+	}
+	if !strings.Contains(fault.ErrorDescription, x1.NEIssueMDFUnreachable) {
+		t.Errorf("the fault does not name the condition: %q", fault.ErrorDescription)
+	}
+	if !strings.Contains(fault.ErrorDescription, "1 of 2") {
+		t.Errorf("the fault does not say how much is wrong: %q", fault.ErrorDescription)
+	}
+
+	// Nothing clears it. Delivery starts working and the next answer says so, which is the
+	// property no design that remembers faults can offer.
+	unreachable = 0
+	if fault := sub.deliveryFault(); fault != nil {
+		t.Errorf("the fault outlived the condition, with nothing having cleared it: %q",
+			fault.ErrorDescription)
+	}
+}
+
+// TestDeliveryFaultNamesNoDestination keeps the NE-level answer at NE level. This element
+// may deliver two agencies' warrants to two MDF2s; TS 103 221-1 keeps an element's own
+// status separate from per-destination and per-task faults, and an answer naming the failing
+// address would put interception detail in a message that is not scoped to a warrant.
+func TestDeliveryFaultNamesNoDestination(t *testing.T) {
+	sub := &subsystem{unreachable: func() (int, int) { return 1, 2 }}
+
+	fault := sub.deliveryFault()
+	if fault == nil {
+		t.Fatal("no fault reported for an unreachable destination")
+	}
+	for _, identity := range []string{"10.0.60.122", "42069", "208930100007488"} {
+		if strings.Contains(fault.ErrorDescription, identity) {
+			t.Errorf("the element's own status names %q; it must say how much is wrong, never whose",
+				identity)
+		}
+	}
+}
+
+// TestDeliveryFaultWithNoAccountingIsSilent: an element that cannot say is not an element
+// that is broken. The probe runs on the X1 request goroutine, where reporting a fault
+// nobody observed — or panicking — are both worse than answering that nothing is known.
+func TestDeliveryFaultWithNoAccountingIsSilent(t *testing.T) {
+	if fault := (&subsystem{}).deliveryFault(); fault != nil {
+		t.Errorf("an element with no delivery accounting reported a fault: %q", fault.ErrorDescription)
 	}
 }

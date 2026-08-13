@@ -86,6 +86,11 @@ type subsystem struct {
 	// X1: two warrants may name two agencies' MDF2s, and delivering both to one address
 	// is cross-agency disclosure.
 	senderFor func(addr string) sender
+	// unreachable answers how many of the destinations this element has delivered to
+	// cannot currently be reached, and how many it has used at all — the delivery pool's
+	// own accounting. A function rather than the pool itself for the same reason senderFor
+	// is one: a test states a delivery condition without an MDF to take away.
+	unreachable func() (unreachable, inUse int)
 	// mdf2 is the configured X2 endpoint, used only for a task that names no
 	// destination this element can resolve.
 	mdf2     string
@@ -99,6 +104,32 @@ type subsystem struct {
 	// configured, in which case CC duplication is still applied but the UPF is
 	// never told whose warrant it serves — so it delivers nothing.
 	triggers *triggerRegistry
+}
+
+// deliveryFault is what this element can answer about itself when an ADMF asks for its
+// status: whether the mediation functions it delivers to are reachable right now.
+//
+// Only the delivery clients know this — li/x1 holds the tasking, not the sockets — so
+// without it the element would answer that no observable condition holds however long it had
+// been failing to deliver. That answer is true and useless, and it is ignored exactly as
+// fast as an element that always reports itself faulty.
+//
+// It answers from what the last delivery attempt established and dials nothing, because it
+// runs on the X1 request goroutine: a probe that went looking would hold up a provisioning
+// function's answer.
+//
+// This is the element's own status, so it covers this POI's X2 delivery only. Whether the
+// UPF it triggers can reach its MDF3 is that element's status to report, and it has an X1
+// interface of its own to report it on.
+//
+// A subsystem with no delivery accounting reports nothing rather than panicking on the X1
+// request path — an element that cannot say is not an element that is broken.
+func (s *subsystem) deliveryFault() *x1.X1Error {
+	if s.unreachable == nil {
+		return nil
+	}
+
+	return x1.MDFUnreachableProbe(s.unreachable)()
 }
 
 // active holds the running subsystem, or nil when LI is not configured.
@@ -136,12 +167,13 @@ func Init(cfg Config) error {
 		nil, // drops are covered by the same MDF-unreachable report from the worker
 	)
 	sub := &subsystem{
-		store:     st,
-		senderFor: func(addr string) sender { return pool.For(addr) },
-		mdf2:      cfg.MDF2,
-		iriCtx:    iri.NewContext(),
-		neID:      cfg.NEID,
-		reporter:  reporter,
+		store:       st,
+		senderFor:   func(addr string) sender { return pool.For(addr) },
+		unreachable: pool.Unreachable,
+		mdf2:        cfg.MDF2,
+		iriCtx:      iri.NewContext(),
+		neID:        cfg.NEID,
+		reporter:    reporter,
 	}
 	// Assign the interface only when a reporter exists: a typed-nil would pass the
 	// nil check in reportTaskIssue and then panic on use.
@@ -183,6 +215,9 @@ func Init(cfg Config) error {
 	x1srv := x1.NewServer(st, cfg.NEID,
 		x1.WithADMF(cfg.AdmfID),
 		x1.WithConfiguredDestinations(configuredDestinations(cfg.Destinations, reporter)...),
+		// The conditions this POI can observe about itself, which li/x1 cannot: see
+		// subsystem.deliveryFault.
+		x1.WithFaultProbes(sub.deliveryFault),
 		x1.OnActivate(sub.reportStartOfInterception),
 		x1.OnDeactivate(sub.reportDeactivation),
 		x1.OnAuthFailure(func(code int) {
