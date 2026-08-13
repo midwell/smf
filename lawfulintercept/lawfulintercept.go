@@ -346,6 +346,59 @@ func ReportEstablishment(sc *smfctx.SMContext) {
 	sub.deliverIRI(sub.matchingTasks(sc), correlationOf(sc), smfEstablishment(sc))
 }
 
+// ReportEstablishmentReject emits an SMFUnsuccessfulProcedure xIRI when the SMF
+// refuses a PDU session establishment for a tasked target. cause is the 5GSM
+// cause the reject itself carries, so the record and the wire cannot disagree.
+//
+// A target whose sessions are being refused otherwise produces no record at all,
+// and to an agency that silence is indistinguishable from a subject who never
+// tried. No-op and silent when LI is inactive or sc is not a target.
+func ReportEstablishmentReject(sc *smfctx.SMContext, cause uint8) {
+	reportUnsuccessful(sc, iri.SMFFailedPDUSessionEstablishment, cause)
+}
+
+// ReportReleaseReject emits an SMFUnsuccessfulProcedure xIRI when the SMF refuses
+// a PDU session release for a tasked target. cause is the 5GSM cause the reject
+// carries.
+func ReportReleaseReject(sc *smfctx.SMContext, cause uint8) {
+	reportUnsuccessful(sc, iri.SMFFailedPDUSessionRelease, cause)
+}
+
+// reportUnsuccessful is the shared body. It cannot fail the procedure it reports:
+// every step is a read, deliverIRI swallows its own errors, and nothing here
+// returns to the caller (design D3). That matters more here than elsewhere —
+// these hooks sit on paths that are already failing, which is where error
+// handling is least exercised.
+func reportUnsuccessful(sc *smfctx.SMContext, procedure iri.SMFFailedProcedureType, cause uint8) {
+	sub := active.Load()
+	if sub == nil || sc == nil {
+		return
+	}
+	sub.deliverIRI(sub.matchingTasks(sc), correlationOf(sc), smfUnsuccessful(sc, procedure, cause))
+}
+
+// smfUnsuccessful maps a refused procedure to a TS 33.128
+// SMFUnsuccessfulProcedure record (XIRIEvent [10]).
+//
+// initiator is always network: the field says who is "initiating the rejection",
+// and on every path SD-Core has, that is the SMF. uE would appear only on a
+// PDU SESSION MODIFICATION COMMAND REJECT, which this SMF does not handle.
+func smfUnsuccessful(sc *smfctx.SMContext, procedure iri.SMFFailedProcedureType, cause uint8) iri.SMFUnsuccessfulProcedure {
+	return iri.SMFUnsuccessfulProcedure{
+		FailedProcedureType: procedure,
+		FailureCause:        iri.FiveGSMCause(cause),
+		Initiator:           iri.InitiatorNetwork,
+		SUPI:                supiChoice(sc),
+		PEI:                 peiChoice(sc),
+		GPSI:                gpsiChoice(sc),
+		PDUSessionID:        iri.PDUSessionID(sc.PDUSessionID),
+		UEEndpoint:          ueEndpoint(sc),
+		DNN:                 iri.DNN(sc.Dnn),
+		RequestType:         requestType(sc),
+		AccessType:          accessType(sc),
+	}
+}
+
 // ReportModification emits an SMFPDUSessionModification xIRI for sc if it
 // matches an active task. No-op and silent otherwise.
 func ReportModification(sc *smfctx.SMContext) {

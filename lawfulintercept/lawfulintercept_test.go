@@ -5,6 +5,7 @@ package lawfulintercept
 
 import (
 	"bytes"
+	"errors"
 	"net"
 	"strings"
 	"sync"
@@ -15,8 +16,10 @@ import (
 	"github.com/omec-project/li/types"
 	"github.com/omec-project/li/x1"
 	"github.com/omec-project/li/x2x3"
+	"github.com/omec-project/nas/v2/nasMessage"
 	"github.com/omec-project/openapi/v2/models"
 	smfctx "github.com/omec-project/smf/context"
+	"github.com/omec-project/smf/smferrors"
 )
 
 // captureSender records the xIRI PDUs delivered, standing in for the X2 client
@@ -860,5 +863,178 @@ func TestUEEndpointIPv6(t *testing.T) {
 	}
 	if len(v6) != 16 {
 		t.Errorf("IPv6Address is %d bytes, want 16", len(v6))
+	}
+}
+
+// activateIRISub installs a subsystem holding tasks and delivering everything to
+// snd, wired the way the production one is.
+func activateIRISub(t *testing.T, snd sender, tasks ...types.InterceptTask) {
+	t.Helper()
+	st := store.New()
+	for _, task := range tasks {
+		if !st.Activate(task) {
+			t.Fatalf("activate %+v", task)
+		}
+	}
+	active.Store(&subsystem{
+		store:     st,
+		senderFor: func(string) sender { return snd },
+		mdf2:      configuredMDF2,
+		iriCtx:    iri.NewContext(),
+		neID:      "ne",
+	})
+	t.Cleanup(func() { active.Store(nil) })
+}
+
+// iriTask is an IRI warrant for the standard test target, delivering to one
+// address so a captureSender sees everything it produces.
+func iriTask() types.InterceptTask {
+	return types.InterceptTask{
+		XID:        types.XID("aaaaaaaa-0000-0000-0000-000000000001"),
+		Targets:    []types.TargetIdentifier{{Type: types.TargetSUPI, Value: "262019876543210"}},
+		Products:   []types.ProductType{types.ProductIRI},
+		Deliveries: []types.DeliveryEndpoint{{Type: types.DeliveryX2, Address: "10.0.60.122:42069"}},
+		State:      types.TaskActive,
+	}
+}
+
+// decodeOne decodes the single xIRI a capture holds, and fails if there is not
+// exactly one — "at least one record arrived" is the assertion that let an empty
+// uEEndpoint through for months.
+func decodeOne(t *testing.T, cap *captureSender) any {
+	t.Helper()
+	if len(cap.pdus) != 1 {
+		t.Fatalf("captured %d PDUs, want exactly 1", len(cap.pdus))
+	}
+	var payload iri.XIRIPayload
+	if _, err := iri.NewContext().Decode(cap.pdus[0].Payload, &payload); err != nil {
+		t.Fatalf("decode xIRI: %v", err)
+	}
+	return payload.Event
+}
+
+// TestUnsuccessfulProcedureReportsRefusedEstablishment covers task 3.1 for the
+// sixteen establishment paths: a refused session for a tasked target produces a
+// record naming the procedure, the cause and the initiator.
+func TestUnsuccessfulProcedureReportsRefusedEstablishment(t *testing.T) {
+	cap := &captureSender{}
+	activateIRISub(t, cap, iriTask())
+
+	ReportEstablishmentReject(targetSM(), nasMessage.Cause5GSMInsufficientResources)
+
+	rec, ok := decodeOne(t, cap).(iri.SMFUnsuccessfulProcedure)
+	if !ok {
+		t.Fatalf("decoded a %T, want SMFUnsuccessfulProcedure", decodeOne(t, cap))
+	}
+	if rec.FailedProcedureType != iri.SMFFailedPDUSessionEstablishment {
+		t.Errorf("failedProcedureType = %d, want pDUSessionEstablishment(1)", rec.FailedProcedureType)
+	}
+	if rec.FailureCause != iri.FiveGSMCause(nasMessage.Cause5GSMInsufficientResources) {
+		t.Errorf("failureCause = %d, want %d", rec.FailureCause, nasMessage.Cause5GSMInsufficientResources)
+	}
+	if rec.Initiator != iri.InitiatorNetwork {
+		t.Errorf("initiator = %d, want network(2) — the SMF is refusing", rec.Initiator)
+	}
+	if supi, ok := rec.SUPI.(iri.IMSI); !ok || supi != "262019876543210" {
+		t.Errorf("SUPI = %#v", rec.SUPI)
+	}
+}
+
+// TestUnsuccessfulProcedureReportsRefusedRelease covers the other three sites:
+// same record, different procedure.
+func TestUnsuccessfulProcedureReportsRefusedRelease(t *testing.T) {
+	cap := &captureSender{}
+	activateIRISub(t, cap, iriTask())
+
+	ReportReleaseReject(targetSM(), nasMessage.Cause5GSMRequestRejectedUnspecified)
+
+	rec := decodeOne(t, cap).(iri.SMFUnsuccessfulProcedure) //nolint:errcheck // asserted below
+	if rec.FailedProcedureType != iri.SMFFailedPDUSessionRelease {
+		t.Errorf("failedProcedureType = %d, want pDUSessionRelease(3)", rec.FailedProcedureType)
+	}
+	if rec.FailureCause != iri.FiveGSMCause(nasMessage.Cause5GSMRequestRejectedUnspecified) {
+		t.Errorf("failureCause = %d", rec.FailureCause)
+	}
+}
+
+// TestUnsuccessfulProcedureSilentForUntaskedSubscriber is the other half of 3.1,
+// and the one that matters for undetectability: a refusal for someone who is not
+// under warrant must produce nothing at all.
+func TestUnsuccessfulProcedureSilentForUntaskedSubscriber(t *testing.T) {
+	cap := &captureSender{}
+	activateIRISub(t, cap, types.InterceptTask{
+		XID:        "aaaaaaaa-0000-0000-0000-000000000009",
+		Targets:    []types.TargetIdentifier{{Type: types.TargetSUPI, Value: "999999999999999"}},
+		Products:   []types.ProductType{types.ProductIRI},
+		Deliveries: []types.DeliveryEndpoint{{Type: types.DeliveryX2, Address: "10.0.60.122:42069"}},
+		State:      types.TaskActive,
+	})
+
+	ReportEstablishmentReject(targetSM(), nasMessage.Cause5GSMInsufficientResources)
+	ReportReleaseReject(targetSM(), nasMessage.Cause5GSMRequestRejectedUnspecified)
+
+	if len(cap.pdus) != 0 {
+		t.Errorf("an untasked subscriber's refusal produced %d PDU(s)", len(cap.pdus))
+	}
+}
+
+// TestUnsuccessfulProcedureCannotWorsenTheFailure covers task 3.2 and design D3.
+// These hooks sit on paths that are already failing, which is where error handling
+// is least exercised — so the reporter must survive a nil context, a delivery that
+// errors, and no subsystem at all, and must never panic or return anything the
+// caller could mistake for a new failure.
+func TestUnsuccessfulProcedureCannotWorsenTheFailure(t *testing.T) {
+	t.Run("no subsystem", func(t *testing.T) {
+		active.Store(nil)
+		ReportEstablishmentReject(targetSM(), 26)
+		ReportReleaseReject(targetSM(), 26)
+	})
+
+	t.Run("nil context", func(t *testing.T) {
+		activateIRISub(t, &captureSender{}, iriTask())
+		ReportEstablishmentReject(nil, 26)
+		ReportReleaseReject(nil, 26)
+	})
+
+	t.Run("delivery fails", func(t *testing.T) {
+		activateIRISub(t, senderFunc(func(*x2x3.PDU) error { return errors.New("MDF unreachable") }), iriTask())
+		ReportEstablishmentReject(targetSM(), 26)
+		ReportReleaseReject(targetSM(), 26)
+	})
+
+	// Reaching here at all is the assertion: none of the above panicked, blocked,
+	// or had a value the rejection path could propagate.
+}
+
+// TestUnsuccessfulProcedureCauseMatchesTheReject covers task 3.3: the record's
+// failureCause is whatever the reject put on the wire, read from the same table.
+//
+// The assertion is agreement, not distinctness — most keys share
+// Cause5GSMRequestRejectedUnspecified, so a test demanding a unique cause per
+// path would be asserting something the SMF does not do.
+func TestUnsuccessfulProcedureCauseMatchesTheReject(t *testing.T) {
+	keys := []string{
+		"DnnNotSupported", "UDMDiscoveryFailure", "IpAllocError",
+		"SubscriptionDataFetchError", "SubscriptionDataLenError",
+		"PDUSessionTypeIPv4OnlyAllowed", "PCFDiscoveryFailure", "PCFPolicyCreateFailure",
+		"UPFDataPathError", "InsufficientResourceSliceDnn", "AMFDiscoveryFailure",
+		"InvalidPDUSessionIdentity",
+	}
+	for _, key := range keys {
+		t.Run(key, func(t *testing.T) {
+			want, ok := smferrors.ErrorCause[key]
+			if !ok {
+				t.Fatalf("%s is not in smferrors.ErrorCause — the mapping this test guards has moved", key)
+			}
+			cap := &captureSender{}
+			activateIRISub(t, cap, iriTask())
+
+			ReportEstablishmentReject(targetSM(), want)
+
+			rec := decodeOne(t, cap).(iri.SMFUnsuccessfulProcedure) //nolint:errcheck // asserted by construction
+			if rec.FailureCause != iri.FiveGSMCause(want) {
+				t.Errorf("failureCause = %d, want %d (the value the reject carries)", rec.FailureCause, want)
+			}
+		})
 	}
 }

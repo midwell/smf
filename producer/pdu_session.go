@@ -100,6 +100,24 @@ func formContextCreateErrRsp(httpStatus int, problemBody models.ExtProblemDetail
 	}
 }
 
+// rejectEstablishment refuses a PDU session establishment and reports the refusal
+// to the LI subsystem, which emits an SMFUnsuccessfulProcedure xIRI if the
+// subscriber is under an active warrant.
+//
+// It exists so the two cannot come apart. There are sixteen rejection paths in
+// HandlePDUSessionSMContextCreate; a hook added to each of them individually is a
+// hook that a seventeenth path will be written without. The LI call is a no-op
+// for an untasked subscriber and cannot fail the rejection — see
+// lawfulintercept.reportUnsuccessful.
+//
+// The cause passed to LI is read from the same errors table the reject is built
+// from, so the record and the wire cannot disagree about why the session failed.
+func rejectEstablishment(smContext *smf_context.SMContext, cause string) *httpwrapper.Response {
+	rsp := smContext.GeneratePDUSessionEstablishmentReject(cause)
+	lawfulintercept.ReportEstablishmentReject(smContext, smferrors.ErrorCause[cause])
+	return rsp
+}
+
 func HandlePduSessionContextReplacement(smCtxtRef string) error {
 	smCtxt := smf_context.GetSMContext(smCtxtRef)
 
@@ -175,18 +193,18 @@ func HandlePDUSessionSMContextCreate(eventData interface{}) error {
 	if smContext.DNNInfo == nil {
 		smContext.SubPduSessLog.Errorf("PDUSessionSMContextCreate, S-NSSAI[sst: %d, sd: %s] DNN[%s] not matched DNN Config",
 			createData.SNssai.Sst, createData.SNssai.Sd, createData.Dnn)
-		txn.Rsp = smContext.GeneratePDUSessionEstablishmentReject("DnnNotSupported")
+		txn.Rsp = rejectEstablishment(smContext, "DnnNotSupported")
 		return fmt.Errorf("SnssaiError")
 	}
 
 	// Query UDM
 	if problemDetails, err := consumer.SendNFDiscoveryUDM(); err != nil {
 		smContext.SubPduSessLog.Errorf("PDUSessionSMContextCreate, send NF Discovery Serving UDM Error[%+v]", err)
-		txn.Rsp = smContext.GeneratePDUSessionEstablishmentReject("UDMDiscoveryFailure")
+		txn.Rsp = rejectEstablishment(smContext, "UDMDiscoveryFailure")
 		return fmt.Errorf("UdmError")
 	} else if problemDetails != nil {
 		smContext.SubPduSessLog.Errorf("PDUSessionSMContextCreate, send NF Discovery Serving UDM Problem[%+v]", problemDetails)
-		txn.Rsp = smContext.GeneratePDUSessionEstablishmentReject("UDMDiscoveryFailure")
+		txn.Rsp = rejectEstablishment(smContext, "UDMDiscoveryFailure")
 		return fmt.Errorf("UdmError")
 	} else {
 		smContext.SubPduSessLog.Debugf("PDUSessionSMContextCreate, send NF Discovery Serving UDM Successful")
@@ -195,7 +213,7 @@ func HandlePDUSessionSMContextCreate(eventData interface{}) error {
 	// IP Allocation
 	if ip, err := smContext.DNNInfo.UeIPAllocator.Allocate(smContext.Supi); err != nil {
 		smContext.SubPduSessLog.Errorln("PDUSessionSMContextCreate, failed allocate IP address: ", err)
-		txn.Rsp = smContext.GeneratePDUSessionEstablishmentReject("IpAllocError")
+		txn.Rsp = rejectEstablishment(smContext, "IpAllocError")
 		return fmt.Errorf("IpAllocError")
 	} else {
 		smContext.PDUAddress = &smf_context.UeIpAddr{Ip: ip, UpfProvided: false}
@@ -253,7 +271,7 @@ func HandlePDUSessionSMContextCreate(eventData interface{}) error {
 		} else {
 			metrics.IncrementSvcUdmMsgStats(smfSelf.NfInstanceID, string(svcmsgtypes.SmSubscriptionDataRetrieval), "In", http.StatusText(rsp.StatusCode), err.Error())
 			smContext.SubPduSessLog.Errorln("PDUSessionSMContextCreate, get SessionManagementSubscriptionData error: ", err)
-			txn.Rsp = smContext.GeneratePDUSessionEstablishmentReject("SubscriptionDataFetchError")
+			txn.Rsp = rejectEstablishment(smContext, "SubscriptionDataFetchError")
 			return fmt.Errorf("SubscriptionError")
 		}
 	} else {
@@ -271,7 +289,7 @@ func HandlePDUSessionSMContextCreate(eventData interface{}) error {
 		} else {
 			metrics.IncrementSvcUdmMsgStats(smfSelf.NfInstanceID, string(svcmsgtypes.SmSubscriptionDataRetrieval), "In", http.StatusText(rsp.StatusCode), "NilSubscriptionData")
 			smContext.SubPduSessLog.Errorln("PDUSessionSMContextCreate, SessionManagementSubscriptionData from UDM is nil")
-			txn.Rsp = smContext.GeneratePDUSessionEstablishmentReject("SubscriptionDataLenError")
+			txn.Rsp = rejectEstablishment(smContext, "SubscriptionDataLenError")
 			return fmt.Errorf("NoSubscriptionError")
 		}
 	}
@@ -280,19 +298,19 @@ func HandlePDUSessionSMContextCreate(eventData interface{}) error {
 	establishmentRequest := m.PDUSessionEstablishmentRequest
 	if err := smContext.HandlePDUSessionEstablishmentRequest(establishmentRequest); err != nil {
 		smContext.SubPduSessLog.Errorf("PDUSessionSMContextCreate, invalid PDU session establishment request: %v", err)
-		txn.Rsp = smContext.GeneratePDUSessionEstablishmentReject("PDUSessionTypeIPv4OnlyAllowed")
+		txn.Rsp = rejectEstablishment(smContext, "PDUSessionTypeIPv4OnlyAllowed")
 		return fmt.Errorf("invalid PDU session establishment request: %w", err)
 	}
 
 	if smContext.SelectedPDUSessionType == nasMessage.PDUSessionTypeUnstructured {
 		smContext.SubPduSessLog.Errorf("Unstructured PDU Session Not Supported")
-		txn.Rsp = smContext.GeneratePDUSessionEstablishmentReject("PDUSessionTypeIPv4OnlyAllowed")
+		txn.Rsp = rejectEstablishment(smContext, "PDUSessionTypeIPv4OnlyAllowed")
 		return fmt.Errorf("unstructured PDU Session not supported")
 	}
 
 	if err := smContext.PCFSelection(); err != nil {
 		smContext.SubPduSessLog.Errorf("PDUSessionSMContextCreate, send NF Discovery Serving PCF Error[%v]", err)
-		txn.Rsp = smContext.GeneratePDUSessionEstablishmentReject("PCFDiscoveryFailure")
+		txn.Rsp = rejectEstablishment(smContext, "PCFDiscoveryFailure")
 		return fmt.Errorf("PcfError")
 	}
 	smContext.SubPduSessLog.Debugln("PDUSessionSMContextCreate, send NF Discovery Serving PCF success")
@@ -303,12 +321,12 @@ func HandlePDUSessionSMContextCreate(eventData interface{}) error {
 	if smPolicyDecisionRsp, httpStatus, err := consumer.SendSMPolicyAssociationCreate(smContext); err != nil {
 		metrics.IncrementSvcPcfMsgStats(smfSelf.NfInstanceID, string(svcmsgtypes.SmPolicyAssociationCreate), "In", http.StatusText(httpStatus), err.Error())
 		smContext.SubPduSessLog.Errorln("PDUSessionSMContextCreate, SMPolicyAssociationCreate error: ", err)
-		txn.Rsp = smContext.GeneratePDUSessionEstablishmentReject("PCFPolicyCreateFailure")
+		txn.Rsp = rejectEstablishment(smContext, "PCFPolicyCreateFailure")
 		return fmt.Errorf("PcfAssoError")
 	} else if httpStatus != http.StatusCreated {
 		metrics.IncrementSvcPcfMsgStats(smfSelf.NfInstanceID, string(svcmsgtypes.SmPolicyAssociationCreate), "In", http.StatusText(httpStatus), "error")
 		smContext.SubPduSessLog.Errorln("PDUSessionSMContextCreate, SMPolicyAssociationCreate http status: ", http.StatusText(httpStatus))
-		txn.Rsp = smContext.GeneratePDUSessionEstablishmentReject("PCFPolicyCreateFailure")
+		txn.Rsp = rejectEstablishment(smContext, "PCFPolicyCreateFailure")
 		return fmt.Errorf("PcfAssoError")
 	} else {
 		smContext.SubPduSessLog.Debugf("PDUSessionSMContextCreate, Policy association create success")
@@ -360,12 +378,12 @@ func HandlePDUSessionSMContextCreate(eventData interface{}) error {
 			smContext.Tunnel.AddDataPath(defaultPath)
 			if err := ensureDataPathUpfAssociated(defaultPath); err != nil {
 				smContext.SubPduSessLog.Errorf("PDUSessionSMContextCreate, UPF association recovery failed: %v", err)
-				txn.Rsp = smContext.GeneratePDUSessionEstablishmentReject("UPFDataPathError")
+				txn.Rsp = rejectEstablishment(smContext, "UPFDataPathError")
 				return fmt.Errorf("DataPathError")
 			}
 			if err := defaultPath.ActivateTunnelAndPDR(smContext, 255); err != nil {
 				smContext.SubPduSessLog.Errorf("PDUSessionSMContextCreate, data path error: %v", err.Error())
-				txn.Rsp = smContext.GeneratePDUSessionEstablishmentReject("UPFDataPathError")
+				txn.Rsp = rejectEstablishment(smContext, "UPFDataPathError")
 				return fmt.Errorf("DataPathError")
 			}
 		}
@@ -376,18 +394,18 @@ func HandlePDUSessionSMContextCreate(eventData interface{}) error {
 		smContext.SubCtxLog.Debugln("PDUSessionSMContextCreate, SMContextState Change State:", smContext.SMContextState.String())
 		smContext.SubPduSessLog.Errorf("PDUSessionSMContextCreate, data path not found for selection param %v", upfSelectionParams.String())
 
-		txn.Rsp = smContext.GeneratePDUSessionEstablishmentReject("InsufficientResourceSliceDnn")
+		txn.Rsp = rejectEstablishment(smContext, "InsufficientResourceSliceDnn")
 		return fmt.Errorf("InsufficientResourceSliceDnn")
 	}
 
 	// AMF Selection for SMF -> AMF communication
 	if problemDetails, err := consumer.SendNFDiscoveryServingAMF(smContext); err != nil {
 		smContext.SubPduSessLog.Errorf("PDUSessionSMContextCreate, send NF Discovery Serving AMF Error[%v]", err)
-		txn.Rsp = smContext.GeneratePDUSessionEstablishmentReject("AMFDiscoveryFailure")
+		txn.Rsp = rejectEstablishment(smContext, "AMFDiscoveryFailure")
 		return fmt.Errorf("AmfError")
 	} else if problemDetails != nil {
 		smContext.SubPduSessLog.Warnf("PDUSessionSMContextCreate, send NF Discovery Serving AMF Problem[%+v]", problemDetails)
-		txn.Rsp = smContext.GeneratePDUSessionEstablishmentReject("AMFDiscoveryFailure")
+		txn.Rsp = rejectEstablishment(smContext, "AMFDiscoveryFailure")
 		return fmt.Errorf("AmfError")
 	} else {
 		smContext.SubPduSessLog.Debugln("PDUSessionSMContextCreate, Send NF Discovery Serving AMF success")
@@ -705,6 +723,9 @@ func HandlePDUSessionSMContextRelease(eventData interface{}) error {
 		jsonData := models.NewSmContextUpdateError(problemDetail)
 		errResponse := models.NewUpdateSmContext400Response()
 		errResponse.SetJsonData(*jsonData)
+		// The reject carries a hardcoded 5GSM cause; report the same value so the
+		// record cannot disagree with the wire (design D7).
+		lawfulintercept.ReportReleaseReject(smContext, nasMessage.Cause5GSMRequestRejectedUnspecified)
 		if buf, err := smf_context.BuildGSMPDUSessionReleaseReject(smContext); err != nil {
 			smContext.SubPduSessLog.Errorf("PDUSessionSMContextRelease, build GSM PDUSessionReleaseReject failed: %+v", err)
 		} else {
@@ -735,6 +756,9 @@ func HandlePDUSessionSMContextRelease(eventData interface{}) error {
 		jsonData := models.NewSmContextUpdateError(problemDetail)
 		errResponse := models.NewUpdateSmContext400Response()
 		errResponse.SetJsonData(*jsonData)
+		// The reject carries a hardcoded 5GSM cause; report the same value so the
+		// record cannot disagree with the wire (design D7).
+		lawfulintercept.ReportReleaseReject(smContext, nasMessage.Cause5GSMRequestRejectedUnspecified)
 		if buf, err := smf_context.BuildGSMPDUSessionReleaseReject(smContext); err != nil {
 			smContext.SubPduSessLog.Errorf("PDUSessionSMContextRelease, build GSM PDUSessionReleaseReject failed: %+v", err)
 		} else {
