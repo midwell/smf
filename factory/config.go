@@ -106,6 +106,20 @@ type Li struct {
 	AdmfURL          string `yaml:"admfUrl"`          // ADMF X1 endpoint for NE-initiated issue reports (optional)
 	AdmfID           string `yaml:"admfId"`           // responsible ADMF identifier (for reports)
 	KeepaliveTimeout string `yaml:"keepaliveTimeout"` // duration; purge tasking if no X1 message within it (optional)
+
+	// DeactivateAllTasks and RemoveAllDestinations carry what TS 103 221-1 leaves to
+	// advance agreement between the operator and the agency: whether this element
+	// performs a bulk deactivation of all its tasking, and whether it performs a bulk
+	// removal of all its destinations.
+	//
+	// Both are tri-state. Unset — the pointer is nil — is "no agreement in advance",
+	// the standard's own phrase, and yields the standard's own defaults: bulk
+	// deactivation performed, bulk destination removal refused. They are pointers
+	// rather than plain bools so that "the operator said false" is a state distinct
+	// from "the operator said nothing", which for the first of them is the difference
+	// between refusing to stop every interception on this element and doing it.
+	DeactivateAllTasks    *bool `yaml:"deactivateAllTasks,omitempty"`
+	RemoveAllDestinations *bool `yaml:"removeAllDestinations,omitempty"`
 }
 
 // LiUPFTrigger is one UPF's LI_T3 triggering endpoint.

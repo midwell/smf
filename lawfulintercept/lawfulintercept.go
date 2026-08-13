@@ -55,6 +55,13 @@ type Config struct {
 	AdmfURL          string        // ADMF X1 endpoint for NE-initiated issue reports (empty = disabled)
 	AdmfID           string        // the responsible ADMF's identifier: authenticates inbound X1 peers and addresses outbound reports (empty accepts any certified ADMF)
 	KeepaliveTimeout time.Duration // purge tasking if no X1 message within this (0 = disabled)
+
+	// DeactivateAllTasks and RemoveAllDestinations are the two bulk operations
+	// TS 103 221-1 leaves to advance agreement between the operator and the agency.
+	// Nil is "no agreement in advance" and leaves the standard's defaults, which
+	// li/x1 holds; see x1.BulkOptions.
+	DeactivateAllTasks    *bool
+	RemoveAllDestinations *bool
 }
 
 // Destination is one pre-shared delivery destination: a DID an ADMF's tasks reference,
@@ -161,6 +168,45 @@ func (s *subsystem) destinationsInUse() []string {
 // active holds the running subsystem, or nil when LI is not configured.
 var active atomic.Pointer[subsystem]
 
+// newX1Server builds this element's X1 provisioning endpoint from its configuration.
+//
+// Separate from Init so that what an operator's configuration does to the X1 server can be
+// asserted against the server this element actually runs, rather than against a second
+// copy of the same wiring written in a test — which is where a configured policy quietly
+// stops being applied.
+func newX1Server(st *store.Store, cfg Config, sub *subsystem) *x1.Server {
+	// OnActivate/OnDeactivate scan already-established sessions when a warrant is
+	// (de)tasked mid-session: emit the "start with established PDU
+	// session" xIRI and (de)activate CC duplication on live sessions.
+	// WithADMF holds X1 peers to the responsible ADMF's identity: a certificate
+	// from the LI CA authenticates a peer, but only this identifier may task us
+	// (TS 103 221-1 clause 8.2.4 + error 1040).
+	// A peer that fails that check is refused, and — since this plane deliberately
+	// logs nothing — would otherwise be refused in complete silence. The ADMF is the
+	// only party entitled to hear that someone is trying to task its network
+	// elements under an identity that is not theirs.
+	opts := []x1.Option{
+		x1.WithADMF(cfg.AdmfID),
+		x1.WithConfiguredDestinations(configuredDestinations(cfg.Destinations, sub.reporter)...),
+		// The conditions this POI can observe about itself, which li/x1 cannot: see
+		// subsystem.deliveryFault.
+		x1.WithFaultProbes(sub.deliveryFault),
+		x1.OnActivate(sub.reportStartOfInterception),
+		x1.OnDeactivate(sub.reportDeactivation),
+		x1.OnAuthFailure(func(code int) {
+			if sub.reporter != nil {
+				sub.reporter.Notify(x1.NEIssueX1AuthFailed,
+					fmt.Sprintf("X1 provisioning refused: peer failed authentication (error %d)", code))
+			}
+		}),
+	}
+	// The two bulk operations the standard settles by advance agreement rather than by
+	// what the element is. Unset leaves its defaults; li/x1 owns what unset means.
+	opts = append(opts, x1.BulkOptions(cfg.DeactivateAllTasks, cfg.RemoveAllDestinations)...)
+
+	return x1.NewServer(st, cfg.NEID, opts...)
+}
+
 // Init starts the SMF LI IRI-POI: it loads the LI credentials, opens the X1
 // listener (mutual TLS), and prepares X2 delivery to the MDF2. Call it once at
 // SMF startup, only when LI is configured.
@@ -231,30 +277,7 @@ func Init(cfg Config) error {
 		// revoked.
 		go sub.reconcileTriggers()
 	}
-	// OnActivate/OnDeactivate scan already-established sessions when a warrant is
-	// (de)tasked mid-session: emit the "start with established PDU
-	// session" xIRI and (de)activate CC duplication on live sessions.
-	// WithADMF holds X1 peers to the responsible ADMF's identity: a certificate
-	// from the LI CA authenticates a peer, but only this identifier may task us
-	// (TS 103 221-1 clause 8.2.4 + error 1040).
-	// A peer that fails that check is refused, and — since this plane deliberately
-	// logs nothing — would otherwise be refused in complete silence. The ADMF is the
-	// only party entitled to hear that someone is trying to task its network
-	// elements under an identity that is not theirs.
-	x1srv := x1.NewServer(st, cfg.NEID,
-		x1.WithADMF(cfg.AdmfID),
-		x1.WithConfiguredDestinations(configuredDestinations(cfg.Destinations, reporter)...),
-		// The conditions this POI can observe about itself, which li/x1 cannot: see
-		// subsystem.deliveryFault.
-		x1.WithFaultProbes(sub.deliveryFault),
-		x1.OnActivate(sub.reportStartOfInterception),
-		x1.OnDeactivate(sub.reportDeactivation),
-		x1.OnAuthFailure(func(code int) {
-			if sub.reporter != nil {
-				sub.reporter.Notify(x1.NEIssueX1AuthFailed,
-					fmt.Sprintf("X1 provisioning refused: peer failed authentication (error %d)", code))
-			}
-		}))
+	x1srv := newX1Server(st, cfg, sub)
 	// Bind the X1 listener synchronously so a bind/permission failure is reported
 	// to the caller, rather than being swallowed in a goroutine while LI already
 	// looks enabled (active.Store below) — otherwise no X1 tasking can be received.

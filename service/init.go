@@ -177,6 +177,8 @@ func (smf *SMF) Start() {
 			MDF3: li.MDF3, UPFTriggers: triggers,
 			Destinations: dests,
 			AdmfURL:      li.AdmfURL, AdmfID: li.AdmfID, KeepaliveTimeout: kaTimeout,
+			DeactivateAllTasks:    li.DeactivateAllTasks,
+			RemoveAllDestinations: li.RemoveAllDestinations,
 		}); err != nil {
 			// Do not name the subsystem or echo err (which carries LI-identifying
 			// text) on the general operator log: that would reveal to an unauthorized
