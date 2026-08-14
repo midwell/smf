@@ -713,6 +713,13 @@ func (s *subsystem) deliverIRI(tasks []types.InterceptTask, corr [8]byte, subjec
 		// carried to every destination it named: the number belongs to the (XID,
 		// Correlation ID) context, so two destinations receive one numbering.
 		matched, other := t.SplitTargets(subjectIDs)
+		// The number is taken here, per record *generated* for this task, and not below
+		// per record delivered. That ordering is deliberate twice over: a task resolving
+		// to no destination therefore consumes a number nobody receives, which is
+		// harmless because nobody is receiving a stream to see a gap in (design D3
+		// accepts the same effect for a destination added mid-task); and moving the call
+		// inside the destination loop would number each destination separately, which is
+		// the per-connection numbering clause 5.3.9 forbids.
 		attrs := s.ids.Attributes(xid, corr, at,
 			types.XMLFragments(matched), types.XMLFragments(other))
 		for _, addr := range s.x2Destinations(t) {

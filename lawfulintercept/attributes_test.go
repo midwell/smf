@@ -123,3 +123,21 @@ func TestInitRefusesWithoutAnElementIdentifier(t *testing.T) {
 		t.Error("interception is running after a refused initialisation")
 	}
 }
+
+// TestEveryIdentityThisPOIProducesRenders is the AMF test's counterpart: targetsOf is
+// the only source of the identities an SMF record's header reports, and one that
+// cannot be rendered would drop a required attribute with nothing failing.
+func TestEveryIdentityThisPOIProducesRenders(t *testing.T) {
+	ids := targetsOf(targetSM())
+	if len(ids) != 3 {
+		t.Fatalf("the fixture yields %d identities, want the SUPI, PEI and GPSI this POI reads", len(ids))
+	}
+	for _, id := range ids {
+		if _, ok := id.XMLFragment(); !ok {
+			t.Errorf("%s renders no fragment, so a record matched on it would carry no matched target identifier", id.Type)
+		}
+	}
+	if got := len(types.XMLFragments(ids)); got != len(ids) {
+		t.Errorf("XMLFragments dropped %d of %d identities silently", len(ids)-got, len(ids))
+	}
+}
