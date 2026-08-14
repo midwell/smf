@@ -12,6 +12,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
 	"strings"
@@ -73,6 +74,17 @@ type Destination struct {
 	Address      string // host:port
 }
 
+// errNoElementIdentifier means the deployment configured interception without the
+// identifier this element asserts on X1, which is also the Network Function ID every
+// record it delivers has to carry (TS 33.128 table 5.3.1-2).
+var errNoElementIdentifier = errors.New("li: no network element identifier configured")
+
+// smfInterceptionPoint is the Interception Point ID every xIRI from this element
+// carries (ETSI TS 103 221-2 clause 5.3.8): it names the POI within the network
+// function. The SMF also hosts the CC and IRI triggering functions, but a triggering
+// function delivers no product, so there is one point of interception here.
+const smfInterceptionPoint = "SMF-IRI-POI"
+
 // sender delivers an xIRI/xCC PDU to an MDF. *x2x3.Client satisfies it; tests
 // inject a capturing implementation to assert per-warrant delivery isolation.
 type sender interface {
@@ -101,9 +113,13 @@ type subsystem struct {
 	unreachable func() (unreachable, inUse int)
 	// mdf2 is the configured X2 endpoint, used only for a task that names no
 	// destination this element can resolve.
-	mdf2     string
-	iriCtx   *liasn1.Context
-	neID     string
+	mdf2   string
+	iriCtx *liasn1.Context
+	neID   string
+	// ids supplies the conditional attributes that belong to this element rather than
+	// to the task — its two identities and the per-context sequence numbering — shared
+	// with the AMF's IRI-POI and the UPF's CC-POI through li/x2x3.
+	ids      *x2x3.Identity
 	reporter *x1.Reporter // nil when NE-initiated reporting is not configured
 	// taskReporter reports per-task faults; nil when no ADMF is configured.
 	taskReporter taskIssueReporter
@@ -211,6 +227,15 @@ func newX1Server(st *store.Store, cfg Config, sub *subsystem) *x1.Server {
 // listener (mutual TLS), and prepares X2 delivery to the MDF2. Call it once at
 // SMF startup, only when LI is configured.
 func Init(cfg Config) error {
+	// Without an identifier for this network element, product would reach a mediation
+	// function that cannot attribute it to the element that produced it. Interception
+	// does not start; the SMF itself carries on serving sessions, because a network
+	// function that crash-loops over its LI configuration tells every operator that it
+	// is LI-provisioned.
+	if cfg.NEID == "" {
+		return errNoElementIdentifier
+	}
+
 	mat, err := mtls.Load(cfg.Cert, cfg.Key, cfg.CACert)
 	if err != nil {
 		return err
@@ -244,6 +269,7 @@ func Init(cfg Config) error {
 		mdf2:      cfg.MDF2,
 		iriCtx:    iri.NewContext(),
 		neID:      cfg.NEID,
+		ids:       x2x3.NewIdentity(cfg.NEID, smfInterceptionPoint),
 		reporter:  reporter,
 	}
 	// Assigned after construction because it reads the subsystem it belongs to: the pool
@@ -343,7 +369,7 @@ func ReportEstablishment(sc *smfctx.SMContext) {
 
 	sc.LiEstablishmentReported = true
 
-	sub.deliverIRI(sub.matchingTasks(sc), correlationOf(sc), smfEstablishment(sc))
+	sub.reportEvent(sc, smfEstablishment(sc))
 }
 
 // ReportEstablishmentReject emits an SMFUnsuccessfulProcedure xIRI when the SMF
@@ -374,7 +400,7 @@ func reportUnsuccessful(sc *smfctx.SMContext, procedure iri.SMFFailedProcedureTy
 	if sub == nil || sc == nil {
 		return
 	}
-	sub.deliverIRI(sub.matchingTasks(sc), correlationOf(sc), smfUnsuccessful(sc, procedure, cause))
+	sub.reportEvent(sc, smfUnsuccessful(sc, procedure, cause))
 }
 
 // smfUnsuccessful maps a refused procedure to a TS 33.128
@@ -406,7 +432,7 @@ func ReportModification(sc *smfctx.SMContext) {
 	if sub == nil || sc == nil {
 		return
 	}
-	sub.deliverIRI(sub.matchingTasks(sc), correlationOf(sc), smfModification(sc))
+	sub.reportEvent(sc, smfModification(sc))
 }
 
 // ReportRelease emits an SMFPDUSessionRelease xIRI for sc if it matches an
@@ -423,7 +449,7 @@ func ReportRelease(sc *smfctx.SMContext) {
 		return
 	}
 	sc.LiReleaseReported = true
-	sub.deliverIRI(sub.matchingTasks(sc), correlationOf(sc), smfRelease(sc))
+	sub.reportEvent(sc, smfRelease(sc))
 }
 
 // ApplyCCTrigger is the SMF Content-of-Communication Triggering Function. When
@@ -551,6 +577,13 @@ func (s *subsystem) reportStartOfInterception(task types.InterceptTask) {
 // still targets the session (correct under overlapping multi-agency warrants).
 // IRI needs no undo, so a pure-IRI deactivation is a no-op.
 func (s *subsystem) reportDeactivation(task types.InterceptTask) {
+	// Numbering state belongs to the tasking that created it, and a warrant covering
+	// many sessions creates a sequence context per session. Done for every warrant,
+	// before the CC check below returns early for a pure-IRI one — it is the IRI
+	// records that were numbered.
+	if s.ids != nil {
+		s.ids.Forget(parseXID(task.DeliveryXID()))
+	}
 	if !task.WantsProduct(types.ProductCC) {
 		return
 	}
@@ -585,14 +618,18 @@ func (s *subsystem) scanSessions(task types.InterceptTask, fn func(*smfctx.SMCon
 	if len(matched) == 0 {
 		return
 	}
+	// The event these records report is the activation, not whatever each session did
+	// earlier, so one instant covers all of them (design D5).
+	activated := time.Now()
 	go func() {
 		for _, sc := range matched {
 			sc.SMLock.Lock()
 			event := fn(sc)
-			corr := correlationOf(sc) // read under the lock (reads sc.PFCPContext)
+			corr := correlationOf(sc)   // read under the lock (reads sc.PFCPContext)
+			subjectIDs := targetsOf(sc) // likewise: reads the session's identity fields
 			sc.SMLock.Unlock()
 			if event != nil {
-				s.deliverIRI([]types.InterceptTask{task}, corr, event)
+				s.deliverIRI([]types.InterceptTask{task}, corr, subjectIDs, activated, event)
 			}
 		}
 	}()
@@ -635,11 +672,29 @@ func sessionTargets(task types.InterceptTask, sc *smfctx.SMContext) bool {
 	return task.TargetsAny(targetsOf(sc))
 }
 
+// reportEvent delivers event to every task this session's identities match, as the
+// session and the clock stood when the event was observed.
+//
+// The instant is taken here, at the hook, because the X2 Timestamp attribute is the
+// time the *event* occurred (TS 33.128 table 5.3.2-2) and not the time a PDU was
+// built. Caller holds sc.SMLock: matchingTasks, correlationOf and targetsOf all read
+// the session's fields.
+func (s *subsystem) reportEvent(sc *smfctx.SMContext, event any) {
+	s.deliverIRI(s.matchingTasks(sc), correlationOf(sc), targetsOf(sc), time.Now(), event)
+}
+
 // deliverIRI encodes event once and delivers it as an X2 xIRI to every task in
 // tasks that wants IRI product. It is silent on any error (encoding or
 // delivery) so that interception can never be inferred from SMF behaviour.
-func (s *subsystem) deliverIRI(tasks []types.InterceptTask, corr [8]byte, event any) {
+func (s *subsystem) deliverIRI(tasks []types.InterceptTask, corr [8]byte, subjectIDs []types.TargetIdentifier, at time.Time, event any) {
 	if len(tasks) == 0 {
+		return
+	}
+	if s.ids == nil {
+		// An element that cannot say which network function produced a record does not
+		// deliver one. Init always supplies this, so reaching here means a subsystem was
+		// assembled by hand — fail closed rather than panic, since this runs on a
+		// session's own goroutine.
 		return
 	}
 	payload, err := iri.EncodeXIRI(s.iriCtx, event)
@@ -650,6 +705,16 @@ func (s *subsystem) deliverIRI(tasks []types.InterceptTask, corr [8]byte, event 
 		if !t.WantsProduct(types.ProductIRI) {
 			continue
 		}
+		// A provisioned ProductID replaces the task XID in the PDU header
+		// (TS 103 221-1 clause 6.2.1.2), so product is labelled with the warrant an
+		// ADMF names rather than with the task carrying it.
+		xid := parseXID(t.DeliveryXID())
+		// The six attributes TS 33.128 table 5.3.2-2 requires, built once per task and
+		// carried to every destination it named: the number belongs to the (XID,
+		// Correlation ID) context, so two destinations receive one numbering.
+		matched, other := t.SplitTargets(subjectIDs)
+		attrs := s.ids.Attributes(xid, corr, at,
+			types.XMLFragments(matched), types.XMLFragments(other))
 		for _, addr := range s.x2Destinations(t) {
 			client := s.senderFor(addr)
 			if client == nil {
@@ -664,11 +729,9 @@ func (s *subsystem) deliverIRI(tasks []types.InterceptTask, corr [8]byte, event 
 				Type:          x2x3.PDUTypeX2,
 				PayloadFormat: x2x3.PayloadFormat3GPP33128,
 				Direction:     x2x3.DirectionNotApplicable,
-				// A provisioned ProductID replaces the task XID in the PDU header
-				// (TS 103 221-1 clause 6.2.1.2), so product is labelled with the
-				// warrant an ADMF names rather than with the task carrying it.
-				XID:           parseXID(t.DeliveryXID()),
+				XID:           xid,
 				CorrelationID: corr,
+				Attributes:    attrs,
 				Payload:       payload,
 			})
 		}

@@ -371,7 +371,7 @@ func TestReportEstablishmentEmitsOnce(t *testing.T) {
 		Products: []types.ProductType{types.ProductIRI},
 		State:    types.TaskActive,
 	})
-	active.Store(&subsystem{store: st, senderFor: func(string) sender { return cap }, mdf2: configuredMDF2, iriCtx: iri.NewContext(), neID: "ne"})
+	active.Store(&subsystem{store: st, senderFor: func(string) sender { return cap }, mdf2: configuredMDF2, iriCtx: iri.NewContext(), ids: x2x3.NewIdentity("smf-1", smfInterceptionPoint), neID: "ne"})
 	t.Cleanup(func() { active.Store(nil) })
 
 	sc := targetSM()
@@ -395,7 +395,7 @@ func TestReportReleaseDeduplicates(t *testing.T) {
 		Products: []types.ProductType{types.ProductIRI},
 		State:    types.TaskActive,
 	})
-	active.Store(&subsystem{store: st, senderFor: func(string) sender { return cap }, mdf2: configuredMDF2, iriCtx: iri.NewContext(), neID: "ne"})
+	active.Store(&subsystem{store: st, senderFor: func(string) sender { return cap }, mdf2: configuredMDF2, iriCtx: iri.NewContext(), ids: x2x3.NewIdentity("smf-1", smfInterceptionPoint), neID: "ne"})
 	t.Cleanup(func() { active.Store(nil) })
 
 	sc := targetSM()
@@ -434,7 +434,7 @@ func TestDeliveryIsolation(t *testing.T) {
 	st.Activate(types.InterceptTask{XID: xidCC, Targets: []types.TargetIdentifier{target}, Products: []types.ProductType{types.ProductCC}, State: types.TaskActive})
 
 	cap := &captureSender{}
-	active.Store(&subsystem{store: st, senderFor: func(string) sender { return cap }, mdf2: configuredMDF2, iriCtx: iri.NewContext()})
+	active.Store(&subsystem{store: st, senderFor: func(string) sender { return cap }, mdf2: configuredMDF2, iriCtx: iri.NewContext(), ids: x2x3.NewIdentity("smf-1", smfInterceptionPoint)})
 	t.Cleanup(func() { active.Store(nil) })
 
 	ReportEstablishment(targetSM())
@@ -663,7 +663,7 @@ func TestXIRIGoesToTheDestinationsTheTaskNamed(t *testing.T) {
 
 	capture := newAddressCapture()
 	active.Store(&subsystem{
-		store: st, senderFor: capture.senderFor, mdf2: configuredMDF2, iriCtx: iri.NewContext(),
+		store: st, senderFor: capture.senderFor, mdf2: configuredMDF2, iriCtx: iri.NewContext(), ids: x2x3.NewIdentity("smf-1", smfInterceptionPoint),
 	})
 	t.Cleanup(func() { active.Store(nil) })
 
@@ -698,7 +698,7 @@ func TestATaskNamingNoDestinationFallsBackToConfiguration(t *testing.T) {
 
 	capture := newAddressCapture()
 	active.Store(&subsystem{
-		store: st, senderFor: capture.senderFor, mdf2: configuredMDF2, iriCtx: iri.NewContext(),
+		store: st, senderFor: capture.senderFor, mdf2: configuredMDF2, iriCtx: iri.NewContext(), ids: x2x3.NewIdentity("smf-1", smfInterceptionPoint),
 	})
 	t.Cleanup(func() { active.Store(nil) })
 
@@ -927,6 +927,7 @@ func activateIRISub(t *testing.T, snd sender, tasks ...types.InterceptTask) {
 		senderFor: func(string) sender { return snd },
 		mdf2:      configuredMDF2,
 		iriCtx:    iri.NewContext(),
+		ids:       x2x3.NewIdentity("smf-1", smfInterceptionPoint),
 		neID:      "ne",
 	})
 	t.Cleanup(func() { active.Store(nil) })
