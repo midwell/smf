@@ -57,6 +57,14 @@ type Config struct {
 	AdmfID           string        // the responsible ADMF's identifier: authenticates inbound X1 peers and addresses outbound reports (empty accepts any certified ADMF)
 	KeepaliveTimeout time.Duration // purge tasking if no X1 message within this (0 = disabled)
 
+	// The three settings of the TS 103 221-2 clause 6.2.4 keepalive mechanism, as the
+	// operator wrote them. Parsed here rather than by the caller because an unusable
+	// value is reported to the ADMF over X1, and the reporter does not exist until
+	// this subsystem starts.
+	X2X3KeepaliveEnabled *bool
+	X2X3KeepaliveTimeP1  string
+	X2X3KeepaliveTimeP2  string
+
 	// DeactivateAllTasks and RemoveAllDestinations are the two bulk operations
 	// TS 103 221-1 leaves to advance agreement between the operator and the agency.
 	// Nil is "no agreement in advance" and leaves the standard's defaults, which
@@ -256,6 +264,7 @@ func Init(cfg Config) error {
 	// endpoints its product goes to, and TS 33.128 marks them mandatory, so this
 	// element cannot know them at startup.
 	pool := x2x3.NewPool(mat.ClientTLS(),
+		keepaliveConfig(cfg, reporter),
 		func(error) {
 			if reporter != nil {
 				reporter.Notify(x1.NEIssueMDFUnreachable, "MDF2 X2 delivery failed")
@@ -1061,6 +1070,62 @@ func afterPrefix(s string, prefixes ...string) string {
 // one agency's product to another's address. There is no general log to say so on — this
 // plane deliberately writes to none — and the count is all the ADMF needs, since the
 // entries themselves are the operator's configuration and not the ADMF's business.
+// keepaliveConfig turns the operator's three settings into the clause 6.2.4
+// mechanism's configuration.
+//
+// It encodes no defaults of its own. An unset timer is passed through as zero, which
+// x2x3 resolves to the specification's own value — so there is one place where "60
+// seconds" is written down, and it is beside the mechanism rather than in each of the
+// three network functions that run it.
+//
+// An unusable setting is reported to the ADMF and then discarded in favour of the
+// defaults, rather than refusing to start. The alternatives are both worse: this
+// subsystem is optional to the network function, so a refusal here means lawful
+// interception silently does not run, and accepting the value as written can mean a
+// mechanism that disconnects every delivery connection on a timer. Reporting keeps
+// the operator's mistake visible to the only party that can act on it while the
+// element keeps intercepting.
+func keepaliveConfig(cfg Config, reporter *x1.Reporter) x2x3.KeepaliveConfig {
+	ka := x2x3.KeepaliveConfig{
+		Disabled: cfg.X2X3KeepaliveEnabled != nil && !*cfg.X2X3KeepaliveEnabled,
+	}
+
+	report := func(format string, args ...any) {
+		if reporter != nil {
+			reporter.Notify(x1.NEIssueInvalidConfig, fmt.Sprintf(format, args...))
+		}
+	}
+
+	for _, t := range []struct {
+		name  string
+		value string
+		into  *time.Duration
+	}{
+		{"x2x3KeepaliveTimeP1", cfg.X2X3KeepaliveTimeP1, &ka.TimeP1},
+		{"x2x3KeepaliveTimeP2", cfg.X2X3KeepaliveTimeP2, &ka.TimeP2},
+	} {
+		if t.value == "" {
+			continue
+		}
+		d, err := time.ParseDuration(t.value)
+		if err != nil {
+			report("%s is not a duration; the specification's default is used instead", t.name)
+
+			continue
+		}
+		*t.into = d
+	}
+
+	if err := ka.Validate(); err != nil {
+		report("the configured X2/X3 keepalive timers are unusable and the specification's "+
+			"defaults are used instead: %v", err)
+
+		return x2x3.KeepaliveConfig{Disabled: ka.Disabled}
+	}
+
+	return ka
+}
+
 func configuredDestinations(dests []Destination, reporter *x1.Reporter) []x1.ConfiguredDestination {
 	out := make([]x1.ConfiguredDestination, 0, len(dests))
 	var rejected int

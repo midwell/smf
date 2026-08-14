@@ -107,6 +107,25 @@ type Li struct {
 	AdmfID           string `yaml:"admfId"`           // responsible ADMF identifier (for reports)
 	KeepaliveTimeout string `yaml:"keepaliveTimeout"` // duration; purge tasking if no X1 message within it (optional)
 
+	// The X2/X3 keepalive mechanism of ETSI TS 103 221-2 clause 6.2.4, which is a
+	// different mechanism from keepaliveTimeout above: that one is the X1 fail-safe
+	// against an ADMF that goes quiet, this one detects a mediation function that
+	// has stopped answering on the delivery connection. Hence the prefix — the two
+	// read as halves of one setting otherwise, and they are not related at all.
+	//
+	// Enabled is a pointer so that "the operator said false" is distinct from "the
+	// operator said nothing": unset means the mechanism runs, because the
+	// specification requires it and TIME_P1 and TIME_P2 are given normatively (60
+	// and 180 seconds), which is what an element configuring nothing must get.
+	//
+	// Setting it false is for a deployment whose mediation function does not
+	// implement the MDF half of clause 6.2.4 — it will never acknowledge, and this
+	// element would disconnect it every TIME_P2 and lose whatever was in flight. The
+	// reference implementation this project interoperates with is such a peer.
+	X2X3KeepaliveEnabled *bool  `yaml:"x2x3KeepaliveEnabled,omitempty"`
+	X2X3KeepaliveTimeP1  string `yaml:"x2x3KeepaliveTimeP1,omitempty"` // duration; default 60s
+	X2X3KeepaliveTimeP2  string `yaml:"x2x3KeepaliveTimeP2,omitempty"` // duration; default 180s
+
 	// DeactivateAllTasks and RemoveAllDestinations carry what TS 103 221-1 leaves to
 	// advance agreement between the operator and the agency: whether this element
 	// performs a bulk deactivation of all its tasking, and whether it performs a bulk

@@ -177,6 +177,9 @@ func (smf *SMF) Start() {
 			MDF3: li.MDF3, UPFTriggers: triggers,
 			Destinations: dests,
 			AdmfURL:      li.AdmfURL, AdmfID: li.AdmfID, KeepaliveTimeout: kaTimeout,
+			X2X3KeepaliveEnabled:  li.X2X3KeepaliveEnabled,
+			X2X3KeepaliveTimeP1:   li.X2X3KeepaliveTimeP1,
+			X2X3KeepaliveTimeP2:   li.X2X3KeepaliveTimeP2,
 			DeactivateAllTasks:    li.DeactivateAllTasks,
 			RemoveAllDestinations: li.RemoveAllDestinations,
 		}); err != nil {
