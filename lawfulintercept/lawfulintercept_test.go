@@ -123,6 +123,52 @@ func TestServingUPFTEIDNilTunnel(t *testing.T) {
 	}
 }
 
+// TestGTPTunnelInfoIsReported covers a field TS 33.128 marks mandatory in three
+// records and that this POI did not emit at all. It is worth its own test for a
+// reason that generalises: the published ASN.1 module marks gTPTunnelInfo
+// OPTIONAL, so every record encoded and decoded cleanly without it and no
+// round-trip, golden or live-decode check could ever have noticed. Only the
+// payload tables say it is mandatory.
+//
+// For SMFPDUSessionModification it is the sole mandatory field, so that record
+// previously satisfied none of its mandatory set.
+func TestGTPTunnelInfoIsReported(t *testing.T) {
+	sc := targetSM()
+	node := smfctx.NewDataPathNode()
+	node.UpLinkTunnel.TEID = 0x01020304
+	node.UPF = &smfctx.UPF{NodeID: smfctx.NodeID{NodeIdType: smfctx.NodeIdTypeIpv4Address, NodeIdValue: net.ParseIP("10.100.0.7").To4()}}
+	sc.Tunnel = &smfctx.UPTunnel{DataPathPool: smfctx.DataPathPool{1: &smfctx.DataPath{IsDefaultPath: true, FirstDPNode: node}}}
+
+	want := servingUPFTEID(sc)
+	if want.TEID == 0 {
+		t.Fatal("fixture produced no uplink F-TEID, so this test would prove nothing")
+	}
+
+	// Every record whose payload table marks the field mandatory must carry it,
+	// and each is asserted separately: a helper shared by three call sites is
+	// exactly the shape where one call site silently gets it wrong.
+	if got := smfEstablishment(sc).GTPTunnelInfo.FiveGSGTPTunnels.ULNGUUPTunnelInformation; got.TEID != want.TEID {
+		t.Errorf("establishment gTPTunnelInfo TEID = %d, want %d", got.TEID, want.TEID)
+	}
+	if got := smfStartOfInterception(sc).GTPTunnelInfo.FiveGSGTPTunnels.ULNGUUPTunnelInformation; got.TEID != want.TEID {
+		t.Errorf("start-of-interception gTPTunnelInfo TEID = %d, want %d", got.TEID, want.TEID)
+	}
+	mod := smfModification(sc).GTPTunnelInfo.FiveGSGTPTunnels.ULNGUUPTunnelInformation
+	if mod.TEID != want.TEID {
+		t.Errorf("modification gTPTunnelInfo TEID = %d, want %d", mod.TEID, want.TEID)
+	}
+	if !bytes.Equal(mod.IPv4Address, want.IPv4Address) {
+		t.Errorf("modification gTPTunnelInfo address = %v, want %v", mod.IPv4Address, want.IPv4Address)
+	}
+
+	// With no data path the POI has no tunnel to report, so the field stays empty
+	// and the codec omits it rather than reporting a tunnel with endpoint zero.
+	empty := smfModification(&smfctx.SMContext{}).GTPTunnelInfo.FiveGSGTPTunnels.ULNGUUPTunnelInformation
+	if empty.TEID != 0 || empty.IPv4Address != nil || empty.IPv6Address != nil {
+		t.Errorf("tunnel-less context produced %+v, want a zero F-TEID", empty)
+	}
+}
+
 func TestCorrelationOfNilTunnel(t *testing.T) {
 	// No PFCP session yet → a zero correlation ID (best-effort), never a panic.
 	// The populated value (serving UPF F-SEID, big-endian, matching the UPF's X3)

@@ -51,6 +51,10 @@ type fakePOI struct {
 	// holds is the tasking this POI reports when asked, which is how a restarted
 	// triggering function discovers what it left behind.
 	holds []string
+	// unhealthy maps an XID to the provisioningStatus this POI reports for it.
+	// Anything other than "complete" means the trigger is not actually running,
+	// which the triggering function can only learn from this answer.
+	unhealthy map[string]string
 }
 
 func newFakePOI(t *testing.T) *fakePOI {
@@ -79,10 +83,25 @@ func newFakePOI(t *testing.T) *fakePOI {
 			held := append([]string(nil), p.holds...)
 			p.mu.Unlock()
 
+			p.mu.Lock()
+			unhealthy := map[string]string{}
+			for k, v := range p.unhealthy {
+				unhealthy[k] = v
+			}
+			p.mu.Unlock()
+
 			var details string
 			for _, xid := range held {
+				// taskStatus is a complex type in the schema; a bare string there is the
+				// shape this project used to emit and no longer does.
+				status := "complete"
+				if s, ok := unhealthy[xid]; ok {
+					status = s
+				}
 				details += `<x1:taskResponseDetails><x1:taskDetails><x1:xId>` + xid +
-					`</x1:xId></x1:taskDetails><x1:taskStatus>Active</x1:taskStatus></x1:taskResponseDetails>`
+					`</x1:xId></x1:taskDetails><x1:taskStatus>` +
+					`<x1:provisioningStatus>` + status + `</x1:provisioningStatus>` +
+					`<x1:listOfFaults/></x1:taskStatus></x1:taskResponseDetails>`
 			}
 
 			//nolint:errcheck // test handler write
@@ -746,5 +765,84 @@ func TestMatchEndpointIsDeterministic(t *testing.T) {
 			t.Fatalf("matched %q then %q: the same session would be triggered at a "+
 				"different UPF on re-establishment", first, got)
 		}
+	}
+}
+
+// TestReconcileReportsATriggerThePOISaysIsNotRunning covers the one thing a CC
+// triggering function exists to notice: a trigger it installed, for a live
+// warrant, that the POI is not actually running.
+//
+// Nothing else can report it. The POI answers to this SMF over the internal
+// triggering interface, not to the ADMF, so the ADMF cannot ask it directly — and
+// this SMF used to read the POI's reply for XIDs and discard everything else,
+// including the task's provisioning status and its unresolved faults. The
+// interception was stopped and every party believed it was running.
+func TestReconcileReportsATriggerThePOISaysIsNotRunning(t *testing.T) {
+	var mu sync.Mutex
+	var reports []string
+	admf := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body) //nolint:errcheck // test
+		mu.Lock()
+		reports = append(reports, string(body))
+		mu.Unlock()
+		//nolint:errcheck // test handler write
+		_, _ = w.Write([]byte(`<?xml version="1.0"?><X1Response xmlns="http://uri.etsi.org/03221/X1/2017/10">` +
+			`<x1ResponseMessage><oK>AcknowledgedAndCompleted</oK></x1ResponseMessage></X1Response>`))
+	}))
+	defer admf.Close()
+
+	poi := newFakePOI(t)
+	s := triggerSubsystem(poi)
+	s.taskReporter = &recordingTaskReporter{}
+	s.reporter = x1.NewReporter(admf.URL, "admf", "smf", nil)
+
+	warrant := types.InterceptTask{
+		XID:      "11111111-1111-4111-8111-111111111111",
+		Products: []types.ProductType{types.ProductCC},
+	}
+	s.installFor("session-1", []types.InterceptTask{warrant},
+		[]upfSession{{node: upfNode("10.0.1.5"), seid: 42}}, 7)
+
+	var mine []string
+	for _, xid := range s.triggers.installed {
+		mine = append(mine, string(xid))
+	}
+	if len(mine) == 0 {
+		t.Fatal("no trigger was installed, so this test would prove nothing")
+	}
+
+	// The POI holds exactly what this process installed, and reports the first as
+	// not provisioned.
+	poi.mu.Lock()
+	poi.holds = mine
+	poi.unhealthy = map[string]string{mine[0]: "failed"}
+	poi.mu.Unlock()
+
+	s.reconcileTriggers()
+
+	// It is ours, so it must not be withdrawn — the fault is reported, not acted on
+	// by tearing down a live warrant's interception.
+	if n := poi.countMessages("DeactivateTaskRequest"); n != 0 {
+		t.Errorf("sent %d deactivations for a faulty trigger; the warrant is live", n)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	var found bool
+	for _, body := range reports {
+		if strings.Contains(body, "triggerFaulty") {
+			found = true
+			if !strings.Contains(body, "failed") {
+				t.Errorf("report does not say what the POI reported:\n%s", body)
+			}
+			// The ADMF is told how much is wrong, never whose: an NE-level issue
+			// carries no target identity.
+			if strings.Contains(body, mine[0]) {
+				t.Errorf("NE-level report names a task XID:\n%s", body)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("no triggerFaulty report reached the ADMF; got %d report(s): %v", len(reports), reports)
 	}
 }

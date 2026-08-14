@@ -226,7 +226,7 @@ func (s *subsystem) reconcileTriggers() {
 	}
 
 	for _, endpoint := range s.triggers.endpoints {
-		xids, err := endpoint.req.TaskXIDs()
+		reported, err := endpoint.req.ReportedTasks()
 		if err != nil {
 			// The POI may simply not be up yet — on a whole-cluster restart it very
 			// likely is not. Worth telling the LIPF either way, because tasking may
@@ -241,11 +241,28 @@ func (s *subsystem) reconcileTriggers() {
 			continue
 		}
 
-		for _, xid := range xids {
+		for _, task := range reported {
+			xid := types.XID(task.TaskDetails.XID)
+			if xid == "" {
+				continue
+			}
+
 			// Skip anything this process has itself installed. Reconciliation runs
 			// concurrently with ordinary triggering, so a session establishing right
 			// now would otherwise have its brand-new trigger withdrawn by the cleanup.
 			if s.triggers.holds(xid) {
+				// It is ours, so it is not stale — but the POI's account of it is the
+				// only way this function learns that a trigger it installed is not
+				// actually running. A failed provisioning or an unresolved fault means
+				// content interception has stopped while the warrant is live, which is
+				// precisely what a CC triggering function exists to notice. The reply
+				// was previously read for XIDs and nothing else.
+				if !task.TaskStatus.Healthy() && s.reporter != nil {
+					s.reporter.Notify(x1.NEIssueTriggerFaulty,
+						"a UPF reports a content trigger this SMF installed as not running: "+
+							task.TaskStatus.Describe())
+				}
+
 				continue
 			}
 

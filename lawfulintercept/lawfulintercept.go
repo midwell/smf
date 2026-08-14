@@ -777,6 +777,7 @@ func smfEstablishment(sc *smfctx.SMContext) iri.SMFPDUSessionEstablishment {
 		DNN:            iri.DNN(sc.Dnn),
 		RequestType:    requestType(sc),
 		AccessType:     accessType(sc),
+		GTPTunnelInfo:  gtpTunnelInfo(sc),
 	}
 }
 
@@ -812,6 +813,7 @@ func smfStartOfInterception(sc *smfctx.SMContext) iri.SMFStartOfInterceptionWith
 		DNN:            iri.DNN(sc.Dnn),
 		RequestType:    iri.SMRequestExisting,
 		AccessType:     accessType(sc),
+		GTPTunnelInfo:  gtpTunnelInfo(sc),
 	}
 }
 
@@ -819,13 +821,14 @@ func smfStartOfInterception(sc *smfctx.SMContext) iri.SMFStartOfInterceptionWith
 // record. Only requestType is mandatory.
 func smfModification(sc *smfctx.SMContext) iri.SMFPDUSessionModification {
 	return iri.SMFPDUSessionModification{
-		SUPI:         supiChoice(sc),
-		PEI:          peiChoice(sc),
-		GPSI:         gpsiChoice(sc),
-		SNSSAI:       snssai(sc),
-		RequestType:  iri.SMRequestModification,
-		AccessType:   accessType(sc),
-		PDUSessionID: iri.PDUSessionID(sc.PDUSessionID),
+		SUPI:          supiChoice(sc),
+		PEI:           peiChoice(sc),
+		GPSI:          gpsiChoice(sc),
+		SNSSAI:        snssai(sc),
+		RequestType:   iri.SMRequestModification,
+		AccessType:    accessType(sc),
+		PDUSessionID:  iri.PDUSessionID(sc.PDUSessionID),
+		GTPTunnelInfo: gtpTunnelInfo(sc),
 	}
 }
 
@@ -847,6 +850,22 @@ func smfRelease(sc *smfctx.SMContext) iri.SMFPDUSessionRelease {
 // arbitrary map entry, so a multi-path (ULCL) session yields the anchoring path
 // deterministically. The PDU-session establishment record carries this mandatory
 // field so the MDF can correlate the user plane.
+// gtpTunnelInfo carries the session's user plane GTP tunnels. TS 33.128 marks
+// gTPTunnelInfo mandatory in the establishment, modification and
+// start-of-interception records, and it is the only tunnel field the
+// modification record has at all — that record carries no gTPTunnelID.
+//
+// It reports the same UL NG-U F-TEID as gTPTunnelID, which is what table
+// 6.2.3-1C asks for: the F-TEID of the UPF endpoint of the NG-U transport
+// bearer. The two fields are not redundant to a mediation function — the
+// structured form is where later tunnel detail (additional NG-U bearers, the
+// downlink RAN tunnel) is defined to go.
+func gtpTunnelInfo(sc *smfctx.SMContext) iri.GTPTunnelInfo {
+	return iri.GTPTunnelInfo{
+		FiveGSGTPTunnels: iri.FiveGSGTPTunnels{ULNGUUPTunnelInformation: servingUPFTEID(sc)},
+	}
+}
+
 func servingUPFTEID(sc *smfctx.SMContext) iri.FTEID {
 	var f iri.FTEID
 	if sc.Tunnel == nil {
