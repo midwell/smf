@@ -8,9 +8,11 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/omec-project/li/types"
 	"github.com/omec-project/li/x1"
@@ -51,6 +53,9 @@ type fakePOI struct {
 	// holds is the tasking this POI reports when asked, which is how a restarted
 	// triggering function discovers what it left behind.
 	holds []string
+	// detailsFail makes the POI refuse to say what it holds, which is the failure
+	// reconciliation has to survive — an X1 endpoint that is not up yet.
+	detailsFail bool
 	// unhealthy maps an XID to the provisioningStatus this POI reports for it.
 	// Anything other than "complete" means the trigger is not actually running,
 	// which the triggering function can only learn from this answer.
@@ -81,7 +86,17 @@ func newFakePOI(t *testing.T) *fakePOI {
 		if strings.Contains(string(body), "GetAllDetailsRequest") {
 			p.mu.Lock()
 			held := append([]string(nil), p.holds...)
+			fail := p.detailsFail
 			p.mu.Unlock()
+
+			if fail {
+				//nolint:errcheck // test handler write
+				_, _ = w.Write([]byte(`<?xml version="1.0"?><X1Response xmlns="http://uri.etsi.org/03221/X1/2017/10">` +
+					`<x1ResponseMessage><errorInformation><errorCode>1000</errorCode>` +
+					`<errorDescription>not ready</errorDescription></errorInformation></x1ResponseMessage></X1Response>`))
+
+				return
+			}
 
 			p.mu.Lock()
 			unhealthy := map[string]string{}
@@ -385,9 +400,14 @@ func TestInstallTriggersReportsMissingEndpoint(t *testing.T) {
 
 // TestTakeForSessionAndWarrant pins the bookkeeping the deactivation paths depend
 // on. A session's triggers are withdrawn when it is released; a warrant's are
-// withdrawn when it is deactivated, wherever they were installed.
+// withdrawn when it is deactivated, wherever they were installed. Taken triggers
+// move to pending rather than out of the registry: the withdrawal has been decided,
+// not performed.
 func TestTakeForSessionAndWarrant(t *testing.T) {
-	reg := &triggerRegistry{installed: map[string]types.XID{}}
+	reg := &triggerRegistry{
+		installed: map[string]types.XID{},
+		pending:   map[string]*pendingWithdrawal{},
+	}
 
 	// Two warrants, two sessions, two UPFs.
 	for _, w := range []types.XID{"warrant-a", "warrant-b"} {
@@ -405,32 +425,33 @@ func TestTakeForSessionAndWarrant(t *testing.T) {
 	// belonging to the other session. The UPFs come from the bookkeeping, not from
 	// the session, so a session whose PFCP state is already gone is still cleaned up.
 	got := reg.takeForSession("sess-1")
-	total := 0
-	for node, xids := range got {
-		if node != "10.0.1.5" && node != "10.0.1.6" {
-			t.Errorf("takeForSession grouped under an unexpected node %q", node)
+	for _, w := range got {
+		if w.nodeID != "10.0.1.5" && w.nodeID != "10.0.1.6" {
+			t.Errorf("takeForSession named an unexpected node %q", w.nodeID)
 		}
-		total += len(xids)
 	}
-	if total != 4 {
-		t.Errorf("takeForSession returned %d triggers, want 4 (2 warrants x 2 UPFs)", total)
+	if len(got) != 4 {
+		t.Errorf("takeForSession returned %d triggers, want 4 (2 warrants x 2 UPFs)", len(got))
 	}
 	if len(reg.installed) != 4 {
 		t.Errorf("installed = %d after takeForSession, want 4 (sess-2's)", len(reg.installed))
 	}
-
-	// Deactivating a warrant takes its remaining triggers, grouped by UPF so each
-	// can be deactivated at the right peer.
-	byNode := reg.takeForWarrant("warrant-a")
-	total = 0
-	for node, xids := range byNode {
-		if node != "10.0.1.5" && node != "10.0.1.6" {
-			t.Errorf("takeForWarrant grouped under an unexpected node %q", node)
-		}
-		total += len(xids)
+	// Nothing is withdrawn yet, so the registry is still answerable for all four.
+	if len(reg.pending) != 4 {
+		t.Errorf("pending = %d after takeForSession, want the 4 it took — a trigger dropped "+
+			"here is one the POI keeps and nothing retries", len(reg.pending))
 	}
-	if total != 2 {
-		t.Errorf("takeForWarrant returned %d triggers, want warrant-a's remaining 2", total)
+
+	// Deactivating a warrant takes its remaining triggers, each naming the UPF it
+	// must be deactivated at.
+	byWarrant := reg.takeForWarrant("warrant-a")
+	for _, w := range byWarrant {
+		if w.nodeID != "10.0.1.5" && w.nodeID != "10.0.1.6" {
+			t.Errorf("takeForWarrant named an unexpected node %q", w.nodeID)
+		}
+	}
+	if len(byWarrant) != 2 {
+		t.Errorf("takeForWarrant returned %d triggers, want warrant-a's remaining 2", len(byWarrant))
 	}
 	// Only warrant-b's sess-2 pair remains.
 	if len(reg.installed) != 2 {
@@ -500,7 +521,7 @@ func TestReconcileWithdrawsTaskingFromAPreviousLife(t *testing.T) {
 	s := triggerSubsystem(poi)
 	s.taskReporter = &recordingTaskReporter{}
 
-	s.reconcileTriggers()
+	s.reconcileOne()
 
 	// Both must be withdrawn: this process installed neither.
 	if n := poi.countMessages("DeactivateTaskRequest"); n != 2 {
@@ -533,7 +554,7 @@ func TestReconcileLeavesThisProcesssOwnTasking(t *testing.T) {
 	poi.holds = mine
 	poi.mu.Unlock()
 
-	s.reconcileTriggers()
+	s.reconcileOne()
 
 	if n := poi.countMessages("DeactivateTaskRequest"); n != 0 {
 		t.Errorf("sent %d deactivations for tasking this process installed itself", n)
@@ -553,6 +574,14 @@ func (r *recordingTaskReporter) NotifyTask(xid, reportType, details string) {
 	r.reports = append(r.reports, taskReport{xid, reportType, details})
 }
 
+// reconcileOne runs the reconciliation that reconcileTriggers gives each endpoint
+// its own goroutine for, synchronously, so a test can assert on what it did. The
+// fan-out exists so that one unreachable POI does not hold up the others; nothing
+// about one endpoint's reconciliation depends on it.
+func (s *subsystem) reconcileOne() {
+	s.reconcileEndpoint("10.0.1.5", s.triggers.endpoints["10.0.1.5"])
+}
+
 // installFor mirrors what triggerCC does — claim the triggers under the caller's
 // lock, then install them — so a test can drive both halves synchronously. The
 // two are separate in production only because the X1 exchange must not run on the
@@ -570,9 +599,12 @@ func (s *subsystem) installFor(ref string, tasks []types.InterceptTask, upfs []u
 // still being installed. The withdrawal then runs against a registry entry whose
 // trigger does not exist at the POI yet, and used to withdraw nothing — leaving a
 // trigger in place that reconciliation (startup only) and the POI's own fail-safe
-// (this SMF is alive and sending keepalives) would both never reach. Tasking
-// nobody can withdraw is exactly what must not exist, so the install must notice
-// and take it down itself.
+// (this SMF is alive and sending keepalives) would both never reach.
+//
+// The pending-removal state is what closes it now, and it closes it in either
+// order: the withdrawal that arrives before the trigger exists stays pending and
+// retries, so the install need only leave it alone. Exactly one party withdraws,
+// which is the point — two would each read an answer meant for the other.
 func TestTriggerInstalledAfterReleaseIsWithdrawn(t *testing.T) {
 	poi := newFakePOI(t)
 	s := triggerSubsystem(poi)
@@ -591,21 +623,26 @@ func TestTriggerInstalledAfterReleaseIsWithdrawn(t *testing.T) {
 
 	// The session is released before the install goroutine gets to run its X1
 	// exchange — the ordering the session lock permits and this guards against.
-	if byNode := s.triggers.takeForSession("session-ref-1"); len(byNode) != 1 {
-		t.Fatalf("takeForSession returned %d UPFs, want 1", len(byNode))
+	pending := s.triggers.takeForSession("session-ref-1")
+	if len(pending) != 1 {
+		t.Fatalf("takeForSession returned %d triggers, want 1", len(pending))
 	}
 
 	s.installTriggers(planned)
+	s.deactivate(pending)
 
 	if n := poi.countMessages("ActivateTaskRequest"); n != 1 {
 		t.Fatalf("ActivateTaskRequest count = %d, want 1", n)
 	}
 	if n := poi.countMessages("DeactivateTaskRequest"); n != 1 {
 		t.Errorf("DeactivateTaskRequest count = %d, want 1 — a trigger installed after "+
-			"its session was released must be withdrawn by the install itself", n)
+			"its session was released must be withdrawn, and withdrawn once", n)
 	}
 	if !strings.Contains(strings.Join(poi.sent(), ""), string(planned[0].trigger.XID)) {
 		t.Error("the withdrawal did not name the trigger that was installed")
+	}
+	if n := s.triggers.pendingCount(); n != 0 {
+		t.Errorf("pending = %d after an acknowledged withdrawal, want 0", n)
 	}
 }
 
@@ -818,7 +855,7 @@ func TestReconcileReportsATriggerThePOISaysIsNotRunning(t *testing.T) {
 	poi.unhealthy = map[string]string{mine[0]: "failed"}
 	poi.mu.Unlock()
 
-	s.reconcileTriggers()
+	s.reconcileOne()
 
 	// It is ours, so it must not be withdrawn — the fault is reported, not acted on
 	// by tearing down a live warrant's interception.
@@ -844,5 +881,557 @@ func TestReconcileReportsATriggerThePOISaysIsNotRunning(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("no triggerFaulty report reached the ADMF; got %d report(s): %v", len(reports), reports)
+	}
+}
+
+// installOneTrigger installs a single CC trigger for a live session and returns
+// the warrant and the trigger XID the CC-TF allocated for it. The withdrawal tests
+// all start from here: a warrant, a session that stays up, and a POI that holds a
+// trigger.
+func installOneTrigger(t *testing.T, s *subsystem) (warrant types.InterceptTask, trigger types.XID) {
+	t.Helper()
+
+	warrant = types.InterceptTask{
+		XID:      "11111111-1111-4111-8111-111111111111",
+		Products: []types.ProductType{types.ProductCC},
+	}
+	s.installFor("session-1", []types.InterceptTask{warrant},
+		[]upfSession{{node: upfNode("10.0.1.5"), seid: 42}}, 7)
+
+	for _, xid := range s.triggers.installed {
+		trigger = xid
+	}
+	if trigger == "" {
+		t.Fatal("no trigger was installed, so this test would prove nothing")
+	}
+
+	return warrant, trigger
+}
+
+// TestWithdrawnWarrantIsStillTrackedWhenThePOIRefuses is the regression test for
+// the defect this change exists for, and it is worth exactly what watching it fail
+// is worth: on the previous code it fails on the first assertion.
+//
+// A warrant is withdrawn while its session is live. The X1 DeactivateTask to the
+// serving UPF fails. The bookkeeping had already been deleted on the way to that
+// attempt, so nothing retried and nothing remembered: the UPF kept the trigger,
+// kept the DUPL FAR, and kept delivering the subject's content to MDF3 under a
+// warrant that no longer authorised it. No participant was in a position to notice
+// — the SMF believed it had withdrawn the trigger, the UPF was never told, and the
+// mediation function received well-formed, correctly attributed product.
+func TestWithdrawnWarrantIsStillTrackedWhenThePOIRefuses(t *testing.T) {
+	poi := newFakePOI(t)
+	s := triggerSubsystem(poi)
+	s.taskReporter = &recordingTaskReporter{}
+
+	warrant, trigger := installOneTrigger(t, s)
+
+	// The POI stops answering. Its session is untouched: this is the withdrawal of
+	// authority from an interception that is otherwise running perfectly.
+	poi.mu.Lock()
+	poi.refuse = true
+	poi.mu.Unlock()
+
+	// The X1 deactivation path, as reportDeactivation reaches it.
+	pending := s.triggers.takeForWarrant(warrant.XID)
+	if len(pending) != 1 {
+		t.Fatalf("takeForWarrant returned %d triggers, want 1", len(pending))
+	}
+
+	held, withdrawing := s.triggers.holds(trigger)
+	if !held {
+		t.Fatal("the registry forgot a trigger it has not been told is gone — the UPF is " +
+			"still duplicating under a withdrawn warrant and nothing will ever reclaim it")
+	}
+	if !withdrawing {
+		t.Error("the trigger is held but not marked as being withdrawn, so reconciliation " +
+			"would treat it as live tasking")
+	}
+
+	// Retry until the POI answers, on a clock the test owns. The registry stays
+	// answerable for the trigger throughout — that is what makes the retry possible
+	// at all.
+	attempts := 0
+	s.triggers.sleep = func(time.Duration) {
+		attempts++
+		if held, _ := s.triggers.holds(trigger); !held {
+			t.Error("the registry dropped the trigger between attempts")
+		}
+		if attempts == 2 {
+			poi.mu.Lock()
+			poi.refuse = false
+			poi.mu.Unlock()
+		}
+	}
+	s.deactivate(pending)
+
+	if held, _ := s.triggers.holds(trigger); held {
+		t.Error("the registry still holds a trigger the POI acknowledged withdrawing")
+	}
+	if n := s.triggers.pendingCount(); n != 0 {
+		t.Errorf("pending = %d after acknowledgement, want 0", n)
+	}
+}
+
+// TestWithdrawalRetriesOnBackoff pins the shape of the retry: bounded in effort so
+// it cannot spin against a POI that is down, unbounded in intent so it cannot give
+// up while it still believes a trigger is installed. A retry that expires is this
+// change's defect arriving later.
+func TestWithdrawalRetriesOnBackoff(t *testing.T) {
+	poi := newFakePOI(t)
+	s := triggerSubsystem(poi)
+	s.taskReporter = &recordingTaskReporter{}
+
+	warrant, _ := installOneTrigger(t, s)
+
+	poi.mu.Lock()
+	poi.refuse = true
+	poi.mu.Unlock()
+
+	pending := s.triggers.takeForWarrant(warrant.XID)
+
+	// The clock is the test's, so a backoff measured in minutes costs nothing. The
+	// POI starts answering after the fifth failure, which is where the schedule has
+	// levelled off at the keepalive interval.
+	var waits []time.Duration
+	s.triggers.sleep = func(d time.Duration) {
+		waits = append(waits, d)
+		if n := s.triggers.pendingCount(); n != 1 {
+			t.Errorf("pending = %d during retry %d, want exactly the one being withdrawn", n, len(waits))
+		}
+		if len(waits) == 5 {
+			poi.mu.Lock()
+			poi.refuse = false
+			poi.mu.Unlock()
+		}
+	}
+
+	before := poi.countMessages("DeactivateTaskRequest")
+	s.deactivate(pending)
+
+	want := []time.Duration{5 * time.Second, 10 * time.Second, 20 * time.Second, 40 * time.Second, 60 * time.Second}
+	if !slices.Equal(waits, want) {
+		t.Errorf("backoff was %v, want %v — doubling from 5s and level at the keepalive interval", waits, want)
+	}
+	if n := poi.countMessages("DeactivateTaskRequest") - before; n != 6 {
+		t.Errorf("sent %d withdrawals, want 6 (five refused, one acknowledged)", n)
+	}
+	if n := s.triggers.pendingCount(); n != 0 {
+		t.Errorf("pending = %d once the POI acknowledged, want 0", n)
+	}
+}
+
+// TestWithdrawalFailureAndStuckAreDistinctReports: the LIPF is the only party that
+// can act on a withdrawal this element cannot deliver, and it can only act if the
+// two conditions reach it as two conditions. "The last attempt failed" and
+// "authority was removed five minutes ago and content is probably still flowing"
+// call for different responses, and an operator who sees the first repeated
+// indefinitely learns nothing from the hundredth.
+func TestWithdrawalFailureAndStuckAreDistinctReports(t *testing.T) {
+	var mu sync.Mutex
+	var reports []string
+	admf := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body) //nolint:errcheck // test
+		mu.Lock()
+		reports = append(reports, string(body))
+		mu.Unlock()
+		//nolint:errcheck // test handler write
+		_, _ = w.Write([]byte(`<?xml version="1.0"?><X1Response xmlns="http://uri.etsi.org/03221/X1/2017/10">` +
+			`<x1ResponseMessage><oK>AcknowledgedAndCompleted</oK></x1ResponseMessage></X1Response>`))
+	}))
+	defer admf.Close()
+
+	poi := newFakePOI(t)
+	s := triggerSubsystem(poi)
+	s.taskReporter = &recordingTaskReporter{}
+	s.reporter = x1.NewReporter(admf.URL, "admf", "smf", nil)
+
+	warrant, trigger := installOneTrigger(t, s)
+
+	poi.mu.Lock()
+	poi.refuse = true
+	poi.mu.Unlock()
+
+	// A clock that advances by more than the stuck window between the second and
+	// third attempt, so the test observes the transition rather than waiting for it.
+	now := time.Now()
+	s.triggers.now = func() time.Time { return now }
+	pending := s.triggers.takeForWarrant(warrant.XID)
+
+	rounds := 0
+	s.triggers.sleep = func(time.Duration) {
+		rounds++
+		if rounds == 2 {
+			now = now.Add(withdrawalStuckAfter + time.Second)
+		}
+		if rounds == 5 {
+			poi.mu.Lock()
+			poi.refuse = false
+			poi.mu.Unlock()
+		}
+	}
+	s.deactivate(pending)
+
+	mu.Lock()
+	defer mu.Unlock()
+	failed, stuck := 0, 0
+	for _, body := range reports {
+		if strings.Contains(body, x1.NEIssueTaskingWithdrawalFailed) {
+			failed++
+		}
+		if strings.Contains(body, x1.NEIssueTaskingWithdrawalStuck) {
+			stuck++
+		}
+		// The fault channel is inside the LI domain, but which subject a warrant
+		// covers is not its business, and neither is which warrant.
+		if strings.Contains(body, string(trigger)) || strings.Contains(body, string(warrant.XID)) {
+			t.Errorf("an NE-level withdrawal report names an identifier:\n%s", body)
+		}
+	}
+	if failed != 1 {
+		t.Errorf("taskingWithdrawalFailed reported %d times over six attempts, want 1", failed)
+	}
+	if stuck != 1 {
+		t.Errorf("taskingWithdrawalStuck reported %d times, want 1 — it is a condition, not a tick", stuck)
+	}
+}
+
+// TestReconcileLeavesAWithdrawalInFlightAlone: reconciliation and the withdrawal
+// retry loop both act on tasking the POI still holds, and a trigger being
+// withdrawn is visible to both. Two parties sending DeactivateTask for one XID
+// each read an answer meant for the other — one sees an acknowledgement for a task
+// the other has already removed and concludes the withdrawal landed. The registry
+// answers "mine, and on its way out", which is what keeps reconciliation off it.
+func TestReconcileLeavesAWithdrawalInFlightAlone(t *testing.T) {
+	poi := newFakePOI(t)
+	s := triggerSubsystem(poi)
+	s.taskReporter = &recordingTaskReporter{}
+
+	warrant, trigger := installOneTrigger(t, s)
+
+	// The warrant is withdrawn and the POI has not acknowledged, so the trigger is
+	// pending — and the POI, asked what it holds, still reports it.
+	s.triggers.takeForWarrant(warrant.XID)
+	poi.mu.Lock()
+	poi.holds = []string{string(trigger)}
+	poi.mu.Unlock()
+
+	before := poi.countMessages("DeactivateTaskRequest")
+	s.reconcileOne()
+
+	if n := poi.countMessages("DeactivateTaskRequest") - before; n != 0 {
+		t.Errorf("reconciliation sent %d withdrawals for a trigger already being withdrawn, want 0", n)
+	}
+}
+
+// TestKeepalivesFollowTaskingRatherThanConfiguration: the POI's fail-safe purge is
+// the last mechanism able to reclaim tasking a triggering function can no longer
+// name, and keeping every configured endpoint alive on a timer disables it by
+// construction. A POI holding a forgotten trigger was being told, once a minute,
+// that the function responsible for it was alive and well.
+func TestKeepalivesFollowTaskingRatherThanConfiguration(t *testing.T) {
+	poi := newFakePOI(t)
+	s := triggerSubsystem(poi)
+	s.taskReporter = &recordingTaskReporter{}
+	endpoint := s.triggers.endpoints["10.0.1.5"]
+
+	// Reconciled and holding nothing: there is nothing to keep, so the POI is left
+	// to lapse whatever it still holds.
+	endpoint.markReconciled()
+	if s.triggers.keepaliveDue("10.0.1.5", endpoint) {
+		t.Error("an SMF holding no content tasking keeps a POI alive, which is what makes " +
+			"its fail-safe unreachable")
+	}
+
+	warrant, _ := installOneTrigger(t, s)
+	if !s.triggers.keepaliveDue("10.0.1.5", endpoint) {
+		t.Error("a POI holding this SMF's live trigger is not kept alive; its fail-safe " +
+			"would purge an authorised interception")
+	}
+
+	// A withdrawal in flight still counts. Going silent under it would ask the POI's
+	// fail-safe to finish a job this process has not given up on, and the fail-safe
+	// takes everything at that POI with it.
+	pending := s.triggers.takeForWarrant(warrant.XID)
+	if !s.triggers.keepaliveDue("10.0.1.5", endpoint) {
+		t.Error("a POI is left to lapse while a withdrawal to it is still pending")
+	}
+
+	s.deactivate(pending)
+	if s.triggers.keepaliveDue("10.0.1.5", endpoint) {
+		t.Error("keepalives continue after the last trigger was withdrawn and acknowledged")
+	}
+}
+
+// TestKeepalivesWaitForReconciliation is the inversion D3 exists for. A restarted
+// SMF is *present*, so the POI's fail-safe will not act while it is being kept
+// alive — and until reconciliation completes, this process cannot name what that
+// POI holds and therefore could never withdraw it, not even when the warrant
+// behind it is revoked. Staying silent means such tasking lapses instead of
+// persisting: the failure mode inverts from "interception survives" to
+// "interception stops", which is the direction a fail-safe must fail in.
+func TestKeepalivesWaitForReconciliation(t *testing.T) {
+	poi := newFakePOI(t)
+	s := triggerSubsystem(poi)
+	s.taskReporter = &recordingTaskReporter{}
+	endpoint := s.triggers.endpoints["10.0.1.5"]
+
+	// A session establishes before reconciliation has finished, so this process does
+	// hold tasking at the POI — and still owes it nothing, because what it cannot
+	// name is what the fail-safe is for.
+	installOneTrigger(t, s)
+	if s.triggers.keepaliveDue("10.0.1.5", endpoint) {
+		t.Error("a POI is kept alive before this process has established what it holds")
+	}
+
+	s.reconcileOne()
+	if !s.triggers.keepaliveDue("10.0.1.5", endpoint) {
+		t.Error("a reconciled POI holding live tasking is not kept alive")
+	}
+}
+
+// TestReconcileRetriesUntilThePOIAnswers: an endpoint unreachable at startup and
+// reachable a minute later is the ordinary shape of a whole-cluster restart. One
+// attempt is not reconciliation — abandoning the POI left tasking this process
+// could not name, for the life of the process.
+func TestReconcileRetriesUntilThePOIAnswers(t *testing.T) {
+	poi := newFakePOI(t)
+	poi.mu.Lock()
+	poi.detailsFail = true
+	poi.holds = []string{"aaaaaaaa-1111-4111-8111-111111111111"}
+	poi.mu.Unlock()
+
+	s := triggerSubsystem(poi)
+	s.taskReporter = &recordingTaskReporter{}
+	endpoint := s.triggers.endpoints["10.0.1.5"]
+
+	attempts := 0
+	s.triggers.sleep = func(time.Duration) {
+		attempts++
+		if endpoint.isReconciled() {
+			t.Error("the endpoint counts as reconciled while it is still refusing to say what it holds")
+		}
+		if attempts == 2 {
+			poi.mu.Lock()
+			poi.detailsFail = false
+			poi.mu.Unlock()
+		}
+	}
+	s.reconcileOne()
+
+	if attempts != 2 {
+		t.Errorf("reconciliation waited %d times, want 2 — two failures then an answer", attempts)
+	}
+	if !endpoint.isReconciled() {
+		t.Error("the endpoint is not reconciled after the POI answered")
+	}
+	// And what it found is withdrawn durably, not fired and forgotten: the pending
+	// state is empty because the POI acknowledged, not because nobody was watching.
+	if n := poi.countMessages("DeactivateTaskRequest"); n != 1 {
+		t.Errorf("sent %d withdrawals for the one orphan the POI reported, want 1", n)
+	}
+	if n := s.triggers.pendingCount(); n != 0 {
+		t.Errorf("pending = %d after an acknowledged withdrawal, want 0", n)
+	}
+}
+
+// TestReconcileWithdrawalIsRetriedLikeAnyOther: reconciliation's own withdrawals
+// used to be the one unchecked path left — the tasking least able to survive being
+// forgotten, since by definition nothing else knows it exists.
+func TestReconcileWithdrawalIsRetriedLikeAnyOther(t *testing.T) {
+	poi := newFakePOI(t)
+	poi.mu.Lock()
+	poi.holds = []string{"aaaaaaaa-1111-4111-8111-111111111111"}
+	poi.refuse = true // GetAllDetails still answers; DeactivateTask does not
+	poi.mu.Unlock()
+
+	s := triggerSubsystem(poi)
+	s.taskReporter = &recordingTaskReporter{}
+
+	attempts := 0
+	s.triggers.sleep = func(time.Duration) {
+		attempts++
+		if n := s.triggers.pendingCount(); n != 1 {
+			t.Errorf("pending = %d while an orphan's withdrawal is unacknowledged, want 1", n)
+		}
+		if attempts == 2 {
+			poi.mu.Lock()
+			poi.refuse = false
+			poi.mu.Unlock()
+		}
+	}
+	s.reconcileOne()
+
+	if n := poi.countMessages("DeactivateTaskRequest"); n != 3 {
+		t.Errorf("sent %d withdrawals, want 3 (two refused, one acknowledged)", n)
+	}
+	if n := s.triggers.pendingCount(); n != 0 {
+		t.Errorf("pending = %d once the orphan was acknowledged, want 0", n)
+	}
+}
+
+// TestFailSafeCannotReclaimAnOrphanBesideLiveTasking is the documented limit of the
+// backstop, not a behaviour to rely on. The POI's fail-safe is per-connection: it
+// purges all of an endpoint's tasking or none of it. So an orphan at an endpoint
+// that also holds a live task is preserved by the keepalives that live task earns,
+// and no amount of gating changes that. Durable withdrawal (the pending state) is
+// the remedy; this only makes the backstop reachable in the case where the
+// endpoint's last task was the one that failed to withdraw.
+func TestFailSafeCannotReclaimAnOrphanBesideLiveTasking(t *testing.T) {
+	poi := newFakePOI(t)
+	s := triggerSubsystem(poi)
+	s.taskReporter = &recordingTaskReporter{}
+	endpoint := s.triggers.endpoints["10.0.1.5"]
+	endpoint.markReconciled()
+
+	// One live warrant's trigger, installed and running.
+	warrant, live := installOneTrigger(t, s)
+
+	// And an orphan the POI holds that this process is not tracking — the state a
+	// forgotten withdrawal leaves behind, and the reason the pending state exists.
+	orphan := "99999999-9999-4999-8999-999999999999"
+	poi.mu.Lock()
+	poi.holds = []string{string(live), orphan}
+	poi.mu.Unlock()
+
+	if held, _ := s.triggers.holds(types.XID(orphan)); held {
+		t.Fatal("the orphan is tracked, so this test would not describe an orphan")
+	}
+	// The live trigger keeps the endpoint alive, so the POI's fail-safe never fires
+	// and the orphan keeps duplicating alongside it.
+	if !s.triggers.keepaliveDue("10.0.1.5", endpoint) {
+		t.Fatal("the endpoint is not kept alive despite holding a live trigger")
+	}
+
+	// Only once the live trigger is withdrawn and acknowledged does the endpoint
+	// fall silent — and only then can the fail-safe reclaim the orphan.
+	s.deactivate(s.triggers.takeForWarrant(warrant.XID))
+	if s.triggers.keepaliveDue("10.0.1.5", endpoint) {
+		t.Error("the endpoint is still kept alive with nothing of ours left at it, so the " +
+			"orphan survives even the case this backstop does cover")
+	}
+}
+
+// TestRetargetDoesNotReapTheTriggerItInstalled is the race the one-event contract
+// removes. A ModifyTask keeps the XID, and this registry is keyed by the warrant
+// XID, so "the old task's teardown" and "the new task's installation" address the
+// same entries. Under the two-event contract the activation ran first and
+// installed, asynchronously, while the deactivation that followed took everything
+// the warrant held — including what had just been installed — and the interception
+// the ADMF had just ordered was gone with nothing left to say so.
+//
+// Now the modification computes the sessions the task still covers and reads the
+// registry once, so a trigger for a session that survives the retarget is never
+// among what is withdrawn, whatever order the goroutines run in.
+func TestRetargetDoesNotReapTheTriggerItInstalled(t *testing.T) {
+	const warrant = types.XID("11111111-1111-4111-8111-111111111111")
+
+	for range 200 {
+		poi := newFakePOI(t)
+		s := triggerSubsystem(poi)
+		s.taskReporter = &recordingTaskReporter{}
+		task := types.InterceptTask{XID: warrant, Products: []types.ProductType{types.ProductCC}}
+
+		// The old target's session, tasked before the modification.
+		s.installFor("session-old", []types.InterceptTask{task},
+			[]upfSession{{node: upfNode("10.0.1.5"), seid: 42}}, 7)
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		// The new target's session being tasked, off the signalling path.
+		go func() {
+			defer wg.Done()
+			s.installFor("session-new", []types.InterceptTask{task},
+				[]upfSession{{node: upfNode("10.0.1.5"), seid: 43}}, 9)
+		}()
+		// The modification's own teardown, keeping the sessions the task still covers.
+		go func() {
+			defer wg.Done()
+			s.deactivate(s.triggers.takeForWarrantExcept(warrant, map[string]bool{"session-new": true}))
+		}()
+		wg.Wait()
+
+		key := triggerKey(warrant, "session-new", "10.0.1.5")
+		if _, held := s.triggers.installed[key]; !held {
+			t.Fatalf("the retarget reaped the trigger it had just installed for the new target; "+
+				"installed = %v", s.triggers.installed)
+		}
+		if _, gone := s.triggers.installed[triggerKey(warrant, "session-old", "10.0.1.5")]; gone {
+			t.Fatal("the trigger for a session the task no longer covers survived the retarget")
+		}
+		if n := s.triggers.pendingCount(); n != 0 {
+			t.Fatalf("pending = %d after an acknowledged withdrawal, want 0", n)
+		}
+	}
+}
+
+// TestAReactivatedWarrantDoesNotDisplaceTheWithdrawalInFlight: the two maps are
+// not in step. A warrant deactivated and re-activated while its POI is unreachable
+// claims the same (warrant, session, UPF) key again under a new XID, while the old
+// XID is still being withdrawn. Both are this registry's responsibility and it must
+// be able to hold both — the first's acknowledgement must not clear the second's
+// record, which would leave a trigger installed with nothing tracking it.
+func TestAReactivatedWarrantDoesNotDisplaceTheWithdrawalInFlight(t *testing.T) {
+	poi := newFakePOI(t)
+	s := triggerSubsystem(poi)
+	s.taskReporter = &recordingTaskReporter{}
+
+	warrant, first := installOneTrigger(t, s)
+
+	// The POI stops answering, and the warrant is withdrawn.
+	poi.mu.Lock()
+	poi.refuse = true
+	poi.mu.Unlock()
+	pending := s.triggers.takeForWarrant(warrant.XID)
+
+	// The ADMF re-activates the same warrant on the same session before the
+	// withdrawal has landed. The trigger key is the same; the XID is not.
+	poi.mu.Lock()
+	poi.refuse = false
+	poi.mu.Unlock()
+	s.installFor("session-1", []types.InterceptTask{warrant},
+		[]upfSession{{node: upfNode("10.0.1.5"), seid: 42}}, 7)
+
+	var second types.XID
+	for _, xid := range s.triggers.installed {
+		second = xid
+	}
+	if second == "" || second == first {
+		t.Fatalf("the re-activation claimed no new trigger (first %q, second %q)", first, second)
+	}
+	if n := s.triggers.pendingCount(); n != 1 {
+		t.Fatalf("pending = %d after a re-activation over a pending withdrawal, want the 1 being withdrawn", n)
+	}
+
+	// And the re-activated warrant is withdrawn in its turn, before the first
+	// withdrawal has been acknowledged. Both triggers are now this registry's
+	// responsibility, under one trigger key.
+	poi.mu.Lock()
+	poi.refuse = true
+	poi.mu.Unlock()
+	again := s.triggers.takeForWarrant(warrant.XID)
+	if n := s.triggers.pendingCount(); n != 2 {
+		t.Fatalf("pending = %d with two withdrawals outstanding for one trigger key, want 2 — "+
+			"the second displaced the first and one of them is now tracked by nobody", n)
+	}
+
+	// The first withdrawal lands. It must clear its own record and leave the
+	// second's alone: the second trigger is still installed at the POI.
+	poi.mu.Lock()
+	poi.refuse = false
+	poi.mu.Unlock()
+	s.deactivate(pending)
+
+	if held, withdrawing := s.triggers.holds(second); !held || !withdrawing {
+		t.Error("the acknowledgement of the first trigger's withdrawal took the second's " +
+			"record with it, leaving a trigger installed at the POI with nothing tracking it")
+	}
+	if n := s.triggers.pendingCount(); n != 1 {
+		t.Errorf("pending = %d after one of two withdrawals was acknowledged, want the other one", n)
+	}
+
+	s.deactivate(again)
+	if n := s.triggers.pendingCount(); n != 0 {
+		t.Errorf("pending = %d after both withdrawals were acknowledged, want 0", n)
 	}
 }

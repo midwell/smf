@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -199,9 +200,9 @@ var active atomic.Pointer[subsystem]
 // copy of the same wiring written in a test — which is where a configured policy quietly
 // stops being applied.
 func newX1Server(st *store.Store, cfg Config, sub *subsystem) *x1.Server {
-	// OnActivate/OnDeactivate scan already-established sessions when a warrant is
-	// (de)tasked mid-session: emit the "start with established PDU
-	// session" xIRI and (de)activate CC duplication on live sessions.
+	// OnTaskChange scans already-established sessions when a warrant is (de)tasked
+	// or modified mid-session: emit the "start with established PDU session" xIRI
+	// and (de)activate CC duplication on live sessions.
 	// WithADMF holds X1 peers to the responsible ADMF's identity: a certificate
 	// from the LI CA authenticates a peer, but only this identifier may task us
 	// (TS 103 221-1 clause 8.2.4 + error 1040).
@@ -215,8 +216,7 @@ func newX1Server(st *store.Store, cfg Config, sub *subsystem) *x1.Server {
 		// The conditions this POI can observe about itself, which li/x1 cannot: see
 		// subsystem.deliveryFault.
 		x1.WithFaultProbes(sub.deliveryFault),
-		x1.OnActivate(sub.reportStartOfInterception),
-		x1.OnDeactivate(sub.reportDeactivation),
+		x1.OnTaskChange(sub.applyTaskChange),
 		x1.OnAuthFailure(func(code int) {
 			if sub.reporter != nil {
 				sub.reporter.Notify(x1.NEIssueX1AuthFailed,
@@ -554,12 +554,71 @@ func SetSessionModifier(fn func(*smfctx.SMContext) error) {
 	sessionModifier = fn
 }
 
-// reportStartOfInterception is the X1 OnActivate hook: when a warrant is tasked
-// for a UE that already has a live PDU session, emit the "start with established
-// PDU session" xIRI (if IRI is wanted) and switch on CC duplication (if CC is
-// wanted). It runs on live sessions the target already has; sessions established
-// later are handled at establishment by ReportEstablishment / ApplyCCTrigger.
-func (s *subsystem) reportStartOfInterception(task types.InterceptTask) {
+// applyTaskChange is the X1 lifecycle hook (x1.OnTaskChange): one event per
+// transition of this element's tasking, carrying the task as it was and as it
+// becomes. prev nil is an activation, next nil a removal, both a modification.
+func (s *subsystem) applyTaskChange(prev, next *types.InterceptTask) {
+	switch {
+	case prev == nil:
+		s.reportStartOfInterception(*next, nil)
+	case next == nil:
+		s.reportDeactivation(*prev)
+	default:
+		s.modifyInterception(*prev, *next)
+	}
+}
+
+// modifyInterception applies a modification as one reconciliation rather than as
+// an activation followed by a deactivation.
+//
+// A ModifyTask keeps the XID, and everything this element keys off it is the same
+// key for both sides: the trigger registry is keyed by the warrant XID, and so is
+// the sequence-numbering state. Applying the new task and then tearing down the
+// old one let the teardown reclaim the triggers the activation had just installed,
+// and let Forget discard numbering the new task's records had already consumed.
+// Neither is possible from here, because there is only one pass.
+func (s *subsystem) modifyInterception(prev, next types.InterceptTask) {
+	wantedCC := prev.WantsProduct(types.ProductCC)
+	wantsCC := next.WantsProduct(types.ProductCC)
+	if slices.Equal(prev.Targets, next.Targets) && wantedCC == wantsCC {
+		// Nothing this POI acts on has moved. It applies interception by target and
+		// by product, and the numbering state belongs to the XID, which a
+		// modification never changes.
+		return
+	}
+
+	// Reconcile the triggers held for this warrant against the sessions the task
+	// still covers, in one locked pass: a session tasked before and after keeps the
+	// trigger it has. Withdrawing everything and reinstalling would stop and restart
+	// content interception for a session whose tasking did not change.
+	s.retriggerWarrant(next)
+
+	// Duplication re-derives from the task set, which already holds next, so a
+	// session reached by either scan is evaluated the same way. Only sessions the
+	// old task covered need the extra visit — the new task's own scan covers its.
+	if wantedCC {
+		s.scanSessions(prev, func(sc *smfctx.SMContext) any {
+			if s.applyCC(sc) {
+				s.modifySession(sc)
+			}
+
+			return nil
+		})
+	}
+
+	s.reportStartOfInterception(next, &prev)
+}
+
+// reportStartOfInterception applies a task to sessions that already exist: emit
+// the "start with established PDU session" xIRI (if IRI is wanted) and switch on
+// CC duplication (if CC is wanted). It runs on live sessions the target already
+// has; sessions established later are handled at establishment by
+// ReportEstablishment / ApplyCCTrigger.
+//
+// already, when set, is the task this one replaces. Interception of a session that
+// task already covered did not begin here, so no record says it did — the CC work
+// is unaffected, since that re-derives from the task set either way.
+func (s *subsystem) reportStartOfInterception(task types.InterceptTask, already *types.InterceptTask) {
 	wantIRI := task.WantsProduct(types.ProductIRI)
 	s.scanSessions(task, func(sc *smfctx.SMContext) any {
 		var event any
@@ -567,7 +626,7 @@ func (s *subsystem) reportStartOfInterception(task types.InterceptTask) {
 		// the session has no endpoint address. A session with no address assigned
 		// is not one this record can describe, so report nothing for it rather
 		// than something untrue — the CC work below is unaffected either way.
-		if wantIRI && ueEndpoint(sc) != nil {
+		if wantIRI && ueEndpoint(sc) != nil && !covered(already, sc) {
 			event = smfStartOfInterception(sc)
 		}
 		if s.applyCC(sc) {
@@ -580,8 +639,14 @@ func (s *subsystem) reportStartOfInterception(task types.InterceptTask) {
 	})
 }
 
-// reportDeactivation is the X1 OnDeactivate hook: when a warrant is removed, undo
-// the CC duplication it caused on the target's live sessions. It re-evaluates
+// covered reports whether task already intercepted this session's IRI. Caller
+// holds sc.SMLock (sessionTargets reads the session's identity fields).
+func covered(task *types.InterceptTask, sc *smfctx.SMContext) bool {
+	return task != nil && task.WantsProduct(types.ProductIRI) && sessionTargets(*task, sc)
+}
+
+// reportDeactivation undoes the CC duplication a removed warrant caused on the
+// target's live sessions. It re-evaluates
 // against the remaining task set, so duplication is only cleared once no CC task
 // still targets the session (correct under overlapping multi-agency warrants).
 // IRI needs no undo, so a pure-IRI deactivation is a no-op.
