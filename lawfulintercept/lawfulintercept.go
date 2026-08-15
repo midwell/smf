@@ -263,13 +263,17 @@ func Init(cfg Config) error {
 	// One client per destination address, created on first use: a task carries the
 	// endpoints its product goes to, and TS 33.128 marks them mandatory, so this
 	// element cannot know them at startup.
+	// The delivery-failure hook no longer reports. An unreachable mediation function
+	// is a condition this element can re-observe — the pool's own accounting answers
+	// it — so it has an ending, and TS 103 221-1 clause 5.3 requires an ending to be
+	// reported too. A site that announces with nothing that retracts eventually
+	// announces something nobody retracts, so both edges belong to whoever can see
+	// the transition. The hook nudges that watcher, which keeps the report as prompt
+	// as it was while moving the decision to one place.
+	var watcher *x1.DestinationWatcher
 	pool := x2x3.NewPool(mat.ClientTLS(),
 		keepaliveConfig(cfg, reporter),
-		func(error) {
-			if reporter != nil {
-				reporter.Notify(x1.NEIssueMDFUnreachable, "MDF2 X2 delivery failed")
-			}
-		},
+		func(error) { watcher.Nudge() },
 		nil, // drops are covered by the same MDF-unreachable report from the worker
 	)
 	sub := &subsystem{
@@ -285,6 +289,18 @@ func Init(cfg Config) error {
 	// knows what each destination's last delivery established, and only the subsystem knows
 	// which destinations the tasking still names.
 	sub.unreachable = func() (int, int) { return pool.UnreachableAmong(sub.destinationsInUse()) }
+	// The watcher's view of the same destinations, with the identifiers the ADMF
+	// provisioned them under. A different shape from the probe's on purpose: the
+	// probe answers a status request and takes counts so it *cannot* name a
+	// destination, and a destination-scoped report says which. Same fact, two
+	// questions.
+	if reporter != nil {
+		watcher = x1.NewDestinationWatcher(func() []x1.DestinationHealth {
+			return x1.DestinationHealthOf(sub.store.Snapshot(), types.DeliveryX2,
+				func(addr string) bool { return pool.UnreachableAt(addr) })
+		}, reporter, 0)
+		go watcher.Watch(nil)
+	}
 	// Assign the interface only when a reporter exists: a typed-nil would pass the
 	// nil check in reportTaskIssue and then panic on use.
 	if reporter != nil {
