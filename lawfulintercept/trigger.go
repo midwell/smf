@@ -577,6 +577,9 @@ func (s *subsystem) installTriggers(planned []plannedTrigger) {
 		if err := s.ensureDestination(p.endpoint); err != nil {
 			s.triggers.release(p.key)
 			s.reportTaskIssue(p.warrant, "X3 delivery destination could not be provisioned at the UPF")
+			// The first X1 exchange of the sequence, so an answer this element
+			// cannot bind surfaces here before it ever reaches the activation.
+			s.reportUnattributable(err)
 
 			continue
 		}
@@ -600,6 +603,12 @@ func (s *subsystem) installTriggers(planned []plannedTrigger) {
 			// retries, and tell the LIPF this warrant is producing no content.
 			s.triggers.release(p.key)
 			s.reportTaskIssue(p.warrant, "the UPF refused or failed the content-interception trigger")
+			// And, where the cause was an answer this element could not bind to its
+			// request, say so separately. The task issue above is the same whether
+			// the POI refused the warrant or this element disbelieved its answer,
+			// and those need opposite actions — the first is a POI to look at, the
+			// second a configuration mismatch here.
+			s.reportUnattributable(err)
 
 			continue
 		}
@@ -705,12 +714,7 @@ func (s *subsystem) reportWithdrawalFailure(key string, cause error) {
 		return
 	}
 
-	var unattributable *x1.ResponseError
-	if errors.As(cause, &unattributable) {
-		s.reporter.Notify(x1.NEIssueX1ResponseUnattributable,
-			"a UPF's answer to a withdrawal could not be bound to the request that produced it ("+
-				unattributable.Field+"); the POI may be answering correctly and being refused here")
-	}
+	s.reportUnattributable(cause)
 
 	if first {
 		s.reporter.Notify(x1.NEIssueTaskingWithdrawalFailed,
@@ -761,6 +765,25 @@ func (s *subsystem) ensureDestination(endpoint *upfEndpoint) error {
 
 	endpoint.destinationReady = true
 	return nil
+}
+
+// reportUnattributable tells the LIPF that this element received an X1 answer it
+// could not bind to the request that produced it, naming the envelope field that
+// disagreed and nothing else.
+//
+// It is called beside a task-level report rather than instead of one: on this path
+// the element does know which warrant it was installing, so the task issue is
+// true and useful. What it cannot convey is *which side* the fault is on, and that
+// is what this adds. A response that cannot be attributed is an element-level
+// condition however much context the caller happens to hold.
+func (s *subsystem) reportUnattributable(cause error) {
+	var unattributable *x1.ResponseError
+	if s.reporter == nil || !errors.As(cause, &unattributable) {
+		return
+	}
+	s.reporter.Notify(x1.NEIssueX1ResponseUnattributable,
+		"a POI's answer could not be bound to the request that produced it ("+
+			unattributable.Field+"); the POI may be answering correctly and being refused here")
 }
 
 // reportTaskIssue tells the LIPF that an authorised interception is not producing

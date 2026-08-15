@@ -25,6 +25,10 @@ import (
 // address (see matchEndpoint).
 func upfNode(s string) smfctx.NodeID { return *smfctx.NewNodeID(s) }
 
+// wrongNE is an element identifier this SMF does not address, which is how a POI
+// is made to answer correctly under a name the requester did not ask for.
+const wrongNE = "upf-2"
+
 // mustRegistry builds a registry from a configuration the test knows is valid.
 // Construction only fails on an ambiguous configuration, which the tests that care
 // about that assert on explicitly.
@@ -1515,7 +1519,7 @@ func TestAnUnattributableAnswerKeepsTheWithdrawalPending(t *testing.T) {
 
 	// The POI now answers perfectly well, under a name this SMF did not address.
 	poi.mu.Lock()
-	poi.misname = "upf-2"
+	poi.misname = wrongNE
 	poi.mu.Unlock()
 
 	pending := s.triggers.takeForWarrant(warrant.XID)
@@ -1575,7 +1579,7 @@ func TestAWithdrawalStuckOnOurOwnRefusalIsDistinguishable(t *testing.T) {
 	warrant, trigger := installOneTrigger(t, s)
 
 	poi.mu.Lock()
-	poi.misname = "upf-2"
+	poi.misname = wrongNE
 	poi.mu.Unlock()
 
 	pending := s.triggers.takeForWarrant(warrant.XID)
@@ -1625,5 +1629,86 @@ func TestAWithdrawalStuckOnOurOwnRefusalIsDistinguishable(t *testing.T) {
 	}
 	if !named {
 		t.Error("the unattributable-answer report does not name which envelope field disagreed")
+	}
+}
+
+// TestAnUnbindableActivationAnswerIsReportedAsElementLevel is the gap the
+// end-to-end suite found, and the reason it is worth running a section against a
+// real deployment even when the unit tests are green.
+//
+// The unattributable condition was wired into the withdrawal path only, because
+// that is where this change's risk register put it. On the activation path the
+// element reported a task issue and nothing else — the same report whether the POI
+// refused the warrant or this element refused to believe the POI's answer. Those
+// need opposite actions: one is a POI to go and look at, the other a configuration
+// mismatch on this side.
+//
+// The task issue stays. On this path the element does know which warrant it was
+// installing, so naming it is true and useful; what the task issue cannot convey
+// is which side of the exchange is at fault.
+func TestAnUnbindableActivationAnswerIsReportedAsElementLevel(t *testing.T) {
+	var mu sync.Mutex
+	var reports []string
+	admf := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body) //nolint:errcheck // test
+		mu.Lock()
+		reports = append(reports, string(body))
+		mu.Unlock()
+		//nolint:errcheck // test handler write
+		_, _ = w.Write([]byte(`<?xml version="1.0"?><X1Response xmlns="http://uri.etsi.org/03221/X1/2017/10">` +
+			`<x1ResponseMessage><oK>AcknowledgedAndCompleted</oK></x1ResponseMessage></X1Response>`))
+	}))
+	defer admf.Close()
+
+	poi := newFakePOI(t)
+	s := triggerSubsystem(poi)
+	s.taskReporter = &recordingTaskReporter{}
+	s.reporter = x1.NewReporter(admf.URL, "admf", "smf", nil)
+
+	// The POI answers perfectly well, under a name this SMF did not address.
+	poi.mu.Lock()
+	poi.misname = wrongNE
+	poi.mu.Unlock()
+
+	warrant := types.InterceptTask{
+		XID:      "11111111-1111-4111-8111-111111111111",
+		Products: []types.ProductType{types.ProductCC},
+	}
+	s.installFor("session-1", []types.InterceptTask{warrant},
+		[]upfSession{{node: upfNode("10.0.1.5"), seid: 42}}, 7)
+
+	// The X1 exchanges happen off the signalling path, so the assertion has to wait
+	// for them rather than for installFor to return.
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		seen := len(reports)
+		mu.Unlock()
+		if seen > 0 {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	var unattributable int
+	for _, body := range reports {
+		if strings.Contains(body, x1.NEIssueX1ResponseUnattributable) {
+			unattributable++
+		}
+		if strings.Contains(body, x1.NEIssueX1ResponseUnattributable) &&
+			strings.Contains(body, string(warrant.XID)) {
+			t.Errorf("the element-level condition names a warrant:\n%s", body)
+		}
+	}
+	if unattributable == 0 {
+		t.Error("an activation answered by the wrong element was reported only as a task issue; an operator is sent to look at a POI that is answering correctly")
+	}
+
+	// And nothing was recorded as installed on the strength of an answer that
+	// could not be bound.
+	if n := len(s.triggers.installed); n != 0 {
+		t.Errorf("%d triggers recorded as installed, want 0", n)
 	}
 }
