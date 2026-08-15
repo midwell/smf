@@ -5,6 +5,7 @@ package lawfulintercept
 
 import (
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net"
 	"slices"
@@ -672,7 +673,7 @@ func (s *subsystem) deactivate(pending []withdrawal) {
 
 			if err := endpoint.req.DeactivateTask(w.xid); err != nil {
 				remaining = append(remaining, w)
-				s.reportWithdrawalFailure(w.key)
+				s.reportWithdrawalFailure(w.key, err)
 
 				continue
 			}
@@ -687,11 +688,30 @@ func (s *subsystem) deactivate(pending []withdrawal) {
 // worse. Both are element-level conditions: they name no XID, because what an
 // operator must know is that this element cannot end an interception it has been
 // told to end, and a channel carrying that must not also carry whose it was.
-func (s *subsystem) reportWithdrawalFailure(key string) {
+//
+// It also says *which side* the failure is on, and that is not cosmetic. A
+// withdrawal whose answer this element refuses is not a POI problem: the POI may
+// be answering perfectly well and being disbelieved, because the identity it
+// states is not the one this SMF addressed, or its version is one this element
+// does not speak. Reported only as taskingWithdrawalFailed, that presents as a POI
+// at fault and sends an operator to look in the wrong place — and it is precisely
+// the failure that does not resolve itself, because the pending entry never
+// clears, the retries never stop, and the keepalives a pending entry earns keep
+// the POI's own fail-safe from reclaiming the tasking either. Both remedies are
+// held open by the same condition, so naming it is what makes it actionable.
+func (s *subsystem) reportWithdrawalFailure(key string, cause error) {
 	first, stuck := s.triggers.noteFailure(key)
 	if s.reporter == nil {
 		return
 	}
+
+	var unattributable *x1.ResponseError
+	if errors.As(cause, &unattributable) {
+		s.reporter.Notify(x1.NEIssueX1ResponseUnattributable,
+			"a UPF's answer to a withdrawal could not be bound to the request that produced it ("+
+				unattributable.Field+"); the POI may be answering correctly and being refused here")
+	}
+
 	if first {
 		s.reporter.Notify(x1.NEIssueTaskingWithdrawalFailed,
 			"a UPF did not acknowledge the withdrawal of a content trigger; retrying")

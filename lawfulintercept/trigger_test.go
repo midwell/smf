@@ -4,6 +4,7 @@
 package lawfulintercept
 
 import (
+	"encoding/xml"
 	"io"
 	"net"
 	"net/http"
@@ -60,6 +61,57 @@ type fakePOI struct {
 	// Anything other than "complete" means the trigger is not actually running,
 	// which the triggering function can only learn from this answer.
 	unhealthy map[string]string
+	// misname makes this POI answer under a different NE identifier while otherwise
+	// behaving perfectly. It models the two things the response binding exists for
+	// and cannot tell apart: an endpoint a misroute put in the path, and a POI whose
+	// configured identity does not match the one this SMF was told to address.
+	misname string
+}
+
+// poiEnvelope builds the response envelope a conformant NE returns: the response
+// type derived from the request's, and the five fields of the schema's
+// X1ResponseMessage base type — the peer's echoed back, its own stated.
+//
+// This fake used to answer with a bare <oK> and nothing else, which is not a
+// response any conformant NE sends and which the CC-TF now refuses as
+// unattributable. A stub that is not conformant tests this element against a
+// fiction — and what this file is about is precisely what the CC-TF does with the
+// answers it gets back.
+func poiEnvelope(t *testing.T, request []byte, payload string) string {
+	t.Helper()
+
+	var in struct {
+		Messages []struct {
+			Type            string `xml:"http://www.w3.org/2001/XMLSchema-instance type,attr"`
+			AdmfIdentifier  string `xml:"admfIdentifier"`
+			NeIdentifier    string `xml:"neIdentifier"`
+			Timestamp       string `xml:"messageTimestamp"`
+			Version         string `xml:"version"`
+			X1TransactionID string `xml:"x1TransactionId"`
+		} `xml:"x1RequestMessage"`
+	}
+	if err := xml.Unmarshal(request, &in); err != nil {
+		t.Fatalf("fake POI could not parse the request it is answering: %v", err)
+	}
+	if len(in.Messages) != 1 {
+		t.Fatalf("fake POI received %d request messages, want 1", len(in.Messages))
+	}
+	m := in.Messages[0]
+
+	local := m.Type
+	if i := strings.LastIndex(local, ":"); i >= 0 {
+		local = local[i+1:]
+	}
+
+	return `<?xml version="1.0"?><x1:X1Response xmlns:x1="http://uri.etsi.org/03221/X1/2017/10" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">` +
+		`<x1:x1ResponseMessage xsi:type="x1:` + strings.TrimSuffix(local, "Request") + `Response">` +
+		`<x1:admfIdentifier>` + m.AdmfIdentifier + `</x1:admfIdentifier>` +
+		`<x1:neIdentifier>` + m.NeIdentifier + `</x1:neIdentifier>` +
+		`<x1:messageTimestamp>` + m.Timestamp + `</x1:messageTimestamp>` +
+		`<x1:version>` + m.Version + `</x1:version>` +
+		`<x1:x1TransactionId>` + m.X1TransactionID + `</x1:x1TransactionId>` +
+		payload +
+		`</x1:x1ResponseMessage></x1:X1Response>`
 }
 
 func newFakePOI(t *testing.T) *fakePOI {
@@ -91,9 +143,9 @@ func newFakePOI(t *testing.T) *fakePOI {
 
 			if fail {
 				//nolint:errcheck // test handler write
-				_, _ = w.Write([]byte(`<?xml version="1.0"?><X1Response xmlns="http://uri.etsi.org/03221/X1/2017/10">` +
-					`<x1ResponseMessage><errorInformation><errorCode>1000</errorCode>` +
-					`<errorDescription>not ready</errorDescription></errorInformation></x1ResponseMessage></X1Response>`))
+				_, _ = w.Write([]byte(poiEnvelope(t, body,
+					`<x1:errorInformation><x1:errorCode>1000</x1:errorCode>`+
+						`<x1:errorDescription>not ready</x1:errorDescription></x1:errorInformation>`)))
 
 				return
 			}
@@ -120,25 +172,34 @@ func newFakePOI(t *testing.T) *fakePOI {
 			}
 
 			//nolint:errcheck // test handler write
-			_, _ = w.Write([]byte(`<?xml version="1.0"?><x1:X1Response xmlns:x1="http://uri.etsi.org/03221/X1/2017/10">` +
-				`<x1:x1ResponseMessage>` + details + `<x1:oK>AcknowledgedAndCompleted</x1:oK>` +
-				`</x1:x1ResponseMessage></x1:X1Response>`))
+			_, _ = w.Write([]byte(poiEnvelope(t, body,
+				`<x1:listOfTaskResponseDetails>`+details+`</x1:listOfTaskResponseDetails>`)))
 
 			return
 		}
 
 		if refuse {
 			//nolint:errcheck // test handler write
-			_, _ = w.Write([]byte(`<?xml version="1.0"?><X1Response xmlns="http://uri.etsi.org/03221/X1/2017/10">` +
-				`<x1ResponseMessage><errorInformation><errorCode>1000</errorCode>` +
-				`<errorDescription>refused</errorDescription></errorInformation></x1ResponseMessage></X1Response>`))
+			_, _ = w.Write([]byte(poiEnvelope(t, body,
+				`<x1:errorInformation><x1:errorCode>1000</x1:errorCode>`+
+					`<x1:errorDescription>refused</x1:errorDescription></x1:errorInformation>`)))
 
 			return
 		}
 
+		p.mu.Lock()
+		misname := p.misname
+		p.mu.Unlock()
+
+		answer := poiEnvelope(t, body, `<x1:oK>AcknowledgedAndCompleted</x1:oK>`)
+		if misname != "" {
+			answer = strings.Replace(answer,
+				`<x1:neIdentifier>upf-1</x1:neIdentifier>`,
+				`<x1:neIdentifier>`+misname+`</x1:neIdentifier>`, 1)
+		}
+
 		//nolint:errcheck // test handler write
-		_, _ = w.Write([]byte(`<?xml version="1.0"?><X1Response xmlns="http://uri.etsi.org/03221/X1/2017/10">` +
-			`<x1ResponseMessage><oK>AcknowledgedAndCompleted</oK></x1ResponseMessage></X1Response>`))
+		_, _ = w.Write([]byte(answer))
 	}))
 	t.Cleanup(p.srv.Close)
 
@@ -1433,5 +1494,136 @@ func TestAReactivatedWarrantDoesNotDisplaceTheWithdrawalInFlight(t *testing.T) {
 	s.deactivate(again)
 	if n := s.triggers.pendingCount(); n != 0 {
 		t.Errorf("pending = %d after both withdrawals were acknowledged, want 0", n)
+	}
+}
+
+// TestAnUnattributableAnswerKeepsTheWithdrawalPending is task 3.8 of
+// `fix-li-x1-response-binding`, asserted rather than assumed.
+//
+// Validating responses turns silent successes on the withdrawal path into visible
+// failures, and this change was sequenced behind `fix-li-withdrawal-durability`
+// precisely because a visible failure used to be discarded as silently as the
+// success was. So: a POI that acknowledges under the wrong NE identifier is
+// refused, and the withdrawal it refused must stay pending and keep being retried
+// rather than being forgotten.
+func TestAnUnattributableAnswerKeepsTheWithdrawalPending(t *testing.T) {
+	poi := newFakePOI(t)
+	s := triggerSubsystem(poi)
+	s.taskReporter = &recordingTaskReporter{}
+
+	warrant, _ := installOneTrigger(t, s)
+
+	// The POI now answers perfectly well, under a name this SMF did not address.
+	poi.mu.Lock()
+	poi.misname = "upf-2"
+	poi.mu.Unlock()
+
+	pending := s.triggers.takeForWarrant(warrant.XID)
+	if len(pending) != 1 {
+		t.Fatalf("took %d withdrawals, want 1", len(pending))
+	}
+
+	rounds := 0
+	s.triggers.sleep = func(time.Duration) {
+		rounds++
+		if rounds == 3 {
+			// Once the mismatch is corrected the withdrawal completes, which is what
+			// makes the retry worth having rather than merely persistent.
+			poi.mu.Lock()
+			poi.misname = ""
+			poi.mu.Unlock()
+		}
+	}
+	s.deactivate(pending)
+
+	if rounds < 3 {
+		t.Errorf("the withdrawal was retried %d times before succeeding, want at least 3 — an answer this element refuses must not be read as an acknowledgement", rounds)
+	}
+	if n := len(s.triggers.pending); n != 0 {
+		t.Errorf("%d withdrawals still pending after the POI's answer became attributable, want 0", n)
+	}
+}
+
+// TestAWithdrawalStuckOnOurOwnRefusalIsDistinguishable is task 3.9, and it is the
+// one that decides whether an operator looks in the right place.
+//
+// A systematic validation mismatch is the failure mode this change introduces: the
+// pending entry never clears, the retries never stop, and because pending entries
+// keep their endpoint's keepalives flowing, the POI's own fail-safe cannot reclaim
+// the tasking either. Both remedies are held open by the same condition. Reported
+// only as taskingWithdrawalFailed, it presents as a POI that will not answer —
+// while the POI is answering perfectly well and being disbelieved here.
+func TestAWithdrawalStuckOnOurOwnRefusalIsDistinguishable(t *testing.T) {
+	var mu sync.Mutex
+	var reports []string
+	admf := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body) //nolint:errcheck // test
+		mu.Lock()
+		reports = append(reports, string(body))
+		mu.Unlock()
+		//nolint:errcheck // test handler write
+		_, _ = w.Write([]byte(`<?xml version="1.0"?><X1Response xmlns="http://uri.etsi.org/03221/X1/2017/10">` +
+			`<x1ResponseMessage><oK>AcknowledgedAndCompleted</oK></x1ResponseMessage></X1Response>`))
+	}))
+	defer admf.Close()
+
+	poi := newFakePOI(t)
+	s := triggerSubsystem(poi)
+	s.taskReporter = &recordingTaskReporter{}
+	s.reporter = x1.NewReporter(admf.URL, "admf", "smf", nil)
+
+	warrant, trigger := installOneTrigger(t, s)
+
+	poi.mu.Lock()
+	poi.misname = "upf-2"
+	poi.mu.Unlock()
+
+	pending := s.triggers.takeForWarrant(warrant.XID)
+
+	rounds := 0
+	s.triggers.sleep = func(time.Duration) {
+		rounds++
+		if rounds == 4 {
+			poi.mu.Lock()
+			poi.misname = ""
+			poi.mu.Unlock()
+		}
+	}
+	s.deactivate(pending)
+
+	mu.Lock()
+	defer mu.Unlock()
+	var unattributable, failed int
+	for _, body := range reports {
+		if strings.Contains(body, x1.NEIssueX1ResponseUnattributable) {
+			unattributable++
+		}
+		if strings.Contains(body, x1.NEIssueTaskingWithdrawalFailed) {
+			failed++
+		}
+		// The same rule as every other NE-level report: which warrant, and whose
+		// session, are not this channel's business.
+		if strings.Contains(body, string(trigger)) || strings.Contains(body, string(warrant.XID)) {
+			t.Errorf("an NE-level report names an identifier:\n%s", body)
+		}
+	}
+
+	if unattributable == 0 {
+		t.Error("a withdrawal refused by this element's own response binding was reported only as a POI failure; an operator is sent to look at a POI that is answering correctly")
+	}
+	if failed == 0 {
+		t.Error("the withdrawal failure itself was not reported")
+	}
+	// The condition names the field that disagreed, which is the operator's first
+	// clue and the difference between "fix your configuration" and "go and look at
+	// the UPF".
+	named := false
+	for _, body := range reports {
+		if strings.Contains(body, x1.NEIssueX1ResponseUnattributable) && strings.Contains(body, "neIdentifier") {
+			named = true
+		}
+	}
+	if !named {
+		t.Error("the unattributable-answer report does not name which envelope field disagreed")
 	}
 }
