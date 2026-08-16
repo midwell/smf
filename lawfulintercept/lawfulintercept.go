@@ -217,11 +217,34 @@ func newX1Server(st *store.Store, cfg Config, sub *subsystem) *x1.Server {
 		// subsystem.deliveryFault.
 		x1.WithFaultProbes(sub.deliveryFault),
 		x1.OnTaskChange(sub.applyTaskChange),
+		// Refuse a warrant this element could never act on. It resolves subjects by
+		// subscriber identity alone (see targetsOf), so a warrant naming only a UE
+		// address, a tunnel endpoint or a port matches nothing here at every moment —
+		// and acknowledging it tells the ADMF an interception is running that cannot
+		// be. Producing nothing is also what a tasked subject who does nothing
+		// produces, so the agency has no way to tell the two apart and waits.
+		//
+		// Refused only when *none* of the named identifiers is resolvable here: a
+		// warrant naming a SUPI and a UE address is one this element can partly serve,
+		// and declining it would refuse interception it is capable of performing.
+		x1.CanApply(canApply),
 		x1.OnAuthFailure(func(code int) {
-			if sub.reporter != nil {
-				sub.reporter.Notify(x1.NEIssueX1AuthFailed,
-					fmt.Sprintf("X1 provisioning refused: peer failed authentication (error %d)", code))
+			if sub.reporter == nil {
+				return
 			}
+			// Off this goroutine: OnAuthFailure documents that it runs synchronously on
+			// the X1 request goroutine and must not block, and Notify is a synchronous
+			// HTTPS round trip to the ADMF. Reporting an authentication failure by
+			// holding the provisioning interface open for the duration of a POST to a
+			// peer that may itself be unreachable turns a refused request into a stalled
+			// X1 channel — and makes the element's response time depend on whether the
+			// ADMF is up, which is observable to whoever is probing it.
+			//
+			// The goroutine is bounded in effect rather than in count: Notify's throttle
+			// is checked before anything is sent, so under a flood of refusals each of
+			// these returns immediately and at most one report per window is dispatched.
+			go sub.reporter.Notify(x1.NEIssueX1AuthFailed,
+				fmt.Sprintf("X1 provisioning refused: peer failed authentication (error %d)", code))
 		}),
 	}
 	// The two bulk operations the standard settles by advance agreement rather than by
@@ -516,6 +539,33 @@ func ApplyCCTrigger(sc *smfctx.SMContext) {
 	})
 }
 
+// ApplyCCAfterEstablishment re-derives sc's duplication state now that its PFCP
+// session exists, and sends a modification if that changed anything.
+//
+// It closes the window scanSessions defers. A warrant can activate after
+// ApplyCCTrigger has run for a session — the rules are built and sent by then —
+// but before the establishment response lands. The X1 scan leaves such a session
+// to the establishment path rather than mutating rules that path is still
+// sending; this is the establishment path picking it up. Without it the deferral
+// would be a drop, and the interception would silently never start: the one
+// direction this plane must not fail in.
+//
+// In the ordinary case nothing has changed since ApplyCCTrigger ran, applyCC
+// returns false, and no modification is sent. Run here rather than anywhere
+// earlier because this is the first point ordered after the session exists, and
+// it is already under the lock the handler holds for its whole body.
+//
+// Caller holds sc.SMLock.
+func ApplyCCAfterEstablishment(sc *smfctx.SMContext) {
+	sub := active.Load()
+	if sub == nil || sc == nil {
+		return
+	}
+	if sub.applyCC(sc) {
+		sub.modifySession(sc)
+	}
+}
+
 // forEachForwardingFAR invokes fn for every forwarding FAR across all of sc's
 // data paths — the ones actually carrying the target's user-plane traffic, on
 // every UPF serving the session. Caller holds sc.SMLock; sc.Tunnel must be non-nil.
@@ -717,9 +767,30 @@ func (s *subsystem) scanSessions(task types.InterceptTask, fn func(*smfctx.SMCon
 	go func() {
 		for _, sc := range matched {
 			sc.SMLock.Lock()
-			event := fn(sc)
 			corr := correlationOf(sc)   // read under the lock (reads sc.PFCPContext)
 			subjectIDs := targetsOf(sc) // likewise: reads the session's identity fields
+			// A session whose PFCP session does not exist yet belongs to the
+			// establishment path, and this pass leaves it alone — the same test, for
+			// the same reason, that triggerRegistry.plan already applies before
+			// planning a trigger.
+			//
+			// It is a deferral, not a drop. The establishment path re-derives
+			// duplication from the current task set as it goes and again when the
+			// response lands (see TriggerCC's call site), so a warrant activating
+			// inside this window is applied on arrival rather than lost. What it
+			// avoids is this goroutine mutating rules the establishment path is
+			// part-way through building and sending: that path runs without SMLock,
+			// so the two would otherwise reach the same FARs with no ordering
+			// between them.
+			//
+			// The IRI side wants the same skip for its own reason: the correlation
+			// identifier is this session's F-SEID, so a record emitted now would
+			// carry a zero the mediation function cannot join to anything, and
+			// ReportEstablishment emits the real one once the session exists.
+			var event any
+			if corr != ([8]byte{}) {
+				event = fn(sc)
+			}
 			sc.SMLock.Unlock()
 			if event != nil {
 				s.deliverIRI([]types.InterceptTask{task}, corr, subjectIDs, activated, event)
@@ -743,7 +814,23 @@ func (s *subsystem) applyCC(sc *smfctx.SMContext) bool {
 			return
 		}
 		setDuplication(far, want)
-		far.State = smfctx.RULE_UPDATE
+		// The same guard ApplyCCTrigger carries, and for the same reason: a FAR
+		// still RULE_INITIAL has never been sent, and the establishment builder
+		// emits a Create FAR only for that state. Marking it RULE_UPDATE describes
+		// an amendment to a rule the UPF does not have, so the FAR is dropped from
+		// the establishment request while the PDR referring to it goes out anyway.
+		// The UPF then holds a detection rule pointing at a forwarding rule that
+		// does not exist: the subject's traffic has no forwarding action at all and
+		// the session breaks — the most conspicuous thing an interception can do to
+		// a target whose service must look like everyone else's — and the
+		// duplication this was called to apply is lost with it.
+		//
+		// This path reaches sessions the establishment path owns only in the window
+		// scanSessions now defers (see there); the guard is what makes a mistake in
+		// that reasoning harmless rather than service-affecting.
+		if far.State == smfctx.RULE_CREATE {
+			far.State = smfctx.RULE_UPDATE
+		}
 		changed = true
 	})
 	return changed
@@ -1229,4 +1316,24 @@ func configuredDestinations(dests []Destination, reporter *x1.Reporter) []x1.Con
 	}
 
 	return out
+}
+
+// resolvableTargets are the identifier kinds this element can match a subject on.
+// It is targetsOf's counterpart: what that function can produce is exactly what a
+// warrant must name for this element to be able to act on it.
+var resolvableTargets = []types.TargetIdentifierType{
+	types.TargetSUPI, types.TargetPEI, types.TargetGPSI,
+}
+
+// canApply refuses tasking this element cannot act on, before it is acknowledged.
+func canApply(task types.InterceptTask) error {
+	if len(task.Targets) == 0 {
+		return errors.New("li: task names no target identifiers")
+	}
+	if !task.NamesAnyType(resolvableTargets...) {
+		return errors.New("li: task names no identifier this element resolves; " +
+			"it matches subjects by SUPI, PEI or GPSI")
+	}
+
+	return nil
 }

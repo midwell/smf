@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/omec-project/li/iri"
 	"github.com/omec-project/li/store"
@@ -19,6 +20,8 @@ import (
 	"github.com/omec-project/nas/v2/nasMessage"
 	"github.com/omec-project/openapi/v2/models"
 	smfctx "github.com/omec-project/smf/context"
+	"github.com/omec-project/smf/factory"
+	"github.com/omec-project/smf/pfcp/message"
 	"github.com/omec-project/smf/smferrors"
 )
 
@@ -1083,5 +1086,319 @@ func TestUnsuccessfulProcedureCauseMatchesTheReject(t *testing.T) {
 				t.Errorf("failureCause = %d, want %d (the value the reject carries)", rec.FailureCause, want)
 			}
 		})
+	}
+}
+
+// TestApplyCCDuringEstablishmentKeepsCreateFAR asserts at the level the defect
+// lives at: not that applyCC leaves the rule state alone, but that the
+// establishment request it precedes still carries the forwarding FAR.
+//
+// A warrant can activate while one of the target's sessions is still being
+// established, and the X1 scan reaches sessions by tasking rather than by
+// lifecycle. applyCC used to mark every FAR it touched RULE_UPDATE, and the
+// establishment builder emits a Create FAR only for RULE_INITIAL — so the FAR
+// vanished from the request while the PDR referring to it was sent anyway. The
+// UPF was left holding a detection rule pointing at a forwarding rule it had
+// never been given: no forwarding action for the subject at all.
+//
+// Asserting on far.State alone would pass with the builder's rule inverted; what
+// the subscriber's service depends on is the IE actually being in the message.
+func TestApplyCCDuringEstablishmentKeepsCreateFAR(t *testing.T) {
+	task := types.InterceptTask{
+		XID:      "task-cc",
+		Targets:  []types.TargetIdentifier{{Type: types.TargetSUPI, Value: "262019876543210"}},
+		Products: []types.ProductType{types.ProductIRI, types.ProductCC},
+		State:    types.TaskActive,
+	}
+	st := store.New()
+	if !st.Activate(task) {
+		t.Fatal("failed to activate test task")
+	}
+	sub := &subsystem{store: st}
+
+	far := &smfctx.FAR{FARID: 1, State: smfctx.RULE_INITIAL}
+	far.ApplyAction.Forw = true
+	sc := ccSession(far)
+
+	// The warrant lands mid-establishment: the FAR exists and has never been sent.
+	if !sub.applyCC(sc) {
+		t.Fatal("applyCC reported no change for a session a CC task covers")
+	}
+	if !far.ApplyAction.Dupl {
+		t.Error("duplication was not applied")
+	}
+	if far.State != smfctx.RULE_INITIAL {
+		t.Errorf("FAR state = %v after applyCC on an unsent rule, want RULE_INITIAL — "+
+			"an unsent rule marked as an amendment is dropped from the establishment request",
+			far.State)
+	}
+
+	// Now the establishment request the FSM was already building goes out.
+	req, err := message.BuildPfcpSessionEstablishmentRequest(
+		1, "10.0.0.1", net.ParseIP("10.0.0.1"), 0x1234,
+		[]*smfctx.PDR{sc.Tunnel.DataPathPool[1].FirstDPNode.UpLinkTunnel.PDR["default"]},
+		[]*smfctx.FAR{far}, nil,
+	)
+	if err != nil {
+		t.Fatalf("BuildPfcpSessionEstablishmentRequest: %v", err)
+	}
+	if len(req.CreateFAR) != 1 {
+		t.Fatalf("establishment request carries %d Create FAR IEs, want 1 — the session's "+
+			"PDR would reference a forwarding rule the UPF was never given, and the "+
+			"subscriber's traffic would have no forwarding action at all", len(req.CreateFAR))
+	}
+	if len(req.CreatePDR) != 1 {
+		t.Fatalf("establishment request carries %d Create PDR IEs, want 1", len(req.CreatePDR))
+	}
+
+	// And the copy the warrant authorised rides out with it, rather than waiting
+	// for a modification that the lost Create FAR would have made meaningless.
+	applyAction, err := req.CreateFAR[0].ApplyAction()
+	if err != nil {
+		t.Fatalf("reading ApplyAction from the Create FAR: %v", err)
+	}
+	if applyAction[0]&0x10 == 0 {
+		t.Errorf("Create FAR ApplyAction = %#x, DUPL bit not set — the FAR was created "+
+			"but the interception it was marked for is not in effect", applyAction[0])
+	}
+}
+
+// establishingSession builds a target's session in the state it holds between the
+// establishment request going out and the response coming back: rules built and
+// sent (so the FAR is RULE_CREATE), but no F-SEID assigned yet, which is what
+// makes its correlation identifier zero.
+func establishingSession(t *testing.T, far *smfctx.FAR) *smfctx.SMContext {
+	t.Helper()
+
+	// The session has to be in the global pool, because scanSessions reaches
+	// sessions through it and reaching them is what is under test. RemoveSMContext
+	// is the only way back out, and it publishes a state change that dereferences a
+	// configuration these tests otherwise never build — so build the one field it
+	// needs, and put it back.
+	if factory.SmfConfig.Configuration == nil {
+		off := false
+		factory.SmfConfig.Configuration = &factory.Configuration{
+			KafkaInfo: factory.KafkaInfo{EnableKafka: &off},
+		}
+		t.Cleanup(func() { factory.SmfConfig.Configuration = nil })
+	}
+
+	sc := smfctx.NewSMContext("imsi-262019876543210", 5)
+	t.Cleanup(func() { smfctx.RemoveSMContext(sc.Ref) })
+	// No PDUAddress: releasing the context returns the address to a pool these
+	// tests do not build, and nothing here matches on it — the task targets SUPI.
+	sc.Supi = "imsi-262019876543210"
+
+	node := smfctx.NewDataPathNode()
+	node.UpLinkTunnel.PDR["default"] = &smfctx.PDR{FAR: far}
+	node.UPF = &smfctx.UPF{NodeID: *smfctx.NewNodeID("10.0.1.5")}
+	sc.Tunnel = &smfctx.UPTunnel{DataPathPool: smfctx.DataPathPool{
+		1: &smfctx.DataPath{FirstDPNode: node, IsDefaultPath: true},
+	}}
+	sc.PFCPContext = map[string]*smfctx.PFCPSessionContext{"10.0.1.5": {}}
+
+	return sc
+}
+
+// establish assigns the F-SEID the UPF's response carries, which is what makes
+// the session exist as far as this element is concerned.
+func establish(sc *smfctx.SMContext, seid uint64) {
+	sc.PFCPContext["10.0.1.5"].RemoteSEID = seid
+}
+
+// TestWarrantActivatingDuringEstablishmentIsAppliedOnArrival covers the window
+// the deferral opens, which is the thing most likely to be got wrong about it.
+//
+// scanSessions leaves a session whose PFCP session does not exist yet to the
+// establishment path, so that it never mutates rules that path is part-way
+// through sending. That is only safe if the establishment path then picks the
+// session up — otherwise a warrant activating inside the window is applied by
+// nobody and the interception silently never starts, which is worse than the race
+// it avoids. This asserts the deferral is a deferral.
+func TestWarrantActivatingDuringEstablishmentIsAppliedOnArrival(t *testing.T) {
+	var modified int
+	SetSessionModifier(func(*smfctx.SMContext) error { modified++; return nil })
+	t.Cleanup(func() { SetSessionModifier(nil) })
+
+	far := &smfctx.FAR{FARID: 1, State: smfctx.RULE_CREATE}
+	far.ApplyAction.Forw = true
+	sc := establishingSession(t, far)
+
+	st := store.New()
+	sub := &subsystem{store: st}
+	active.Store(sub)
+	t.Cleanup(func() { active.Store(nil) })
+
+	// The warrant arrives while the session is mid-establishment.
+	task := types.InterceptTask{
+		XID:      "task-cc",
+		Targets:  []types.TargetIdentifier{{Type: types.TargetSUPI, Value: "262019876543210"}},
+		Products: []types.ProductType{types.ProductCC},
+		State:    types.TaskActive,
+	}
+	if !st.Activate(task) {
+		t.Fatal("failed to activate test task")
+	}
+
+	done := make(chan struct{})
+	sub.scanSessions(task, func(*smfctx.SMContext) any { close(done); return nil })
+	select {
+	case <-done:
+		t.Fatal("the X1 scan acted on a session whose PFCP session does not exist yet — " +
+			"it would be mutating rules the establishment path is still sending")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	sc.SMLock.Lock()
+	if far.ApplyAction.Dupl {
+		sc.SMLock.Unlock()
+		t.Fatal("the deferred session's FAR was modified by the X1 scan")
+	}
+	sc.SMLock.Unlock()
+
+	// The response arrives: the session now exists, and the establishment path is
+	// responsible for a warrant nobody has applied yet.
+	sc.SMLock.Lock()
+	establish(sc, 0x2632898145f4d191)
+	ApplyCCAfterEstablishment(sc)
+	sc.SMLock.Unlock()
+
+	if !far.ApplyAction.Dupl {
+		t.Error("duplication is not in effect after establishment — a warrant activating " +
+			"during the establishment window was applied by neither path, so the " +
+			"interception silently never starts")
+	}
+	if far.State != smfctx.RULE_UPDATE {
+		t.Errorf("FAR state = %v, want RULE_UPDATE — the rule has been sent already, so "+
+			"the duplication flip only reaches the UPF as a modification", far.State)
+	}
+	if modified != 1 {
+		t.Errorf("session modifier called %d times, want 1 — applying duplication without "+
+			"sending it leaves the UPF forwarding without duplicating", modified)
+	}
+}
+
+// TestEstablishmentReapplyIsSilentWhenNothingChanged: the ordinary path. The
+// duplication instruction rode out with the establishment request, so by the time
+// the response lands there is nothing to re-derive and no modification to send.
+func TestEstablishmentReapplyIsSilentWhenNothingChanged(t *testing.T) {
+	var modified int
+	SetSessionModifier(func(*smfctx.SMContext) error { modified++; return nil })
+	t.Cleanup(func() { SetSessionModifier(nil) })
+
+	far := &smfctx.FAR{FARID: 1, State: smfctx.RULE_CREATE}
+	far.ApplyAction.Forw = true
+	setDuplication(far, true) // as ApplyCCTrigger did before the request went out
+	sc := establishingSession(t, far)
+	establish(sc, 0x2632898145f4d191)
+
+	st := store.New()
+	if !st.Activate(types.InterceptTask{
+		XID:      "task-cc",
+		Targets:  []types.TargetIdentifier{{Type: types.TargetSUPI, Value: "262019876543210"}},
+		Products: []types.ProductType{types.ProductCC},
+		State:    types.TaskActive,
+	}) {
+		t.Fatal("failed to activate test task")
+	}
+	active.Store(&subsystem{store: st})
+	t.Cleanup(func() { active.Store(nil) })
+
+	sc.SMLock.Lock()
+	ApplyCCAfterEstablishment(sc)
+	sc.SMLock.Unlock()
+
+	if modified != 0 {
+		t.Errorf("session modifier called %d times, want 0 — nothing changed since the "+
+			"establishment request carried the duplication instruction", modified)
+	}
+	if far.State != smfctx.RULE_CREATE {
+		t.Errorf("FAR state = %v, want RULE_CREATE untouched", far.State)
+	}
+}
+
+// TestConcurrentEstablishmentAndTasking is the case the -race runs never
+// exercised, and the reason the FAR race went unseen: no test drove session
+// establishment against X1 tasking on the same session.
+//
+// The establishment path runs without SMLock (there is none anywhere in smf/fsm
+// or smf/transaction), and the X1 path mutates the same far.State and
+// far.ApplyAction under it. Two goroutines, one lock between them, is not
+// serialisation. What makes this safe now is that the X1 side leaves a session
+// whose PFCP session does not exist yet alone — so this asserts that under the
+// race detector, and asserts the session survives it with a coherent rule state.
+func TestConcurrentEstablishmentAndTasking(t *testing.T) {
+	SetSessionModifier(func(*smfctx.SMContext) error { return nil })
+	t.Cleanup(func() { SetSessionModifier(nil) })
+
+	st := store.New()
+	sub := &subsystem{store: st}
+	active.Store(sub)
+	t.Cleanup(func() { active.Store(nil) })
+
+	task := types.InterceptTask{
+		XID:      "task-cc",
+		Targets:  []types.TargetIdentifier{{Type: types.TargetSUPI, Value: "262019876543210"}},
+		Products: []types.ProductType{types.ProductCC},
+		State:    types.TaskActive,
+	}
+	if !st.Activate(task) {
+		t.Fatal("failed to activate test task")
+	}
+
+	far := &smfctx.FAR{FARID: 1, State: smfctx.RULE_INITIAL}
+	far.ApplyAction.Forw = true
+	sc := establishingSession(t, far)
+
+	// The establishment path: ApplyCCTrigger with no lock held, exactly as
+	// SendPFCPRules calls it from the create-pending state handler. It runs until
+	// told to stop, so the scans below are guaranteed to overlap it — scanSessions
+	// does its work on a goroutine of its own, and a fixed-iteration writer can
+	// finish before any of them is scheduled, which is a test that races nothing.
+	stop := make(chan struct{})
+
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			// A session's rules being built: the FAR is rebuilt from scratch and its
+			// whole ApplyAction replaced — which clears Dupl, the case
+			// n1n2_data_handler documents — and then the duplication state is derived
+			// for the rules about to be sent. Every step of that is an unsynchronised
+			// write to the same fields the X1 path writes under SMLock.
+			*far = smfctx.FAR{FARID: 1, State: smfctx.RULE_INITIAL}
+			far.ApplyAction.Forw = true
+			ApplyCCTrigger(sc)
+		}
+	}()
+
+	// The X1 path: repeated tasking scans, each taking SMLock per session.
+	for range 200 {
+		sub.scanSessions(task, func(s *smfctx.SMContext) any {
+			sub.applyCC(s)
+			return nil
+		})
+	}
+	time.Sleep(100 * time.Millisecond)
+	close(stop)
+	wg.Wait()
+
+	// Whatever interleaving happened, the rule must still be one the establishment
+	// builder will emit: an unsent rule marked as an amendment is dropped from the
+	// request, and the subscriber loses its forwarding action entirely.
+	sc.SMLock.Lock()
+	state := far.State
+	sc.SMLock.Unlock()
+	if state != smfctx.RULE_INITIAL {
+		t.Errorf("FAR state = %v after concurrent establishment and tasking, want "+
+			"RULE_INITIAL — the rule has not been sent, and only RULE_INITIAL is "+
+			"emitted as a Create FAR", state)
 	}
 }
