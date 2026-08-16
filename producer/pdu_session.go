@@ -127,6 +127,18 @@ func HandlePduSessionContextReplacement(smCtxtRef string) error {
 
 		smCtxt.LocalPurged = true
 
+		// Lawful Interception IRI-POI: this ends the session as surely as a release
+		// does, so it owes the same two things. The record, because an agency that
+		// sees signalling stop cannot otherwise tell a session that ended from a
+		// subject who went quiet. And the withdrawal, because a trigger left
+		// installed keeps this CC-TF sending keepalives to that POI — which is
+		// exactly what stops the POI's fail-safe from ever reclaiming it, so
+		// interception would outlive the session with every party behaving as
+		// designed and nothing reporting a fault. Before RemoveSMContext, while the
+		// session can still be read. Silent no-op unless LI is configured.
+		lawfulintercept.ReportRelease(smCtxt)
+		lawfulintercept.UntriggerCC(smCtxt)
+
 		// Disassociate ctxt from any look-ups(Report-Req from UPF shouldn't get this context)
 		smf_context.RemoveSMContext(smCtxt.Ref)
 

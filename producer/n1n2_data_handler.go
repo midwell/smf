@@ -606,6 +606,15 @@ func HandleUpdateN2Msg(txn *transaction.Transaction, response *models.UpdateSmCo
 			response.SetJsonData(jd)
 
 			smContext.PDUSessionRelease_DUE_TO_DUP_PDU_ID = false
+
+			// Lawful Interception IRI-POI: a duplicate PDU session identifier ends
+			// this session, so it owes the release record and the withdrawal of the
+			// triggers it held — a trigger left installed here keeps the CC-TF
+			// keeping its POI alive, which is what disables that POI's fail-safe.
+			// Before RemoveSMContext, while the session can still be read. Silent
+			// no-op unless LI is configured.
+			lawfulintercept.ReportRelease(smContext)
+			lawfulintercept.UntriggerCC(smContext)
 			context.RemoveSMContext(smContext.Ref)
 			problemDetails, err := consumer.SendSMContextStatusNotification(smContext.SmStatusNotifyUri)
 			if problemDetails != nil || err != nil {
