@@ -162,8 +162,8 @@ func (smf *SMF) Start() {
 		// healthy while it does. The UPF already refuses its equivalent
 		// (pfcpiface/config.go), and a stated policy that reaches one element and not
 		// another is the failure this is.
-		kaTimeout, kaErr := time.ParseDuration(li.KeepaliveTimeout)
-		if li.KeepaliveTimeout != "" && kaErr != nil {
+		kaTimeout, kaOK := liKeepaliveTimeout(li.KeepaliveTimeout)
+		if !kaOK {
 			// Not started, rather than started without the fail-safe the operator
 			// asked for. This element does not crash-loop over its LI configuration —
 			// that would tell every operator it is LI-provisioned — so the refusal is
