@@ -709,7 +709,7 @@ func (s *subsystem) deactivate(pending []withdrawal) {
 				continue
 			}
 
-			if err := endpoint.req.DeactivateTask(w.xid); err != nil {
+			if err := endpoint.req.DeactivateTask(w.xid); err != nil && !withdrawalComplete(err) {
 				remaining = append(remaining, w)
 				s.reportWithdrawalFailure(w.key, err)
 
@@ -719,6 +719,41 @@ func (s *subsystem) deactivate(pending []withdrawal) {
 		}
 		pending = remaining
 	}
+}
+
+// x1CodeNoSuchTask is TS 103 221-1 table 6.7-3 code 2020, "XID does not exist on
+// NE". Named here rather than imported because x1 keeps its copy unexported for
+// the server side; the two must stay in step.
+const x1CodeNoSuchTask = 2020
+
+// withdrawalComplete reports whether an error from DeactivateTask means the
+// tasking is already gone — which is what the withdrawal was for.
+//
+// Only 2020 qualifies, and only here. The POI is required to answer it for an XID
+// it does not hold, and the situations that produce it are the ordinary ones: the
+// POI restarted, or its keepalive fail-safe purged tasking this element could no
+// longer name. Read as a failure, it makes the retry loop run hardest exactly
+// when the withdrawal has most certainly succeeded, and the loop has no exit —
+// the POI's answer cannot change.
+//
+// What that costs is both of the things the pending state exists to protect.
+// taskingWithdrawalStuck says content is probably still being intercepted without
+// authority; raised over tasking the POI has confirmed absent, it sends an
+// operator after an interception that is not running, and an alarm that cries
+// wolf is not one anybody acts on when it is real. Meanwhile the entry that can
+// never clear keeps keepaliveDue true, and those keepalives are precisely what
+// stops that POI's fail-safe from reclaiming any orphaned tasking it does hold.
+// So the misreading manufactures the alarm for unauthorised interception and
+// disables the mechanism that would end a real case of it, at once.
+//
+// The classification stays on this side rather than moving into the x1 client
+// because 2020 only means "already done" for a withdrawal. Answering the same
+// code to an activation means what it says, and folding it into the transport
+// would make tasking against a vanished task look like it worked.
+func withdrawalComplete(err error) bool {
+	var reqErr *x1.RequestError
+
+	return errors.As(err, &reqErr) && reqErr.Code == x1CodeNoSuchTask
 }
 
 // reportWithdrawalFailure tells the LIPF that a withdrawal did not land, and
@@ -898,8 +933,18 @@ func (r *triggerRegistry) plan(
 				key:      key,
 				warrant:  t.XID,
 				trigger: x1.Trigger{
-					XID:           xid,
-					ProductID:     t.XID,
+					XID: xid,
+					// The label the POI will put on its xCC, and it must be the one this
+					// element puts on its own xIRI for the same warrant — the ADMF's
+					// productID where it provisioned one, per TS 103 221-1 clause 6.2.1.2.
+					// The task XID is the wrong value whenever the two differ: an MDF
+					// attributes on this field alone, so signalling labelled one way and
+					// content the other are two unrelated intercepts to it, with nothing
+					// in either stream to show they were meant to join. Both sides stay
+					// well-formed and separately deliverable, which is why nothing reports
+					// it. Above, t.XID is correct — the registry keys tasking by the
+					// warrant this element was tasked with, not by how product is labelled.
+					ProductID:     t.DeliveryXID(),
 					CorrelationID: correlation,
 					SEID:          u.seid,
 					DIDs:          []string{endpoint.did},

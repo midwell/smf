@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -71,6 +72,11 @@ type fakePOI struct {
 	// and cannot tell apart: an endpoint a misroute put in the path, and a POI whose
 	// configured identity does not match the one this SMF was told to address.
 	misname string
+	// refuseCode is the errorCode a refusing POI answers with. Zero means 1000, a
+	// generic refusal. It matters because the code is the whole content of some
+	// answers: 2020 says the XID is not held, which for a withdrawal is the
+	// outcome, not a failure.
+	refuseCode int
 }
 
 // poiEnvelope builds the response envelope a conformant NE returns: the response
@@ -130,6 +136,10 @@ func newFakePOI(t *testing.T) *fakePOI {
 		p.bodies = append(p.bodies, string(body))
 		p.requests++
 		refuse := p.refuse
+		refuseCode := p.refuseCode
+		if refuseCode == 0 {
+			refuseCode = 1000
+		}
 		if p.refuseUntilProvisioned {
 			switch {
 			case strings.Contains(string(body), "CreateDestinationRequest"):
@@ -186,7 +196,7 @@ func newFakePOI(t *testing.T) *fakePOI {
 		if refuse {
 			//nolint:errcheck // test handler write
 			_, _ = w.Write([]byte(poiEnvelope(t, body,
-				`<x1:errorInformation><x1:errorCode>1000</x1:errorCode>`+
+				`<x1:errorInformation><x1:errorCode>`+strconv.Itoa(refuseCode)+`</x1:errorCode>`+
 					`<x1:errorDescription>refused</x1:errorDescription></x1:errorInformation>`)))
 
 			return
@@ -1767,5 +1777,222 @@ func TestAnUnbindableActivationAnswerIsReportedAsElementLevel(t *testing.T) {
 	// could not be bound.
 	if n := len(s.triggers.installed); n != 0 {
 		t.Errorf("%d triggers recorded as installed, want 0", n)
+	}
+}
+
+// TestTriggerCarriesDeliveryXIDNotTaskXID: the trigger's ProductID is the label
+// the POI puts on its xCC, and it has to be the label this element puts on its
+// own xIRI for the same warrant — the ADMF's productID wherever it provisioned
+// one. Sending the task XID instead is invisible in every deployment that does
+// not use the field, because DeliveryXID() is then the task XID and both values
+// are the same one; it separates the two streams the moment an agency does use
+// it, and separates them silently, since each stream stays well-formed and
+// individually deliverable. So the warrant here provisions a productID that
+// differs from its XID: a test that leaves it unset passes against the defect.
+func TestTriggerCarriesDeliveryXIDNotTaskXID(t *testing.T) {
+	poi := newFakePOI(t)
+	s := triggerSubsystem(poi)
+
+	const (
+		taskXID   = "11111111-1111-4111-8111-111111111111"
+		productID = "22222222-2222-4222-8222-222222222222"
+	)
+	warrant := types.InterceptTask{
+		XID:       taskXID,
+		ProductID: productID,
+		Products:  []types.ProductType{types.ProductCC},
+	}
+	upfs := []upfSession{{node: upfNode("10.0.1.5"), seid: 0x2632898145f4d191}}
+
+	planned, unreachable := s.triggers.plan("session-ref-1", []types.InterceptTask{warrant}, upfs, 7)
+	if len(unreachable) != 0 || len(planned) != 1 {
+		t.Fatalf("plan() = %d triggers, %d unreachable; want 1, 0", len(planned), len(unreachable))
+	}
+
+	// Guards the test itself: if these ever coincide, the assertions below hold
+	// against the defect too and prove nothing.
+	if warrant.DeliveryXID() == warrant.XID {
+		t.Fatal("test setup: the productID must differ from the task XID, or this test cannot detect the defect")
+	}
+
+	if got := planned[0].trigger.ProductID; got != warrant.DeliveryXID() {
+		t.Errorf("trigger ProductID = %q, want the delivery XID %q — the POI labels its "+
+			"xCC with this, and an MDF attributes on that label alone", got, warrant.DeliveryXID())
+	}
+	if got := planned[0].trigger.ProductID; got == types.XID(taskXID) {
+		t.Errorf("trigger ProductID = %q, the task XID — content would carry a different "+
+			"label from this element's own signalling for the same warrant", got)
+	}
+
+	// The X2 side of the same claim: lawfulintercept.go labels an xIRI header with
+	// parseXID(t.DeliveryXID()), and the UPF labels its xCC header from the
+	// trigger's ProductID. Comparing the two encoded headers is what says the
+	// mediation function can join the streams.
+	if x2, x3 := parseXID(warrant.DeliveryXID()), parseXID(planned[0].trigger.ProductID); x2 != x3 {
+		t.Errorf("X2 header XID %x != X3 header XID %x — signalling and content would be "+
+			"two unrelated intercepts to the mediation function", x2, x3)
+	}
+
+	// The registry still keys tasking by the warrant this element was tasked with:
+	// how product is labelled is not how a withdrawal finds what to withdraw.
+	if planned[0].warrant != types.XID(taskXID) {
+		t.Errorf("registry warrant = %q, want the task XID %q", planned[0].warrant, taskXID)
+	}
+}
+
+// withdrawOne installs a trigger and then withdraws it, returning the pending
+// withdrawals deactivate was given. It is the shape every withdrawal test needs:
+// a trigger the registry believes is installed, taken out of the registry the way
+// a release does, so deactivate runs against a real entry rather than a literal.
+func withdrawOne(t *testing.T, s *subsystem) []withdrawal {
+	t.Helper()
+
+	warrant := types.InterceptTask{
+		XID:      "11111111-1111-4111-8111-111111111111",
+		Products: []types.ProductType{types.ProductCC},
+	}
+	upfs := []upfSession{{node: upfNode("10.0.1.5"), seid: 0x2632898145f4d191}}
+
+	planned, unreachable := s.triggers.plan("session-ref-1", []types.InterceptTask{warrant}, upfs, 7)
+	if len(unreachable) != 0 || len(planned) != 1 {
+		t.Fatalf("plan() = %d triggers, %d unreachable; want 1, 0", len(planned), len(unreachable))
+	}
+	s.installTriggers(planned)
+
+	pending := s.triggers.takeForSession("session-ref-1")
+	if len(pending) != 1 {
+		t.Fatalf("takeForSession returned %d withdrawals, want 1", len(pending))
+	}
+
+	return pending
+}
+
+// TestWithdrawalCompletesWhenPOIDoesNotHoldTheTask: 2020 is "XID does not exist
+// on NE", and a POI is required to answer it for tasking it does not hold — after
+// a restart, or after its own fail-safe purged what this element could no longer
+// name. That is the withdrawal's goal reached, not a failure to reach it, and the
+// retry loop must exit on it. Read as a failure it never exits: the answer cannot
+// change, so the loop runs forever against a POI that is behaving correctly.
+func TestWithdrawalCompletesWhenPOIDoesNotHoldTheTask(t *testing.T) {
+	poi := newFakePOI(t)
+	s := triggerSubsystem(poi)
+	pending := withdrawOne(t, s)
+
+	// The POI restarted between the install and the withdrawal: it no longer holds
+	// the XID and says so.
+	poi.mu.Lock()
+	poi.refuse = true
+	poi.refuseCode = 2020
+	poi.mu.Unlock()
+
+	s.deactivate(pending) // must return; against the defect this never terminates
+
+	if n := poi.countMessages("DeactivateTaskRequest"); n != 1 {
+		t.Errorf("DeactivateTaskRequest count = %d, want 1 — an answer of 2020 cannot "+
+			"change on a retry, so retrying it is a loop with no exit", n)
+	}
+	if n := s.triggers.pendingCount(); n != 0 {
+		t.Errorf("pending = %d after the POI said it does not hold the task, want 0 — "+
+			"the entry that never clears is what raises taskingWithdrawalStuck against "+
+			"an interception that has already stopped", n)
+	}
+}
+
+// TestWithdrawalStillRetriesOtherFailures keeps the reclassification narrow: only
+// 2020 means the tasking is gone. Any other refusal is a POI that still holds the
+// trigger and has not agreed to drop it, which is the case the pending state and
+// the retry loop exist for.
+func TestWithdrawalStillRetriesOtherFailures(t *testing.T) {
+	poi := newFakePOI(t)
+	s := triggerSubsystem(poi)
+	pending := withdrawOne(t, s)
+
+	poi.mu.Lock()
+	poi.refuse = true
+	poi.refuseCode = 1000
+	poi.mu.Unlock()
+
+	// The backoff is the registry's, not this test's: drive it through the clock
+	// hook so the retries happen at once. Sleeping for real here would assert the
+	// same thing thirty-five seconds later.
+	s.triggers.sleep = func(time.Duration) {
+		if poi.countMessages("DeactivateTaskRequest") >= 3 {
+			poi.mu.Lock()
+			poi.refuse = false
+			poi.mu.Unlock()
+		}
+	}
+
+	s.deactivate(pending)
+
+	if n := poi.countMessages("DeactivateTaskRequest"); n < 2 {
+		t.Errorf("DeactivateTaskRequest count = %d, want at least 2 — a refusal that is "+
+			"not 2020 leaves the POI holding the trigger, and must be retried", n)
+	}
+	if n := s.triggers.pendingCount(); n != 0 {
+		t.Errorf("pending = %d after the POI finally acknowledged, want 0", n)
+	}
+}
+
+// TestKeepaliveLapsesAfterNoSuchTaskWithdrawal: the second half of what a stuck
+// pending entry costs. A triggering function keeps a POI alive while it believes
+// that POI holds tasking it installed, so an entry that can never clear keeps the
+// keepalives flowing — and those keepalives are exactly what stops that POI's own
+// fail-safe from reclaiming orphaned tasking. Completing the withdrawal on 2020
+// is what lets the endpoint go quiet and the backstop work.
+func TestKeepaliveLapsesAfterNoSuchTaskWithdrawal(t *testing.T) {
+	poi := newFakePOI(t)
+	s := triggerSubsystem(poi)
+	pending := withdrawOne(t, s)
+
+	endpoint := s.triggers.endpoints["10.0.1.5"]
+	endpoint.markReconciled()
+	if !s.triggers.keepaliveDue("10.0.1.5", endpoint) {
+		t.Fatal("test setup: the endpoint should be kept alive while a withdrawal is pending")
+	}
+
+	poi.mu.Lock()
+	poi.refuse = true
+	poi.refuseCode = 2020
+	poi.mu.Unlock()
+
+	s.deactivate(pending)
+
+	if s.triggers.keepaliveDue("10.0.1.5", endpoint) {
+		t.Error("the endpoint is still being kept alive after a completed withdrawal — " +
+			"the keepalives a phantom pending entry earns are what disable the POI's fail-safe")
+	}
+}
+
+// TestSessionTeardownLeavesNoTaskingBehind pins the contract the teardown paths
+// depend on: taking a session's triggers out of the registry and withdrawing them
+// leaves this element answerable for nothing at that POI, so it stops sending
+// keepalives and the POI's own fail-safe becomes reachable again.
+//
+// This is what a teardown path that forgets to call UntriggerCC costs. Not the
+// missing release record — that one an operator could at least notice — but a
+// trigger that stays installed, keeping the keepalives flowing, which is exactly
+// what stops the POI's fail-safe from reclaiming it. Interception then outlives
+// the session that authorised it with every party behaving as designed.
+func TestSessionTeardownLeavesNoTaskingBehind(t *testing.T) {
+	poi := newFakePOI(t)
+	s := triggerSubsystem(poi)
+	pending := withdrawOne(t, s)
+
+	endpoint := s.triggers.endpoints["10.0.1.5"]
+	endpoint.markReconciled()
+	if !s.triggers.keepaliveDue("10.0.1.5", endpoint) {
+		t.Fatal("test setup: a session holding a trigger should keep its POI alive")
+	}
+
+	s.deactivate(pending)
+
+	if n := len(s.triggers.installed); n != 0 {
+		t.Errorf("%d triggers still installed after the session's teardown, want 0", n)
+	}
+	if s.triggers.keepaliveDue("10.0.1.5", endpoint) {
+		t.Error("the POI is still being kept alive after the session that held its " +
+			"tasking was torn down — its fail-safe cannot reclaim anything while this " +
+			"element keeps telling it that the function responsible is present")
 	}
 }
