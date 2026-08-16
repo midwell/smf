@@ -311,7 +311,7 @@ func Init(cfg Config) error {
 	}
 	if len(cfg.UPFTriggers) > 0 {
 		var triggers *triggerRegistry
-		triggers, err = newTriggerRegistry(cfg, mat.ClientTLS())
+		triggers, err = newTriggerRegistry(cfg, mat.ClientTLS(), sub.reportUnattributable)
 		if err != nil {
 			// A CC-TF whose triggering configuration is ambiguous cannot task the POI
 			// it displaced, so content for sessions that UPF serves would be

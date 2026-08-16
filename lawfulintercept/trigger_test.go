@@ -5,6 +5,7 @@ package lawfulintercept
 
 import (
 	"encoding/xml"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -33,7 +34,7 @@ const wrongNE = "upf-2"
 // Construction only fails on an ambiguous configuration, which the tests that care
 // about that assert on explicitly.
 func mustRegistry(cfg Config) *triggerRegistry {
-	reg, err := newTriggerRegistry(cfg, nil)
+	reg, err := newTriggerRegistry(cfg, nil, nil)
 	if err != nil {
 		panic(err)
 	}
@@ -832,7 +833,7 @@ func TestTriggerRegistryRejectsAmbiguousNode(t *testing.T) {
 			{NodeID: "10.0.1.5", X1URL: "https://upf-1:8443/X1/NE", NEID: "upf-1"},
 			{NodeID: "10.0.1.5", X1URL: "https://upf-2:8443/X1/NE", NEID: "upf-2"},
 		},
-	}, nil)
+	}, nil, nil)
 	if err == nil {
 		t.Error("an ambiguous upfTriggers configuration was accepted; one UPF's endpoint " +
 			"silently replaces another's and its content cannot be attributed")
@@ -1510,6 +1511,62 @@ func TestAReactivatedWarrantDoesNotDisplaceTheWithdrawalInFlight(t *testing.T) {
 // success was. So: a POI that acknowledges under the wrong NE identifier is
 // refused, and the withdrawal it refused must stay pending and keep being retried
 // rather than being forgotten.
+// TestAKeepaliveAnsweredByTheWrongElementIsReported is the gap verification found
+// after the rest of this change was written: every tasking path reported an
+// unattributable answer and the keepalive discarded one.
+//
+// The discard was deliberate and right about transport — a missed keepalive is
+// transient and the POI's own fail-safe covers a POI that has gone. It was wrong
+// about binding. The keepalive is the exchange whose entire purpose is to say the
+// peer is still there, so an answer from an element this SMF did not address means
+// it believes a POI is alive on the strength of a stranger's answer. That is the
+// silent condition this change exists to remove, on the one exchange where nothing
+// downstream would ever contradict it.
+func TestAKeepaliveAnsweredByTheWrongElementIsReported(t *testing.T) {
+	poi := newFakePOI(t)
+	s := triggerSubsystem(poi)
+
+	var reported []error
+	s.triggers.reportUnattributable = func(err error) { reported = append(reported, err) }
+
+	// A keepalive is owed only for a POI this function believes holds its tasking.
+	installOneTrigger(t, s)
+	for _, e := range s.triggers.endpoints {
+		e.markReconciled()
+	}
+
+	// Answering correctly, under a name this SMF did not address.
+	poi.mu.Lock()
+	poi.misname = wrongNE
+	poi.mu.Unlock()
+
+	s.triggers.keepaliveRound()
+
+	if len(reported) != 1 {
+		t.Fatalf("a keepalive answered by %s produced %d reports, want 1 — this SMF holds a POI alive on an answer from something else", wrongNE, len(reported))
+	}
+	var unattributable *x1.ResponseError
+	if !errors.As(reported[0], &unattributable) {
+		t.Fatalf("reported %v, want an *x1.ResponseError naming the field that disagreed", reported[0])
+	}
+	if unattributable.Field != "neIdentifier" {
+		t.Errorf("the report names %q; the misnaming peer is detected by neIdentifier", unattributable.Field)
+	}
+
+	// And a POI answering under its own name reports nothing, or the condition would
+	// be noise on every healthy tick.
+	poi.mu.Lock()
+	poi.misname = ""
+	poi.mu.Unlock()
+
+	reported = nil
+	s.triggers.keepaliveRound()
+
+	if len(reported) != 0 {
+		t.Errorf("a healthy keepalive produced %d reports, want 0", len(reported))
+	}
+}
+
 func TestAnUnattributableAnswerKeepsTheWithdrawalPending(t *testing.T) {
 	poi := newFakePOI(t)
 	s := triggerSubsystem(poi)

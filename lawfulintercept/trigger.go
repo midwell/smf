@@ -105,6 +105,13 @@ type triggerRegistry struct {
 	// the trigger carries the X3 destination.
 	order []string
 
+	// reportUnattributable tells the LIPF that a POI's answer could not be bound to
+	// the request that produced it. Injected rather than reached through the
+	// subsystem because the keepalive goroutine starts inside the constructor,
+	// before the subsystem holds the registry — a field assigned afterwards would be
+	// written while that goroutine was already reading it.
+	reportUnattributable func(error)
+
 	// sleep and now are the withdrawal retry loop's clock, held here so a test can
 	// drive a backoff measured in minutes without spending it. Nil means the real
 	// one — see sleepFor and timeNow, which is what lets a registry be built as a
@@ -188,12 +195,13 @@ const (
 // newTriggerRegistry builds the CC-TF's endpoints from configuration. A UPF with
 // no configured triggering endpoint cannot be tasked, so CC for a session it
 // serves is reported as a fault rather than silently skipped.
-func newTriggerRegistry(cfg Config, clientTLS *tls.Config) (*triggerRegistry, error) {
+func newTriggerRegistry(cfg Config, clientTLS *tls.Config, onUnattributable func(error)) (*triggerRegistry, error) {
 	reg := &triggerRegistry{
-		mdf3:      cfg.MDF3,
-		endpoints: make(map[string]*upfEndpoint, len(cfg.UPFTriggers)),
-		installed: make(map[string]types.XID),
-		pending:   make(map[string]*pendingWithdrawal),
+		mdf3:                 cfg.MDF3,
+		endpoints:            make(map[string]*upfEndpoint, len(cfg.UPFTriggers)),
+		installed:            make(map[string]types.XID),
+		pending:              make(map[string]*pendingWithdrawal),
+		reportUnattributable: onUnattributable,
 	}
 	for _, t := range cfg.UPFTriggers {
 		// Key by the NodeID exactly as configured, and resolve nothing here. An
@@ -280,14 +288,30 @@ func (r *triggerRegistry) keepalive() {
 	defer ticker.Stop()
 
 	for range ticker.C {
-		for nodeID, endpoint := range r.endpoints {
-			if !r.keepaliveDue(nodeID, endpoint) {
-				continue
-			}
-			// Best-effort: a missed keepalive is transient, and a POI that has really
-			// gone away trips its own fail-safe; nothing here to act on per tick.
-			//nolint:errcheck // periodic keepalive; a single miss is not actionable
-			_ = endpoint.req.Keepalive()
+		r.keepaliveRound()
+	}
+}
+
+// keepaliveRound signals every POI that owes one. Separated from the ticker so the
+// behaviour can be driven directly rather than waited for.
+func (r *triggerRegistry) keepaliveRound() {
+	for nodeID, endpoint := range r.endpoints {
+		if !r.keepaliveDue(nodeID, endpoint) {
+			continue
+		}
+		// Best-effort: a missed keepalive is transient, and a POI that has really
+		// gone away trips its own fail-safe; nothing here to act on per tick.
+		//
+		// A response that could not be *bound* to the request is a different fault
+		// and is not best-effort. A keepalive answered by an endpoint naming another
+		// element means this triggering function believes a POI is alive on the
+		// strength of an answer from something else — the same silent condition the
+		// tasking paths report, on the one exchange whose whole purpose is to say the
+		// peer is still there. reportUnattributable filters for exactly that and
+		// ignores every transient failure, so handing it the error keeps the
+		// best-effort behaviour this loop was written for.
+		if err := endpoint.req.Keepalive(); err != nil && r.reportUnattributable != nil {
+			r.reportUnattributable(err)
 		}
 	}
 }
@@ -620,8 +644,13 @@ func (s *subsystem) installTriggers(planned []plannedTrigger) {
 		// runs only at startup, and the POI's fail-safe only fires once this SMF
 		// stops answering it, so nothing would ever take it down. Withdraw it here.
 		if !s.triggers.stillHolds(p.key, p.trigger.XID) {
-			//nolint:errcheck // best-effort withdrawal; the POI's fail-safe is the last resort
-			_ = p.endpoint.req.DeactivateTask(p.trigger.XID)
+			// Best-effort as to whether the withdrawal lands — the POI's fail-safe is
+			// the last resort — but an answer that cannot be bound to it is reported
+			// all the same, since that says nothing about whether the POI accepted the
+			// withdrawal and everything about who answered.
+			if err := p.endpoint.req.DeactivateTask(p.trigger.XID); err != nil {
+				s.reportUnattributable(err)
+			}
 		}
 	}
 }
