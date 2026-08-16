@@ -613,8 +613,7 @@ func HandleUpdateN2Msg(txn *transaction.Transaction, response *models.UpdateSmCo
 			// keeping its POI alive, which is what disables that POI's fail-safe.
 			// Before RemoveSMContext, while the session can still be read. Silent
 			// no-op unless LI is configured.
-			lawfulintercept.ReportRelease(smContext)
-			lawfulintercept.UntriggerCC(smContext)
+			reportAndUntask(smContext)
 			context.RemoveSMContext(smContext.Ref)
 			problemDetails, err := consumer.SendSMContextStatusNotification(smContext.SmStatusNotifyUri)
 			if problemDetails != nil || err != nil {

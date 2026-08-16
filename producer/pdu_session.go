@@ -136,8 +136,7 @@ func HandlePduSessionContextReplacement(smCtxtRef string) error {
 		// interception would outlive the session with every party behaving as
 		// designed and nothing reporting a fault. Before RemoveSMContext, while the
 		// session can still be read. Silent no-op unless LI is configured.
-		lawfulintercept.ReportRelease(smCtxt)
-		lawfulintercept.UntriggerCC(smCtxt)
+		reportAndUntask(smCtxt)
 
 		// Disassociate ctxt from any look-ups(Report-Req from UPF shouldn't get this context)
 		smf_context.RemoveSMContext(smCtxt.Ref)
@@ -505,8 +504,7 @@ func HandlePDUSessionSMContextUpdate(eventData interface{}) error {
 			// Lawful Interception IRI-POI: an update-initiated release of the PDU
 			// session — emit an SMFPDUSessionRelease xIRI for a tasked target, and
 			// withdraw the CC-TF's triggers from the UPFs that served it.
-			lawfulintercept.ReportRelease(smContext)
-			lawfulintercept.UntriggerCC(smContext)
+			reportAndUntask(smContext)
 			smContext.ChangeState(smf_context.SmStatePfcpRelease)
 			smContext.SubCtxLog.Debugln("PDUSessionSMContextUpdate, SMContextState Change State:", smContext.SMContextState.String())
 
@@ -665,8 +663,7 @@ func HandlePDUSessionSMContextRelease(eventData interface{}) error {
 	// target before the session state is torn down, and withdraw the CC-TF's
 	// triggers from the UPFs that served it (TS 33.128 clause 6.2.3.3.1). Silent
 	// no-op unless LI is configured.
-	lawfulintercept.ReportRelease(smContext)
-	lawfulintercept.UntriggerCC(smContext)
+	reportAndUntask(smContext)
 
 	// Send Policy delete
 	metrics.IncrementSvcPcfMsgStats(smf_context.SMF_Self().NfInstanceID, string(svcmsgtypes.SmPolicyAssociationDelete), "Out", "", "")
@@ -1060,8 +1057,7 @@ func HandlePFCPResponse(smContext *smf_context.SMContext,
 		// LiReleaseReported and UntriggerCC finds nothing the second time — so an
 		// SBI release arriving later reports once, not twice.
 		smContext.SMLock.Lock()
-		lawfulintercept.ReportRelease(smContext)
-		lawfulintercept.UntriggerCC(smContext)
+		reportAndUntask(smContext)
 		smContext.SMLock.Unlock()
 
 		err = SendPfcpSessionReleaseReq(smContext)
