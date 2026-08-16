@@ -296,7 +296,10 @@ func Init(cfg Config) error {
 	// questions.
 	if reporter != nil {
 		watcher = x1.NewDestinationWatcher(func() []x1.DestinationHealth {
+			// x2Destinations, not DeliveryAddresses: it is what delivery resolves, so
+			// the configured MDF2 serving a task that named no DID is watched too.
 			return x1.DestinationHealthOf(sub.store.Snapshot(), types.DeliveryX2,
+				sub.x2Destinations,
 				func(addr string) bool { return pool.UnreachableAt(addr) })
 		}, reporter, 0)
 		go watcher.Watch(nil)
