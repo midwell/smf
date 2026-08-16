@@ -146,11 +146,13 @@ func ModifySessionForLI(smContext *context.SMContext) error {
 		}
 		// Only FARs are carried: LI flips the DUPL bit on existing forwarding FARs
 		// (marked RULE_UPDATE), so there is nothing to create or remove.
-		if err := message.SendPfcpSessionModificationRequest(
-			g.nodeID, smContext,
-			nil, g.farList, nil, nil, // create/update: PDR, FAR, BAR, QER
-			nil, nil, nil, // remove: PDR, FAR, QER
-			g.port); err != nil && firstErr == nil {
+		//
+		// Sent through the LI-marked path so the response is recognisable. This
+		// modification is not part of the session's own procedure and must not be
+		// able to complete one: it is sent whenever a warrant changes, which can be
+		// while the subscriber's own modification is outstanding to the same UPF.
+		if err := message.SendPfcpSessionModificationRequestForLI(
+			g.nodeID, smContext, g.farList, g.port); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}

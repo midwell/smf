@@ -309,7 +309,53 @@ func SendPfcpSessionModificationRequest(
 	removeQER []*smf_context.QER,
 	upfPort uint16,
 ) error {
+	// barList is not forwarded: BuildPfcpSessionModificationRequest has never taken
+	// BARs, so this parameter has always been ignored. Kept on the exported
+	// signature, which seven call sites use, rather than changed here.
+	_ = barList
+
+	return sendSessionModification(upNodeID, ctx, pdrList, farList, qerList,
+		removePDR, removeFAR, removeQER, upfPort, false)
+}
+
+// SendPfcpSessionModificationRequestForLI sends a modification on behalf of Lawful
+// Interception, and records the sequence number it used so the response can be told
+// apart from the answer to a modification the session's own procedures sent.
+//
+// Interception changes duplication on a live session on the provisioning plane's
+// schedule, which has nothing to do with the session's. The two therefore overlap,
+// and the response path correlates on SEID, serving UPF and procedure state — none
+// of which distinguishes the sender. Without this marker an interception's answer
+// can clear the pending entry a subscriber's own modification is waiting on and
+// complete that procedure early, on an answer that was never sent to it. That is
+// interception altering what happens to the target, which is the one thing it may
+// never do.
+func SendPfcpSessionModificationRequestForLI(
+	upNodeID smf_context.NodeID,
+	ctx *smf_context.SMContext,
+	farList []*smf_context.FAR,
+	upfPort uint16,
+) error {
+	return sendSessionModification(upNodeID, ctx, nil, farList, nil,
+		nil, nil, nil, upfPort, true)
+}
+
+func sendSessionModification(
+	upNodeID smf_context.NodeID,
+	ctx *smf_context.SMContext,
+	pdrList []*smf_context.PDR,
+	farList []*smf_context.FAR,
+	qerList []*smf_context.QER,
+	removePDR []*smf_context.PDR,
+	removeFAR []*smf_context.FAR,
+	removeQER []*smf_context.QER,
+	upfPort uint16,
+	forLI bool,
+) error {
 	seqNum := getSeqNumber()
+	if forLI {
+		markLISequence(seqNum)
+	}
 	upNodeIDStr := upNodeID.ResolveNodeIdToIp().String()
 	pfcpContext, ok := ctx.PFCPContext[upNodeIDStr]
 	if !ok {
@@ -639,3 +685,55 @@ func SendPfcpMsgToAdapter(upNodeID smf_context.NodeID, msg message.Message, addr
 
 	return rsp, nil
 }
+
+// liSequences records the sequence numbers of PFCP modifications sent for Lawful
+// Interception, so their responses can be recognised and kept out of the session's
+// own procedure handling.
+//
+// Bounded on purpose. Entries are normally consumed by the response they describe,
+// but a response that never arrives — a lost datagram, a UPF that restarts — would
+// otherwise leave one behind forever, and an unbounded map that grows with traffic
+// while nothing prunes it is a fault this project has already had to fix once.
+// Each insert drops anything older than the window, so what is held is bounded by
+// the rate of LI modifications rather than by uptime.
+var (
+	liSequences      = map[uint32]time.Time{}
+	liSequenceLock   sync.Mutex
+	liSequenceMaxAge = 2 * time.Minute
+)
+
+// markLISequence records that seqNum belongs to an LI-initiated modification.
+func markLISequence(seqNum uint32) {
+	liSequenceLock.Lock()
+	defer liSequenceLock.Unlock()
+
+	cutoff := time.Now().Add(-liSequenceMaxAge)
+	for seq, at := range liSequences {
+		if at.Before(cutoff) {
+			delete(liSequences, seq)
+		}
+	}
+	liSequences[seqNum] = time.Now()
+}
+
+// IsLISequence reports whether seqNum was an LI-initiated modification, consuming
+// the record. A response arrives once, so holding the entry past it would only
+// keep a sequence number that the counter will eventually reuse.
+func IsLISequence(seqNum uint32) bool {
+	liSequenceLock.Lock()
+	defer liSequenceLock.Unlock()
+
+	if _, ok := liSequences[seqNum]; !ok {
+		return false
+	}
+	delete(liSequences, seqNum)
+
+	return true
+}
+
+// MarkLISequenceForTest records an LI-originated sequence number without sending
+// anything, so a handler test can drive the response path with an LI-marked
+// message. It exists because what has to be asserted is what the *handler* does
+// with such a response, and building one by hand is the only way to place it
+// against a concurrent session procedure deterministically.
+func MarkLISequenceForTest(seqNum uint32) { markLISequence(seqNum) }

@@ -561,6 +561,13 @@ func HandlePfcpSessionEstablishmentResponse(msg *udp.Message) {
 	// session, UPF), so the repeated calls cost a lookup. The X1 exchange runs off
 	// this goroutine.
 	if establishmentAccepted(rsp) {
+		// Re-derive duplication before tasking. The X1 scan leaves a session whose
+		// PFCP session does not exist yet to this path, so a warrant that activated
+		// while this session was being established has not been applied to its FARs
+		// by anyone — and this is the first point ordered after the session exists.
+		// Ordinarily nothing has changed since the request went out and this sends
+		// nothing. Under the same lock, so it cannot race the rules it reads.
+		lawfulintercept.ApplyCCAfterEstablishment(smContext)
 		lawfulintercept.TriggerCC(smContext)
 	}
 
@@ -595,6 +602,17 @@ func HandlePfcpSessionModificationResponse(msg *udp.Message) {
 	smContext := smf_context.GetSMContextBySEID(SEID)
 
 	logger.PfcpLog.Infoln("in HandlePfcpSessionModificationResponse")
+
+	// A modification this element sent for Lawful Interception, not one the
+	// session's own procedures sent. The correlation below — SEID, serving UPF,
+	// procedure state — cannot tell the two apart, so without this the LI answer
+	// clears the pending entry a concurrent subscriber modification is waiting on
+	// and completes that procedure on an answer never sent to it. Nothing about the
+	// LI modification needs handling here: it carries no session-state transition
+	// and nothing waits on it.
+	if pfcp_message.IsLISequence(rsp.Sequence()) {
+		return
+	}
 
 	if smf_context.SMF_Self().ULCLSupport && smContext.BPManager != nil {
 		if smContext.BPManager.BPStatus == smf_context.AddingPSA {
