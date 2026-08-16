@@ -154,7 +154,28 @@ func (smf *SMF) Start() {
 	// Lawful Interception IRI-POI: start only when the opt-in Li config is
 	// present; silent otherwise.
 	if li := factory.SmfConfig.Configuration.Li; li != nil {
-		kaTimeout, _ := time.ParseDuration(li.KeepaliveTimeout) //nolint:errcheck // empty or invalid duration yields 0 = keepalive disabled
+		// An unparseable fail-safe window is refused rather than read as "off". Empty
+		// means disabled, which is a choice an operator can state; a value that does
+		// not parse is a choice they stated and this element could not read, and
+		// discarding it silently leaves a deployment that asked for the fail-safe
+		// without one — holding tasking that nothing will ever reclaim, and looking
+		// healthy while it does. The UPF already refuses its equivalent
+		// (pfcpiface/config.go), and a stated policy that reaches one element and not
+		// another is the failure this is.
+		kaTimeout, kaErr := time.ParseDuration(li.KeepaliveTimeout)
+		if li.KeepaliveTimeout != "" && kaErr != nil {
+			// Not started, rather than started without the fail-safe the operator
+			// asked for. This element does not crash-loop over its LI configuration —
+			// that would tell every operator it is LI-provisioned — so the refusal is
+			// declining to start LI at all, reported the same non-attributable way as
+			// any other LI init failure. It fails toward interception not happening,
+			// which is the direction this plane is required to fail in; carrying on
+			// with the window silently set to "off" fails the other way, and looks
+			// healthy while doing it.
+			logger.InitLog.Errorln("an optional subsystem was not started: invalid configuration")
+
+			return
+		}
 		// Inject the PFCP session-modification hook the mid-session CC trigger
 		// needs. Done before Init mounts the X1 listener so the hook is in place
 		// before any tasking can arrive.
