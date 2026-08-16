@@ -1045,6 +1045,25 @@ func HandlePFCPResponse(smContext *smf_context.SMContext,
 			Body:   responseBody, // Depends on the reason why N4 fail
 		}
 
+		// Lawful Interception IRI-POI: this releases the session's tunnel, so it
+		// ends the session as far as the subject's traffic is concerned, and owes
+		// the release record and the withdrawal of the triggers it held. The other
+		// caller of SendPfcpSessionReleaseReq already reports before calling it;
+		// this one did not, which left the trigger installed — and a trigger this
+		// element still believes in keeps its keepalives flowing, which is exactly
+		// what stops the POI's fail-safe from reclaiming it.
+		//
+		// The lock is taken around these two calls alone and not around the release
+		// request: that request blocks on SBIPFCPCommunicationChan until the PFCP
+		// deletion response arrives, and the handler that delivers it takes SMLock
+		// itself. Both hooks are idempotent — ReportRelease is guarded by
+		// LiReleaseReported and UntriggerCC finds nothing the second time — so an
+		// SBI release arriving later reports once, not twice.
+		smContext.SMLock.Lock()
+		lawfulintercept.ReportRelease(smContext)
+		lawfulintercept.UntriggerCC(smContext)
+		smContext.SMLock.Unlock()
+
 		err = SendPfcpSessionReleaseReq(smContext)
 		if err != nil {
 			smContext.SubCtxLog.Errorf("pfcp session release error: %v ", err.Error())

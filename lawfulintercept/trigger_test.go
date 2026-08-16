@@ -1840,6 +1840,38 @@ func TestTriggerCarriesDeliveryXIDNotTaskXID(t *testing.T) {
 	}
 }
 
+// TestTriggerWithoutProductIDCarriesTheTaskXID is the other half, and the half a
+// deployment actually runs today: with no productID provisioned the two values
+// coincide, and the trigger must carry the task XID.
+//
+// Asserted rather than assumed, because every other test in this file leaves the
+// field unset — so the default path is exercised constantly and checked nowhere,
+// which is the shape of a regression that reaches an agency before it reaches a
+// test.
+func TestTriggerWithoutProductIDCarriesTheTaskXID(t *testing.T) {
+	poi := newFakePOI(t)
+	s := triggerSubsystem(poi)
+
+	const taskXID = "11111111-1111-4111-8111-111111111111"
+	warrant := types.InterceptTask{
+		XID:      taskXID,
+		Products: []types.ProductType{types.ProductCC},
+	}
+	upfs := []upfSession{{node: upfNode("10.0.1.5"), seid: 0x2632898145f4d191}}
+
+	planned, unreachable := s.triggers.plan("session-ref-1", []types.InterceptTask{warrant}, upfs, 7)
+	if len(unreachable) != 0 || len(planned) != 1 {
+		t.Fatalf("plan() = %d triggers, %d unreachable; want 1, 0", len(planned), len(unreachable))
+	}
+
+	if got := planned[0].trigger.ProductID; got != types.XID(taskXID) {
+		t.Errorf("trigger ProductID = %q, want the task XID %q", got, taskXID)
+	}
+	if x2, x3 := parseXID(warrant.DeliveryXID()), parseXID(planned[0].trigger.ProductID); x2 != x3 {
+		t.Errorf("X2 header XID %x != X3 header XID %x", x2, x3)
+	}
+}
+
 // withdrawOne installs a trigger and then withdraws it, returning the pending
 // withdrawals deactivate was given. It is the shape every withdrawal test needs:
 // a trigger the registry believes is installed, taken out of the registry the way
