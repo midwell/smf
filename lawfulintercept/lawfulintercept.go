@@ -54,9 +54,18 @@ type Config struct {
 	// having been provisioned over X1, for destinations agreed out of band.
 	Destinations []Destination
 
-	AdmfURL          string        // ADMF X1 endpoint for NE-initiated issue reports (empty = disabled)
-	AdmfID           string        // the responsible ADMF's identifier: authenticates inbound X1 peers and addresses outbound reports (empty accepts any certified ADMF)
-	KeepaliveTimeout time.Duration // purge tasking if no X1 message within this (0 = disabled)
+	AdmfURL string // ADMF X1 endpoint for NE-initiated issue reports (empty = disabled)
+	AdmfID  string // the responsible ADMF's identifier: authenticates inbound X1 peers and addresses outbound reports (empty accepts any certified ADMF)
+	// KeepaliveTimeout is the fail-safe window as the operator wrote it: purge all
+	// tasking if no X1 message arrives within it. Empty leaves the fail-safe off,
+	// which is a choice an operator can state.
+	//
+	// A string rather than a duration, and parsed inside Init, because a value this
+	// element cannot read has to be *reported* — and the only channel it may be
+	// reported on is the one the reporter opens, which does not exist until Init runs.
+	// Parsed by the caller, the refusal had nowhere to go and (worse) was made by
+	// returning from the network function's own start-up.
+	KeepaliveTimeout string
 
 	// The three settings of the TS 103 221-2 clause 6.2.4 keepalive mechanism, as the
 	// operator wrote them. Parsed here rather than by the caller because an unusable
@@ -276,6 +285,20 @@ func Init(cfg Config) error {
 	if cfg.AdmfURL != "" {
 		reporter = x1.NewReporter(cfg.AdmfURL, cfg.AdmfID, cfg.NEID, mat.ClientTLS())
 	}
+	// The fail-safe window, now that there is somewhere to report a value this element
+	// cannot read. Interception does not start on one — a deployment that asked for the
+	// fail-safe and silently did not get it holds tasking nothing will ever reclaim,
+	// and looks healthy while it does — but the network function does, because an
+	// element that refuses to run over its LI configuration is distinguishable from one
+	// that has none by anybody who can see whether it is running.
+	keepalive, err := parseKeepaliveTimeout(cfg.KeepaliveTimeout)
+	if err != nil {
+		reporter.Notify(x1.NEIssueInvalidConfig,
+			"the configured keepalive fail-safe window is not a duration this element can "+
+				"read, so interception has not been started")
+
+		return err
+	}
 	// Deliver X2 asynchronously: the Report* hooks run on the PDU-session
 	// signalling goroutine while sc.SMLock is held, so a slow or unreachable MDF2
 	// must never block them — that is an availability risk and a target-observable
@@ -379,8 +402,8 @@ func Init(cfg Config) error {
 	// Keepalive fail-safe: purge tasking if the ADMF goes silent (TS 103 221-1).
 	// A nil stop channel: the fail-safe runs for as long as this element can hold
 	// tasking, which is the whole point of it.
-	if cfg.KeepaliveTimeout > 0 {
-		go x1srv.WatchKeepalive(cfg.KeepaliveTimeout, nil)
+	if keepalive > 0 {
+		go x1srv.WatchKeepalive(keepalive, nil)
 	}
 	active.Store(sub)
 	// Tasking lives in memory, so this element has just discarded every warrant it
@@ -650,9 +673,18 @@ func (s *subsystem) modifyInterception(prev, next types.InterceptTask) {
 	wantedCC := prev.WantsProduct(types.ProductCC)
 	wantsCC := next.WantsProduct(types.ProductCC)
 	if slices.Equal(prev.Targets, next.Targets) && wantedCC == wantsCC {
-		// Nothing this POI acts on has moved. It applies interception by target and
-		// by product, and the numbering state belongs to the XID, which a
-		// modification never changes.
+		// Nothing about *which* traffic is intercepted has moved. What may still have
+		// moved is how this warrant's product is labelled and where its content goes,
+		// and those reach the two interfaces by different routes: this element reads
+		// them from the task each time it builds a record, so X2 picks them up at once,
+		// while a triggered CC-POI reads them from a trigger built once. Left alone, the
+		// two diverge silently — signalling arrives at the mediation function under one
+		// warrant identifier and content under another, both well-formed, both
+		// separately deliverable, with nothing in either stream to show they were meant
+		// to join.
+		s.relabelWarrant(prev, next)
+
+		// The numbering state belongs to the XID, which a modification never changes.
 		return
 	}
 
@@ -742,29 +774,40 @@ func (s *subsystem) reportDeactivation(task types.InterceptTask) {
 	s.untriggerWarrant(task.XID)
 }
 
-// scanSessions finds every live session targeted by task, then processes each in
-// a background goroutine (holding sc.SMLock) — off the X1 request goroutine, so a
-// slow PFCP round-trip never delays the X1 response. fn returns an xIRI event to
-// deliver after the lock is released, or nil. The target match is done under the
-// per-session lock because it reads the session's identity fields.
+// scanSessions finds every live session targeted by task and processes each,
+// entirely on a background goroutine — off the X1 request goroutine, so neither a
+// slow PFCP round-trip nor the size of the session population delays the X1
+// response. fn returns an xIRI event to deliver after the lock is released, or nil.
+// The target match is done under the per-session lock because it reads the
+// session's identity fields.
+//
+// The *match* used to run on the caller's goroutine, with only the processing
+// deferred. That is the shape the AMF's UE-pool scan had before this change too, and
+// it is a scan either way: it visits every live session and takes every session's
+// lock, so a provisioning function's answer took time proportional to the element's
+// subscriber population, and any one of those acquisitions could queue behind a PFCP
+// handler holding that session's lock. Unlike the registry read in retriggerWarrant,
+// this walk cannot be bounded — which session a target holds is not indexed anywhere,
+// and finding out is the work — so what moves is the whole of it, not its cost.
+//
+// What must not move is the instant. It is the activation's, not the scan's, so it is
+// still taken here (design D5); reading it inside the goroutine would date every
+// record by when this element got round to the session.
 func (s *subsystem) scanSessions(task types.InterceptTask, fn func(*smfctx.SMContext) any) {
-	var matched []*smfctx.SMContext
-	smfctx.RangeSMContexts(func(sc *smfctx.SMContext) bool {
-		sc.SMLock.Lock()
-		hit := sessionTargets(task, sc)
-		sc.SMLock.Unlock()
-		if hit {
-			matched = append(matched, sc)
-		}
-		return true
-	})
-	if len(matched) == 0 {
-		return
-	}
-	// The event these records report is the activation, not whatever each session did
-	// earlier, so one instant covers all of them (design D5).
 	activated := time.Now()
 	go func() {
+		var matched []*smfctx.SMContext
+		smfctx.RangeSMContexts(func(sc *smfctx.SMContext) bool {
+			sc.SMLock.Lock()
+			hit := sessionTargets(task, sc)
+			sc.SMLock.Unlock()
+			if hit {
+				matched = append(matched, sc)
+			}
+
+			return true
+		})
+
 		for _, sc := range matched {
 			sc.SMLock.Lock()
 			corr := correlationOf(sc)   // read under the lock (reads sc.PFCPContext)
@@ -1336,4 +1379,30 @@ func canApply(task types.InterceptTask) error {
 	}
 
 	return nil
+}
+
+// parseKeepaliveTimeout reads the fail-safe window an operator wrote.
+//
+// Empty is not an error: an operator who writes nothing has stated that the fail-safe
+// is off, and that choice is honoured. A value that does not parse is a choice this
+// element could not read, and the difference matters because reading it as zero — which
+// is what discarding the parse error did — turns a mistyped duration into a silently
+// disabled fail-safe on an element that otherwise looks healthy.
+//
+// A non-positive duration is refused for the same reason it is at the UPF: "0s" and
+// "-5m" are values an operator wrote, and neither can mean the window they asked for.
+func parseKeepaliveTimeout(v string) (time.Duration, error) {
+	if v == "" {
+		return 0, nil
+	}
+
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return 0, fmt.Errorf("li: keepaliveTimeout %q is not a duration", v)
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("li: keepaliveTimeout %q is not a positive duration", v)
+	}
+
+	return d, nil
 }

@@ -4,12 +4,17 @@
 package lawfulintercept
 
 import (
+	"bytes"
+	"context"
 	"encoding/xml"
 	"errors"
+	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -20,7 +25,79 @@ import (
 	"github.com/omec-project/li/types"
 	"github.com/omec-project/li/x1"
 	smfctx "github.com/omec-project/smf/context"
+	"github.com/omec-project/smf/factory"
 )
+
+// sessionOn is the session side of an endpoint match: a serving UPF identified the
+// way the session path identifies it, carrying the address sessionUPFs has already
+// resolved to key that session's PFCP context. Built here exactly as production
+// builds it, so a test cannot accidentally assert against a shape the session path
+// never produces.
+func sessionOn(node string) upfSession {
+	n := upfNode(node)
+
+	return upfSession{node: n, addr: n.ResolveNodeIdToIp().String()}
+}
+
+// resolvingTo points a registry's name lookup at a fixed table, and refreshes the
+// index so the answers are in place. The registry resolves names on its own
+// goroutine now — which is the whole point, since resolving them on the trigger path
+// put a name lookup under a targeted subscriber's session lock — so a test drives
+// that resolution rather than waiting for it.
+func resolvingTo(reg *triggerRegistry, table map[string]string) {
+	// Under the lock: the registry's own refresh loop reads this hook, and it is
+	// already running by the time a test substitutes one.
+	reg.mu.Lock()
+	reg.lookup = func(_ context.Context, host string) (string, error) {
+		addr, ok := table[host]
+		if !ok {
+			return "", fmt.Errorf("test resolver: %q not found", host)
+		}
+
+		return addr, nil
+	}
+	reg.mu.Unlock()
+
+	reg.refreshResolved()
+}
+
+// staticRegistry builds a registry with its address index already populated and no
+// background goroutines: no refresh loop and no keepalive. It exists for the tests
+// whose subject is what a lookup *does not* happen, where a live refresh loop makes
+// any count ambiguous.
+//
+// nodes maps a configured NodeID to the address it is taken to resolve to.
+func staticRegistry(nodes map[string]string) *triggerRegistry {
+	reg := &triggerRegistry{
+		mdf3:      "192.0.2.1:42069",
+		endpoints: make(map[string]*upfEndpoint, len(nodes)),
+		resolved:  make(map[string]string, len(nodes)),
+		installed: make(map[string]installedTrigger),
+		pending:   make(map[string]*pendingWithdrawal),
+	}
+	for node, addr := range nodes {
+		reg.endpoints[node] = &upfEndpoint{node: upfNode(node), dids: map[string]string{}}
+		reg.resolved[node] = addr
+		reg.order = append(reg.order, node)
+	}
+	slices.Sort(reg.order)
+
+	return reg
+}
+
+// matchOn is matchEndpoint under the lock it documents needing.
+//
+// The pre-existing tests called it bare, which was harmless while it read only
+// endpoints and order — both written once at construction. It now also reads the
+// resolved-address index, which this registry's own refresh loop writes, so the
+// contract has teeth: -race reports the read against that write, and the production
+// caller (plan) has held the lock all along.
+func matchOn(reg *triggerRegistry, session upfSession) (string, *upfEndpoint, bool) {
+	reg.mu.Lock()
+	defer reg.mu.Unlock()
+
+	return reg.matchEndpoint(session)
+}
 
 // upfNode parses a UPF's N4 node identity the way the session path carries it —
 // unresolved, so a test can distinguish matching by identity from matching by
@@ -72,6 +149,15 @@ type fakePOI struct {
 	// and cannot tell apart: an endpoint a misroute put in the path, and a POI whose
 	// configured identity does not match the one this SMF was told to address.
 	misname string
+	// misnameOn restricts misname to requests whose body contains this string,
+	// so a test can make one exchange of a sequence unbindable and leave the rest
+	// working. Empty applies it to every answer.
+	misnameOn string
+	// hangOn makes this POI accept one request whose body contains this string and
+	// never answer it. It is the member of the ambiguous-activation class that no
+	// answer of any kind describes: the request arrives, the POI may well apply it,
+	// and what ends the exchange is the requester's own clock.
+	hangOn string
 	// refuseCode is the errorCode a refusing POI answers with. Zero means 1000, a
 	// generic refusal. It matters because the code is the whole content of some
 	// answers: 2020 says the XID is not held, which for a withdrawal is the
@@ -148,7 +234,26 @@ func newFakePOI(t *testing.T) *fakePOI {
 				refuse = true
 			}
 		}
+		hang := false
+		if p.hangOn != "" && strings.Contains(string(body), p.hangOn) {
+			hang = true
+			// Both set *before* the wait below, not after it. Exactly one request
+			// hangs, and from here this POI answers nothing — so the state is already
+			// in place when the requester gives up, rather than racing the retry that
+			// its giving up immediately produces.
+			p.hangOn = ""
+			p.refuse = true
+		}
 		p.mu.Unlock()
+
+		if hang {
+			// Never answer. The requester's own deadline is what ends this exchange,
+			// and waiting on the request's context rather than on a duration of this
+			// handler's own means it goes away when the client does.
+			<-r.Context().Done()
+
+			return
+		}
 
 		if strings.Contains(string(body), "GetAllDetailsRequest") {
 			p.mu.Lock()
@@ -204,7 +309,16 @@ func newFakePOI(t *testing.T) *fakePOI {
 
 		p.mu.Lock()
 		misname := p.misname
+		misnameOn := p.misnameOn
 		p.mu.Unlock()
+
+		// Scoped to one message type when a test asks for it. Mis-answering
+		// everything makes the *first* exchange of the sequence fail, which for a
+		// trigger is the CreateDestination — a different branch entirely, and one
+		// where nothing has been installed at the POI to withdraw.
+		if misnameOn != "" && !strings.Contains(string(body), misnameOn) {
+			misname = ""
+		}
 
 		answer := poiEnvelope(t, body, `<x1:oK>AcknowledgedAndCompleted</x1:oK>`)
 		if misname != "" {
@@ -373,11 +487,11 @@ func TestInstallTriggersPerUPFAndWarrant(t *testing.T) {
 	// Every trigger XID must be distinct, or one deactivation would remove another
 	// agency's interception.
 	seen := map[types.XID]bool{}
-	for _, xid := range s.triggers.installed {
-		if seen[xid] {
-			t.Errorf("trigger XID %q reused across triggers", xid)
+	for _, installed := range s.triggers.installed {
+		if seen[installed.xid] {
+			t.Errorf("trigger XID %q reused across triggers", installed.xid)
 		}
-		seen[xid] = true
+		seen[installed.xid] = true
 	}
 }
 
@@ -481,7 +595,7 @@ func TestInstallTriggersReportsMissingEndpoint(t *testing.T) {
 // not performed.
 func TestTakeForSessionAndWarrant(t *testing.T) {
 	reg := &triggerRegistry{
-		installed: map[string]types.XID{},
+		installed: map[string]installedTrigger{},
 		pending:   map[string]*pendingWithdrawal{},
 	}
 
@@ -489,7 +603,9 @@ func TestTakeForSessionAndWarrant(t *testing.T) {
 	for _, w := range []types.XID{"warrant-a", "warrant-b"} {
 		for _, ref := range []string{"sess-1", "sess-2"} {
 			for _, node := range []string{"10.0.1.5", "10.0.1.6"} {
-				reg.installed[triggerKey(w, ref, node)] = types.XID(string(w) + "|" + ref + "|" + node)
+				reg.installed[triggerKey(w, ref, node)] = installedTrigger{
+					xid: types.XID(string(w) + "|" + ref + "|" + node),
+				}
 			}
 		}
 	}
@@ -622,8 +738,8 @@ func TestReconcileLeavesThisProcesssOwnTasking(t *testing.T) {
 
 	// The POI reports exactly what this process just installed.
 	var mine []string
-	for _, xid := range s.triggers.installed {
-		mine = append(mine, string(xid))
+	for _, installed := range s.triggers.installed {
+		mine = append(mine, string(installed.xid))
 	}
 
 	poi.mu.Lock()
@@ -663,9 +779,12 @@ func (s *subsystem) reconcileOne() {
 // two are separate in production only because the X1 exchange must not run on the
 // signalling path.
 func (s *subsystem) installFor(ref string, tasks []types.InterceptTask, upfs []upfSession, correlation uint64) {
-	planned, unreachable := s.triggers.plan(ref, tasks, upfs, correlation)
+	planned, unreachable, undeliverable := s.triggers.plan(ref, tasks, upfs, correlation)
 	for _, warrant := range unreachable {
 		s.reportTaskIssue(warrant, "no triggering endpoint configured for a UPF serving the target")
+	}
+	for _, warrant := range undeliverable {
+		s.reportTaskIssue(warrant, "no X3 delivery destination could be resolved for this task")
 	}
 	s.installTriggers(planned)
 }
@@ -692,9 +811,10 @@ func TestTriggerInstalledAfterReleaseIsWithdrawn(t *testing.T) {
 	upfs := []upfSession{{node: upfNode("10.0.1.5"), seid: 0x2632898145f4d191}}
 
 	// Claim, as triggerCC does under the session lock.
-	planned, unreachable := s.triggers.plan("session-ref-1", []types.InterceptTask{warrant}, upfs, 7)
-	if len(unreachable) != 0 || len(planned) != 1 {
-		t.Fatalf("plan() = %d triggers, %d unreachable; want 1, 0", len(planned), len(unreachable))
+	planned, unreachable, undeliverable := s.triggers.plan("session-ref-1", []types.InterceptTask{warrant}, upfs, 7)
+	if len(unreachable) != 0 || len(undeliverable) != 0 || len(planned) != 1 {
+		t.Fatalf("plan() = %d triggers, %d unreachable, %d undeliverable; want 1, 0, 0",
+			len(planned), len(unreachable), len(undeliverable))
 	}
 
 	// The session is released before the install goroutine gets to run its X1
@@ -765,25 +885,25 @@ func TestTriggerNotInstalledBeforeCorrelationExists(t *testing.T) {
 // UPF reported "no triggering endpoint" until the SMF was restarted.
 func TestMatchEndpointFollowsAUPFThatChangesAddress(t *testing.T) {
 	const name = "upf-moving.test"
-	smfctx.InsertDnsHostIp(name, net.ParseIP("10.0.1.5"))
 
 	reg := mustRegistry(Config{
 		NEID: "smf-1", MDF3: "192.0.2.1:42069",
 		UPFTriggers: []UPFTrigger{{NodeID: name, X1URL: "https://upf-1:8443/X1/NE", NEID: "upf-1"}},
 	})
+	resolvingTo(reg, map[string]string{name: "10.0.1.5"})
 
-	if _, _, ok := reg.matchEndpoint(upfNode("10.0.1.5")); !ok {
+	if _, _, ok := matchOn(reg, sessionOn("10.0.1.5")); !ok {
 		t.Fatal("a session on the UPF's current address found no triggering endpoint")
 	}
 
-	// The Service is recreated with a different address; the SMF's cache catches up.
-	smfctx.InsertDnsHostIp(name, net.ParseIP("10.0.9.9"))
+	// The Service is recreated with a different address, and the refresh catches up.
+	resolvingTo(reg, map[string]string{name: "10.0.9.9"})
 
-	if _, _, ok := reg.matchEndpoint(upfNode("10.0.9.9")); !ok {
+	if _, _, ok := matchOn(reg, sessionOn("10.0.9.9")); !ok {
 		t.Error("the UPF changed address and its triggering endpoint became unreachable " +
 			"for the life of the process; content interception is silently dead until an SMF restart")
 	}
-	if _, _, ok := reg.matchEndpoint(upfNode("10.0.1.5")); ok {
+	if _, _, ok := matchOn(reg, sessionOn("10.0.1.5")); ok {
 		t.Error("a session on the UPF's old address still matched; the endpoint is being " +
 			"selected from a stale address rather than the current one")
 	}
@@ -799,10 +919,17 @@ func TestMatchEndpointNeverMatchesUnresolvableNodes(t *testing.T) {
 		NEID: "smf-1", MDF3: "192.0.2.1:42069",
 		UPFTriggers: []UPFTrigger{{NodeID: "upf-a.invalid", X1URL: "https://upf-a:8443/X1/NE", NEID: "upf-a"}},
 	})
+	// A resolver that answers nothing, so upf-a has no address in the index — the
+	// state a name that has never resolved leaves it in.
+	resolvingTo(reg, map[string]string{})
 
-	if _, _, ok := reg.matchEndpoint(upfNode("upf-b.invalid")); ok {
-		t.Error("a session on upf-b matched upf-a's triggering endpoint because neither name " +
-			"resolves; one UPF's content would be tasked under another's warrant")
+	// Both shapes an unresolved session address can take: the zero address the
+	// session path yields for a name it could not resolve, and an empty one.
+	for _, addr := range []string{net.IPv4zero.String(), ""} {
+		if _, _, ok := matchOn(reg, upfSession{node: upfNode("upf-b.invalid"), addr: addr}); ok {
+			t.Errorf("a session with address %q matched upf-a's triggering endpoint; "+
+				"one UPF's content would be tasked under another's warrant", addr)
+		}
 	}
 }
 
@@ -822,7 +949,7 @@ func TestMatchEndpointPrefersIdentityOverResolution(t *testing.T) {
 		},
 	})
 
-	key, _, ok := reg.matchEndpoint(upfNode(name))
+	key, _, ok := matchOn(reg, sessionOn(name))
 	if !ok {
 		t.Fatal("a session identifying its UPF by name found no endpoint")
 	}
@@ -857,9 +984,6 @@ func TestTriggerRegistryRejectsAmbiguousNode(t *testing.T) {
 // carrying the X3 destination with it. The final review found this same
 // nondeterminism in warrant selection at the CC-POI.
 func TestMatchEndpointIsDeterministic(t *testing.T) {
-	smfctx.InsertDnsHostIp("upf-one.test", net.ParseIP("10.0.3.3"))
-	smfctx.InsertDnsHostIp("upf-two.test", net.ParseIP("10.0.3.3"))
-
 	reg := mustRegistry(Config{
 		NEID: "smf-1", MDF3: "192.0.2.1:42069",
 		UPFTriggers: []UPFTrigger{
@@ -867,13 +991,14 @@ func TestMatchEndpointIsDeterministic(t *testing.T) {
 			{NodeID: "upf-two.test", X1URL: "https://upf-two:8443/X1/NE", NEID: "upf-two"},
 		},
 	})
+	resolvingTo(reg, map[string]string{"upf-one.test": "10.0.3.3", "upf-two.test": "10.0.3.3"})
 
-	first, _, ok := reg.matchEndpoint(upfNode("10.0.3.3"))
+	first, _, ok := matchOn(reg, sessionOn("10.0.3.3"))
 	if !ok {
 		t.Fatal("no endpoint matched an address both configured nodes resolve to")
 	}
 	for range 50 {
-		got, _, _ := reg.matchEndpoint(upfNode("10.0.3.3"))
+		got, _, _ := matchOn(reg, sessionOn("10.0.3.3"))
 		if got != first {
 			t.Fatalf("matched %q then %q: the same session would be triggered at a "+
 				"different UPF on re-establishment", first, got)
@@ -917,8 +1042,8 @@ func TestReconcileReportsATriggerThePOISaysIsNotRunning(t *testing.T) {
 		[]upfSession{{node: upfNode("10.0.1.5"), seid: 42}}, 7)
 
 	var mine []string
-	for _, xid := range s.triggers.installed {
-		mine = append(mine, string(xid))
+	for _, installed := range s.triggers.installed {
+		mine = append(mine, string(installed.xid))
 	}
 	if len(mine) == 0 {
 		t.Fatal("no trigger was installed, so this test would prove nothing")
@@ -974,8 +1099,8 @@ func installOneTrigger(t *testing.T, s *subsystem) (warrant types.InterceptTask,
 	s.installFor("session-1", []types.InterceptTask{warrant},
 		[]upfSession{{node: upfNode("10.0.1.5"), seid: 42}}, 7)
 
-	for _, xid := range s.triggers.installed {
-		trigger = xid
+	for _, installed := range s.triggers.installed {
+		trigger = installed.xid
 	}
 	if trigger == "" {
 		t.Fatal("no trigger was installed, so this test would prove nothing")
@@ -1469,8 +1594,8 @@ func TestAReactivatedWarrantDoesNotDisplaceTheWithdrawalInFlight(t *testing.T) {
 		[]upfSession{{node: upfNode("10.0.1.5"), seid: 42}}, 7)
 
 	var second types.XID
-	for _, xid := range s.triggers.installed {
-		second = xid
+	for _, installed := range s.triggers.installed {
+		second = installed.xid
 	}
 	if second == "" || second == first {
 		t.Fatalf("the re-activation claimed no new trigger (first %q, second %q)", first, second)
@@ -1804,9 +1929,10 @@ func TestTriggerCarriesDeliveryXIDNotTaskXID(t *testing.T) {
 	}
 	upfs := []upfSession{{node: upfNode("10.0.1.5"), seid: 0x2632898145f4d191}}
 
-	planned, unreachable := s.triggers.plan("session-ref-1", []types.InterceptTask{warrant}, upfs, 7)
-	if len(unreachable) != 0 || len(planned) != 1 {
-		t.Fatalf("plan() = %d triggers, %d unreachable; want 1, 0", len(planned), len(unreachable))
+	planned, unreachable, undeliverable := s.triggers.plan("session-ref-1", []types.InterceptTask{warrant}, upfs, 7)
+	if len(unreachable) != 0 || len(undeliverable) != 0 || len(planned) != 1 {
+		t.Fatalf("plan() = %d triggers, %d unreachable, %d undeliverable; want 1, 0, 0",
+			len(planned), len(unreachable), len(undeliverable))
 	}
 
 	// Guards the test itself: if these ever coincide, the assertions below hold
@@ -1859,9 +1985,10 @@ func TestTriggerWithoutProductIDCarriesTheTaskXID(t *testing.T) {
 	}
 	upfs := []upfSession{{node: upfNode("10.0.1.5"), seid: 0x2632898145f4d191}}
 
-	planned, unreachable := s.triggers.plan("session-ref-1", []types.InterceptTask{warrant}, upfs, 7)
-	if len(unreachable) != 0 || len(planned) != 1 {
-		t.Fatalf("plan() = %d triggers, %d unreachable; want 1, 0", len(planned), len(unreachable))
+	planned, unreachable, undeliverable := s.triggers.plan("session-ref-1", []types.InterceptTask{warrant}, upfs, 7)
+	if len(unreachable) != 0 || len(undeliverable) != 0 || len(planned) != 1 {
+		t.Fatalf("plan() = %d triggers, %d unreachable, %d undeliverable; want 1, 0, 0",
+			len(planned), len(unreachable), len(undeliverable))
 	}
 
 	if got := planned[0].trigger.ProductID; got != types.XID(taskXID) {
@@ -1885,9 +2012,10 @@ func withdrawOne(t *testing.T, s *subsystem) []withdrawal {
 	}
 	upfs := []upfSession{{node: upfNode("10.0.1.5"), seid: 0x2632898145f4d191}}
 
-	planned, unreachable := s.triggers.plan("session-ref-1", []types.InterceptTask{warrant}, upfs, 7)
-	if len(unreachable) != 0 || len(planned) != 1 {
-		t.Fatalf("plan() = %d triggers, %d unreachable; want 1, 0", len(planned), len(unreachable))
+	planned, unreachable, undeliverable := s.triggers.plan("session-ref-1", []types.InterceptTask{warrant}, upfs, 7)
+	if len(unreachable) != 0 || len(undeliverable) != 0 || len(planned) != 1 {
+		t.Fatalf("plan() = %d triggers, %d unreachable, %d undeliverable; want 1, 0, 0",
+			len(planned), len(unreachable), len(undeliverable))
 	}
 	s.installTriggers(planned)
 
@@ -2026,5 +2154,858 @@ func TestSessionTeardownLeavesNoTaskingBehind(t *testing.T) {
 		t.Error("the POI is still being kept alive after the session that held its " +
 			"tasking was torn down — its fail-safe cannot reclaim anything while this " +
 			"element keeps telling it that the function responsible is present")
+	}
+}
+
+// x3Task builds a content warrant naming the given X3 endpoints, as an ADMF that
+// provisioned its own destinations produces.
+func x3Task(xid string, addresses ...string) types.InterceptTask {
+	t := types.InterceptTask{
+		XID:      types.XID(xid),
+		Products: []types.ProductType{types.ProductCC},
+	}
+	for i, addr := range addresses {
+		t.Deliveries = append(t.Deliveries, types.DeliveryEndpoint{
+			Type:    types.DeliveryX3,
+			Address: addr,
+			DID:     fmt.Sprintf("aaaaaaaa-aaaa-4aaa-8aaa-%012d", i),
+		})
+	}
+
+	return t
+}
+
+// elements returns the text of every occurrence of an element, by local name, in
+// every recorded request of the given type. Enough to assert what went on the wire
+// without decoding the whole schema.
+func (p *fakePOI) elements(msgType, local string) []string {
+	re := regexp.MustCompile(`<[a-z0-9]+:` + local + `>([^<]*)</[a-z0-9]+:` + local + `>`)
+
+	var out []string
+	for _, b := range p.sent() {
+		if !strings.Contains(b, `xsi:type="ns1:`+msgType+`"`) {
+			continue
+		}
+		for _, m := range re.FindAllStringSubmatch(b, -1) {
+			out = append(out, m[1])
+		}
+	}
+
+	return out
+}
+
+// TestTriggerNamesTheTasksOwnX3Destinations is the cross-agency disclosure this
+// change exists to close.
+//
+// The CC-TF read a task's X3 destinations, carried them into the task, and then
+// triggered every warrant against the one endpoint in its own configuration. With a
+// single agency that is invisible. With two, both agencies' *content* — not
+// metadata, the subscriber's traffic — arrived wherever `mdf3` happened to point,
+// which is the disclosure the equivalent X2 fix removed and which
+// li-security-isolation forbids unconditionally, for every product type and every
+// delivery path.
+func TestTriggerNamesTheTasksOwnX3Destinations(t *testing.T) {
+	poi := newFakePOI(t)
+	s := triggerSubsystem(poi)
+	s.taskReporter = &recordingTaskReporter{}
+
+	const (
+		agencyA = "198.51.100.10:5000"
+		agencyB = "203.0.113.20:6000"
+	)
+
+	s.installFor("session-ref-1", []types.InterceptTask{
+		x3Task("11111111-1111-4111-8111-111111111111", agencyA),
+		x3Task("22222222-2222-4222-8222-222222222222", agencyB),
+	}, []upfSession{{node: upfNode("10.0.1.5"), seid: 0x2632898145f4d191}}, 7)
+
+	// Two destinations provisioned, one per agency, and neither is the configured
+	// MDF3 — which no task named.
+	addresses := poi.elements("CreateDestinationRequest", "IPv4Address")
+	ports := poi.elements("CreateDestinationRequest", "TCPPort")
+	if len(addresses) != 2 || len(ports) != 2 {
+		t.Fatalf("provisioned %d addresses and %d ports, want 2 and 2:\n%s",
+			len(addresses), len(ports), strings.Join(poi.sent(), "\n"))
+	}
+	got := map[string]bool{
+		addresses[0] + ":" + ports[0]: true,
+		addresses[1] + ":" + ports[1]: true,
+	}
+	for _, want := range []string{agencyA, agencyB} {
+		if !got[want] {
+			t.Errorf("no destination provisioned for %s; provisioned %v", want, got)
+		}
+	}
+	if got["192.0.2.1:42069"] {
+		t.Error("the configured MDF3 was provisioned for a task that named its own destination")
+	}
+
+	// And each trigger names its own agency's destination, not the other's.
+	dids := poi.elements("CreateDestinationRequest", "dId")
+	triggerDIDs := poi.elements("ActivateTaskRequest", "dId")
+	if len(dids) != 2 || len(triggerDIDs) != 2 {
+		t.Fatalf("%d destinations and %d trigger DIDs, want 2 and 2", len(dids), len(triggerDIDs))
+	}
+	if triggerDIDs[0] == triggerDIDs[1] {
+		t.Errorf("both warrants' triggers name one destination %q — the two agencies share an endpoint",
+			triggerDIDs[0])
+	}
+
+	// The pairing itself: the DID a warrant's trigger names must be the DID created
+	// for that warrant's address. Asserting only that the two differ would pass with
+	// the two swapped, which is the same disclosure in the other direction.
+	perAddress := map[string]string{} // address -> dId, from the CreateDestination bodies
+	for i, b := range poi.sent() {
+		if !strings.Contains(b, `xsi:type="ns1:CreateDestinationRequest"`) {
+			continue
+		}
+		_ = i
+		a := regexp.MustCompile(`<c:IPv4Address>([^<]*)</c:IPv4Address>`).FindStringSubmatch(b)
+		p := regexp.MustCompile(`<c:TCPPort>([^<]*)</c:TCPPort>`).FindStringSubmatch(b)
+		d := regexp.MustCompile(`<ns1:dId>([^<]*)</ns1:dId>`).FindStringSubmatch(b)
+		if a == nil || p == nil || d == nil {
+			t.Fatalf("CreateDestination body is missing an address, port or dId:\n%s", b)
+		}
+		perAddress[a[1]+":"+p[1]] = d[1]
+	}
+	for _, b := range poi.sent() {
+		if !strings.Contains(b, `xsi:type="ns1:ActivateTaskRequest"`) {
+			continue
+		}
+		x := regexp.MustCompile(`<ns1:productID>([^<]*)</ns1:productID>`).FindStringSubmatch(b)
+		d := regexp.MustCompile(`<ns1:dId>([^<]*)</ns1:dId>`).FindStringSubmatch(b)
+		if x == nil || d == nil {
+			t.Fatalf("ActivateTask body is missing a productID or dId:\n%s", b)
+		}
+		want := map[string]string{
+			"11111111-1111-4111-8111-111111111111": perAddress[agencyA],
+			"22222222-2222-4222-8222-222222222222": perAddress[agencyB],
+		}[x[1]]
+		if d[1] != want {
+			t.Errorf("warrant %s triggers against destination %s, want %s — its content would go to the other agency",
+				x[1], d[1], want)
+		}
+	}
+}
+
+// TestTriggerFallsBackToTheConfiguredMDF3 keeps the fix a conformance fix rather
+// than an outage. An ADMF is entitled to task an element with DIDs it never
+// provisioned here, which is what every deployment predating the destination
+// requirement does, and such a task resolves to no X3 address at all. The
+// configured endpoint serves it, exactly as the configured MDF2 serves the
+// equivalent IRI task — and the task is not refused.
+func TestTriggerFallsBackToTheConfiguredMDF3(t *testing.T) {
+	poi := newFakePOI(t)
+	s := triggerSubsystem(poi)
+	reporter := &recordingTaskReporter{}
+	s.taskReporter = reporter
+
+	s.installFor("session-ref-1", []types.InterceptTask{{
+		XID:      "11111111-1111-4111-8111-111111111111",
+		Products: []types.ProductType{types.ProductCC},
+		// Named a destination, and this element resolved none of it.
+		DIDs: []string{"99999999-9999-4999-8999-999999999999"},
+	}}, []upfSession{{node: upfNode("10.0.1.5"), seid: 0x2632898145f4d191}}, 7)
+
+	addresses := poi.elements("CreateDestinationRequest", "IPv4Address")
+	ports := poi.elements("CreateDestinationRequest", "TCPPort")
+	if len(addresses) != 1 || len(ports) != 1 {
+		t.Fatalf("provisioned %d destinations, want 1:\n%s", len(addresses), strings.Join(poi.sent(), "\n"))
+	}
+	if got := addresses[0] + ":" + ports[0]; got != "192.0.2.1:42069" {
+		t.Errorf("fell back to %s, want the configured MDF3", got)
+	}
+	if n := poi.countMessages("ActivateTaskRequest"); n != 1 {
+		t.Errorf("sent %d activations, want 1 — the task was refused rather than served by the fallback", n)
+	}
+	for _, r := range reporter.reports {
+		t.Errorf("reported a task issue for a task the fallback serves: %+v", r)
+	}
+}
+
+// TestTwoWarrantsToOneEndpointShareItsDestination: the POI deduplicates delivery by
+// address and reports faults by identifier, so a second identifier for one endpoint
+// would deliver the same content once and report one failure twice — leaving the
+// ADMF to work out that its two destinations are one.
+func TestTwoWarrantsToOneEndpointShareItsDestination(t *testing.T) {
+	poi := newFakePOI(t)
+	s := triggerSubsystem(poi)
+	s.taskReporter = &recordingTaskReporter{}
+
+	const shared = "198.51.100.10:5000"
+
+	s.installFor("session-ref-1", []types.InterceptTask{
+		x3Task("11111111-1111-4111-8111-111111111111", shared),
+		x3Task("22222222-2222-4222-8222-222222222222", shared),
+	}, []upfSession{{node: upfNode("10.0.1.5"), seid: 0x2632898145f4d191}}, 7)
+
+	if n := poi.countMessages("CreateDestinationRequest"); n != 1 {
+		t.Errorf("provisioned %d destinations for one endpoint, want 1", n)
+	}
+	dids := poi.elements("ActivateTaskRequest", "dId")
+	if len(dids) != 2 {
+		t.Fatalf("%d triggers, want 2", len(dids))
+	}
+	if dids[0] != dids[1] {
+		t.Errorf("two warrants naming one endpoint were given two destinations, %s and %s", dids[0], dids[1])
+	}
+}
+
+// TestTriggerCarriesEveryDestinationATaskNames: a task may name more than one, and
+// the POI delivers to all of them. Dropping the rest would give an agency an empty
+// stream while the element reported the interception as running.
+func TestTriggerCarriesEveryDestinationATaskNames(t *testing.T) {
+	poi := newFakePOI(t)
+	s := triggerSubsystem(poi)
+	s.taskReporter = &recordingTaskReporter{}
+
+	s.installFor("session-ref-1", []types.InterceptTask{
+		x3Task("11111111-1111-4111-8111-111111111111", "198.51.100.10:5000", "198.51.100.11:5001"),
+	}, []upfSession{{node: upfNode("10.0.1.5"), seid: 0x2632898145f4d191}}, 7)
+
+	if n := poi.countMessages("CreateDestinationRequest"); n != 2 {
+		t.Errorf("provisioned %d destinations, want 2", n)
+	}
+	if dids := poi.elements("ActivateTaskRequest", "dId"); len(dids) != 2 {
+		t.Errorf("the trigger names %d destinations, want both the task named", len(dids))
+	}
+}
+
+// TestWarrantWithNoResolvableDestinationAndNoFallbackIsReported: with no configured
+// MDF3 either, this element cannot deliver the warrant's content anywhere. It
+// installs no trigger — duplicating a subject's traffic so every copy can be
+// discarded is collection without a purpose — and tells the LIPF, which is the only
+// party that can provision the destination.
+func TestWarrantWithNoResolvableDestinationAndNoFallbackIsReported(t *testing.T) {
+	poi := newFakePOI(t)
+	s := triggerSubsystem(poi)
+	s.triggers.mdf3 = ""
+	reporter := &recordingTaskReporter{}
+	s.taskReporter = reporter
+
+	s.installFor("session-ref-1", []types.InterceptTask{{
+		XID:      "11111111-1111-4111-8111-111111111111",
+		Products: []types.ProductType{types.ProductCC},
+	}}, []upfSession{{node: upfNode("10.0.1.5"), seid: 0x2632898145f4d191}}, 7)
+
+	if n := poi.countMessages("ActivateTaskRequest"); n != 0 {
+		t.Errorf("installed %d triggers for a warrant whose content has nowhere to go", n)
+	}
+	if len(reporter.reports) != 1 {
+		t.Fatalf("reported %d task issues, want 1: %+v", len(reporter.reports), reporter.reports)
+	}
+	if !strings.Contains(reporter.reports[0].details, "X3 delivery destination") {
+		t.Errorf("task issue = %q, want it to name the unresolvable destination", reporter.reports[0].details)
+	}
+}
+
+// setMisname changes the identity the POI answers under, which is how a test moves
+// it between "answering unbindably" and "answering properly" mid-run.
+func (p *fakePOI) setHangOn(on string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.hangOn = on
+}
+
+func (p *fakePOI) setRefuse(to bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.refuse = to
+}
+
+func (p *fakePOI) setMisname(to, on string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.misname = to
+	p.misnameOn = on
+}
+
+// awaitMessages blocks until the POI has received at least n requests of a type.
+// The withdrawal after a failed activation runs on its own goroutine, so the
+// assertion has to wait for it rather than race it — and the recorded bodies only
+// ever grow, which is what makes polling them sound where polling the registry's
+// pending count is not (that one goes up and back down).
+func awaitMessages(t *testing.T, p *fakePOI, msgType string, n int) {
+	t.Helper()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if p.countMessages(msgType) >= n {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("the POI received %d %s after 3s, want at least %d",
+		p.countMessages(msgType), msgType, n)
+}
+
+// awaitPending blocks until the registry's pending-withdrawal count reaches want.
+// The withdrawal after a failed activation runs on its own goroutine — the triggers
+// behind it in a batch must not wait for a retry loop — so a test that asserted
+// immediately would be asserting on a race.
+func awaitPending(t *testing.T, r *triggerRegistry, want int) {
+	t.Helper()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if r.pendingCount() == want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("pending = %d after 3s, want %d", r.pendingCount(), want)
+}
+
+// TestAmbiguousActivationIsWithdrawnNotForgotten is the defect, and the
+// distinction it turns on is between a negative answer and no answer.
+//
+// A POI that *refuses* a trigger has said it holds nothing. A POI whose answer
+// never arrives, or arrives and cannot be bound to the request, has said nothing —
+// and may well have applied the task before answering. Dropping the claim on that
+// outcome left the trigger installed and untracked: absent from both maps, so the
+// warrant's withdrawal finds nothing, the session's release finds nothing, and
+// reconciliation only runs at startup. The POI keeps duplicating the subject's
+// content, correctly labelled and indistinguishable downstream, past the point
+// where the warrant is revoked.
+//
+// The POI here answers under an identity this SMF was not told to address, which
+// is the ambiguous case in its purest form: the request was received, parsed and
+// applied, and only the envelope of the reply is unusable.
+func TestAmbiguousActivationIsWithdrawnNotForgotten(t *testing.T) {
+	poi := newFakePOI(t)
+	s := triggerSubsystem(poi)
+	s.taskReporter = &recordingTaskReporter{}
+
+	// The retry clock is the test's. Correcting the POI's identity on the first
+	// retry lets the withdrawal converge instead of looping past the test's end.
+	s.triggers.sleep = func(time.Duration) { poi.setMisname("", "") }
+
+	poi.setMisname("some-other-upf", "ActivateTaskRequest")
+
+	warrant := types.InterceptTask{
+		XID:      "11111111-1111-4111-8111-111111111111",
+		Products: []types.ProductType{types.ProductCC},
+	}
+	s.installFor("session-ref-1", []types.InterceptTask{warrant},
+		[]upfSession{{node: upfNode("10.0.1.5"), seid: 0x2632898145f4d191}}, 7)
+
+	// The trigger must not have been silently dropped: the registry keeps it and
+	// withdraws it. Asserted on the withdrawal arriving at the POI, because that is
+	// the observable that matters — an entry retained and never acted on would be
+	// the same defect with an extra map entry.
+	awaitMessages(t, poi, "DeactivateTaskRequest", 1)
+	awaitPending(t, s.triggers, 0)
+
+	if len(s.triggers.installed) != 0 {
+		t.Errorf("registry still holds %d installed triggers after the withdrawal completed",
+			len(s.triggers.installed))
+	}
+}
+
+// TestRefusedActivationIsReleasedNotWithdrawn is the other side of the same guard,
+// and the reason the classification cannot simply be "withdraw on any error". A POI
+// that states a refusal holds nothing, so withdrawing would send a DeactivateTask
+// for a task that never existed — noise on the provisioning interface, and a
+// pending entry whose keepalives hold that POI's own fail-safe open.
+func TestRefusedActivationIsReleasedNotWithdrawn(t *testing.T) {
+	poi := newFakePOI(t)
+	s := triggerSubsystem(poi)
+	s.taskReporter = &recordingTaskReporter{}
+
+	poi.mu.Lock()
+	poi.refuse = true
+	poi.mu.Unlock()
+
+	s.installFor("session-ref-1", []types.InterceptTask{{
+		XID:      "11111111-1111-4111-8111-111111111111",
+		Products: []types.ProductType{types.ProductCC},
+	}}, []upfSession{{node: upfNode("10.0.1.5"), seid: 0x2632898145f4d191}}, 7)
+
+	if n := poi.countMessages("DeactivateTaskRequest"); n != 0 {
+		t.Errorf("sent %d withdrawals for a trigger the POI stated it refused", n)
+	}
+	if n := s.triggers.pendingCount(); n != 0 {
+		t.Errorf("pending = %d after a stated refusal, want 0", n)
+	}
+	if len(s.triggers.installed) != 0 {
+		t.Errorf("registry holds %d triggers after a stated refusal, want 0", len(s.triggers.installed))
+	}
+}
+
+// TestWithdrawalOfATriggerThePOINeverReceivedCompletesAtOnce is what makes the
+// conservative branch cheap enough to be the default. Where the activation truly
+// never landed, the POI answers 2020 — "XID does not exist on NE" — which this
+// element already reads as a completed withdrawal. One request, no retry, and no
+// fault reported for a condition that resolved itself.
+func TestWithdrawalOfATriggerThePOINeverReceivedCompletesAtOnce(t *testing.T) {
+	poi := newFakePOI(t)
+	s := triggerSubsystem(poi)
+	reporter := &recordingTaskReporter{}
+	s.taskReporter = reporter
+
+	retries := 0
+	s.triggers.sleep = func(time.Duration) { retries++ }
+
+	// Answers unbindably to the activation, and 2020 to everything after it: the
+	// shape of a POI that never received the trigger at all.
+	poi.setMisname("some-other-upf", "ActivateTaskRequest")
+	s.triggers.sleep = func(time.Duration) {
+		retries++
+		poi.setMisname("", "")
+		poi.mu.Lock()
+		poi.refuse = true
+		poi.refuseCode = x1CodeNoSuchTask
+		poi.mu.Unlock()
+	}
+
+	s.installFor("session-ref-1", []types.InterceptTask{{
+		XID:      "11111111-1111-4111-8111-111111111111",
+		Products: []types.ProductType{types.ProductCC},
+	}}, []upfSession{{node: upfNode("10.0.1.5"), seid: 0x2632898145f4d191}}, 7)
+
+	awaitPending(t, s.triggers, 0)
+
+	if retries > 1 {
+		t.Errorf("retried the withdrawal %d times against a POI answering 2020; "+
+			"that answer is the outcome, not a failure", retries)
+	}
+}
+
+// TestWarrantWithdrawnAfterAnAmbiguousActivationStillReachesThePOI is the
+// end-to-end shape of the defect, and the reason it is release-gating: content
+// continuing after a warrant is revoked is the one direction this plane may not
+// fail in. Before the fix the deactivation found nothing to withdraw, because the
+// activation's failure had already dropped the only record of the trigger.
+func TestWarrantWithdrawnAfterAnAmbiguousActivationStillReachesThePOI(t *testing.T) {
+	poi := newFakePOI(t)
+	s := triggerSubsystem(poi)
+	s.taskReporter = &recordingTaskReporter{}
+	s.triggers.sleep = func(time.Duration) { poi.setMisname("", "") }
+
+	poi.setMisname("some-other-upf", "ActivateTaskRequest")
+
+	const warrantXID = "11111111-1111-4111-8111-111111111111"
+	s.installFor("session-ref-1", []types.InterceptTask{{
+		XID:      warrantXID,
+		Products: []types.ProductType{types.ProductCC},
+	}}, []upfSession{{node: upfNode("10.0.1.5"), seid: 0x2632898145f4d191}}, 7)
+
+	awaitMessages(t, poi, "DeactivateTaskRequest", 1)
+	awaitPending(t, s.triggers, 0)
+
+	// The warrant is revoked while the session is still live. By now the trigger has
+	// already been withdrawn by the activation path, so this finds nothing left —
+	// which is the correct end state: the POI holds no trigger for this warrant.
+	s.untriggerWarrant(types.XID(warrantXID))
+	awaitPending(t, s.triggers, 0)
+
+	// The XID withdrawn must be the one that was activated, or the POI keeps the
+	// trigger and answers 2020 to a request about something else.
+	activated := poi.elements("ActivateTaskRequest", "xId")
+	withdrawn := poi.elements("DeactivateTaskRequest", "xId")
+	if len(activated) == 0 || len(withdrawn) == 0 {
+		t.Fatalf("activated %v, withdrew %v", activated, withdrawn)
+	}
+	if !slices.Contains(withdrawn, activated[0]) {
+		t.Errorf("withdrew %v, none of which is the trigger XID %s that was activated",
+			withdrawn, activated[0])
+	}
+}
+
+// TestMatchEndpointPerformsNoResolution is the property M5 exists for.
+//
+// matchEndpoint ran on the PDU-session establishment path of the subscriber being
+// intercepted — triggerCC holds that session's lock, plan holds the registry's — and
+// resolved both sides of its comparison there. On a cache miss that was a
+// synchronous LookupHost with context.Background() and no timeout, and the SMF's own
+// cache *deletes* an entry whenever a lookup fails, so a transient resolver outage
+// put every subsequent call on the live path. A stall there delays a targeted
+// subscriber's session establishment while holding a lock every other trigger
+// operation waits on — the target-observable timing difference this capability names
+// as the concrete, testable form of undetectability.
+//
+// Asserted by making resolution fatal: any lookup at all fails the test.
+func TestMatchEndpointPerformsNoResolution(t *testing.T) {
+	const name = "upf-noio.test"
+
+	// A registry without the refresh loop behind it, so the only thing that can reach
+	// the resolver is matchEndpoint. Built by hand for exactly that reason: with the
+	// loop running, a lookup it makes on its own goroutine is indistinguishable from
+	// one made here, and the assertion would be about timing rather than about the
+	// function under test.
+	reg := staticRegistry(map[string]string{name: "10.0.1.5", "10.0.4.4": "10.0.4.4"})
+	reg.lookup = func(_ context.Context, host string) (string, error) {
+		t.Errorf("matchEndpoint resolved %q; on this path a name lookup runs under the "+
+			"session lock of the subscriber being intercepted", host)
+
+		return "", errors.New("no resolution permitted here")
+	}
+
+	// Every shape of match: by identity, by a resolved name, by a literal, and no
+	// match at all — the last being the one that used to resolve the most, since it
+	// exhausted the identity pass and then resolved every configured node in turn.
+	for _, session := range []upfSession{
+		{node: upfNode(name), addr: "10.0.1.5"},
+		{node: upfNode("10.0.1.5"), addr: "10.0.1.5"},
+		{node: upfNode("10.0.4.4"), addr: "10.0.4.4"},
+		{node: upfNode("10.0.9.9"), addr: "10.0.9.9"},
+	} {
+		matchOn(reg, session) //nolint:errcheck // the assertion is in the resolver hook
+	}
+}
+
+// TestResolvingATriggeringEndpointIsSilent is L12, and it is an undetectability
+// requirement rather than a tidiness one.
+//
+// The shared resolver logs "host [X] not found in smf dns cache" and "host [X] dns
+// resolved" on the general operator log. For a name that appears *only* in the LI
+// block — a triggering endpoint the slice topology does not mention — those lines
+// put an LI-only hostname somewhere every operator can read it, which is precisely
+// what undetectability forbids at network-element level.
+func TestResolvingATriggeringEndpointIsSilent(t *testing.T) {
+	var logged bytes.Buffer
+
+	// Capture anything the standard logger emits, which is where a stray fmt or log
+	// call would land, and assert on the LI-only name never appearing.
+	restore := log.Writer()
+	log.SetOutput(&logged)
+	t.Cleanup(func() { log.SetOutput(restore) })
+
+	const name = "upf-secret.li.test"
+	reg := mustRegistry(Config{
+		NEID: "smf-1", MDF3: "192.0.2.1:42069",
+		UPFTriggers: []UPFTrigger{{NodeID: name, X1URL: "https://upf-1:8443/X1/NE", NEID: "upf-1"}},
+	})
+	resolvingTo(reg, map[string]string{name: "10.0.1.5"})
+
+	_, _, ok := matchOn(reg, sessionOn("10.0.1.5"))
+
+	if !ok {
+		t.Fatal("the endpoint did not match, so this test proves nothing about what it logged")
+	}
+	if strings.Contains(logged.String(), name) {
+		t.Errorf("resolving a triggering endpoint wrote its hostname to the general log:\n%s", logged.String())
+	}
+}
+
+// TestSessionUPFsCarriesTheAddressItAlreadyResolved pins the other half of M5: the
+// session side must hand on the address it derived for the PFCP context key rather
+// than leave matchEndpoint to derive it again. Two derivations of one value is one
+// lookup too many, and the second was the one on the locked path.
+func TestSessionUPFsCarriesTheAddressItAlreadyResolved(t *testing.T) {
+	// A bare context, not one from NewSMContext: sessionUPFs reads only Tunnel and
+	// PFCPContext, and a registered context has to be released — which returns its
+	// PDU address to a pool these tests do not build.
+	sc := &smfctx.SMContext{}
+
+	node := smfctx.NewDataPathNode()
+	node.UPF = &smfctx.UPF{NodeID: upfNode("10.0.1.5")}
+	sc.Tunnel = &smfctx.UPTunnel{DataPathPool: smfctx.DataPathPool{
+		1: &smfctx.DataPath{FirstDPNode: node, IsDefaultPath: true},
+	}}
+	sc.PFCPContext = map[string]*smfctx.PFCPSessionContext{
+		"10.0.1.5": {RemoteSEID: 0x2632898145f4d191},
+	}
+
+	upfs := sessionUPFs(sc)
+	if len(upfs) != 1 {
+		t.Fatalf("sessionUPFs returned %d entries, want 1", len(upfs))
+	}
+	if upfs[0].addr != "10.0.1.5" {
+		t.Errorf("upfSession.addr = %q, want the resolved address the PFCP context is keyed by", upfs[0].addr)
+	}
+}
+
+// TestProductIDChangeReachesTheInstalledTrigger.
+//
+// An ADMF may change the identifier a warrant's product is labelled with. This
+// element reads that identifier from the task each time it builds a record, so its own
+// xIRI picks the new value up at once; a triggered CC-POI reads it from a trigger built
+// once. modifyInterception returned early whenever the target identifiers and the
+// required products were unchanged — which a productID change leaves alone — so the
+// trigger kept the old label. Signalling then arrived at the mediation function under
+// one warrant identifier and content under another, both well-formed, both separately
+// deliverable, with nothing in either stream to show they were meant to join.
+func TestProductIDChangeReachesTheInstalledTrigger(t *testing.T) {
+	poi := newFakePOI(t)
+	s := triggerSubsystem(poi)
+	s.taskReporter = &recordingTaskReporter{}
+
+	const (
+		warrantXID = "11111111-1111-4111-8111-111111111111"
+		oldLabel   = "22222222-2222-4222-8222-222222222222"
+		newLabel   = "33333333-3333-4333-8333-333333333333"
+	)
+	targets := []types.TargetIdentifier{{Type: types.TargetSUPI, Value: "262019876543210"}}
+
+	prev := types.InterceptTask{
+		XID: warrantXID, ProductID: oldLabel, Targets: targets,
+		Products: []types.ProductType{types.ProductCC},
+	}
+	s.installFor("session-ref-1", []types.InterceptTask{prev},
+		[]upfSession{{node: upfNode("10.0.1.5"), addr: "10.0.1.5", seid: 0x2632898145f4d191}}, 7)
+
+	if got := poi.elements("ActivateTaskRequest", "productID"); len(got) != 1 || got[0] != oldLabel {
+		t.Fatalf("activation carried productID %v, want [%s]", got, oldLabel)
+	}
+
+	// Only the label moves: same target, same products, so this is exactly the
+	// modification the early return used to swallow.
+	next := prev
+	next.ProductID = newLabel
+	s.modifyInterception(prev, next)
+
+	awaitMessages(t, poi, "ModifyTaskRequest", 1)
+
+	modified := poi.elements("ModifyTaskRequest", "productID")
+	if len(modified) != 1 || modified[0] != newLabel {
+		t.Fatalf("modification carried productID %v, want [%s]", modified, newLabel)
+	}
+
+	// The trigger is modified, not replaced: the same XID, so the POI keeps
+	// intercepting rather than stopping and starting.
+	activated := poi.elements("ActivateTaskRequest", "xId")
+	remodified := poi.elements("ModifyTaskRequest", "xId")
+	if len(activated) != 1 || len(remodified) != 1 || activated[0] != remodified[0] {
+		t.Errorf("modification names trigger %v where the activation named %v; the trigger "+
+			"was replaced rather than relabelled", remodified, activated)
+	}
+	if n := poi.countMessages("DeactivateTaskRequest"); n != 0 {
+		t.Errorf("sent %d withdrawals to change a label; content the warrant still "+
+			"authorises would be interrupted", n)
+	}
+
+	// And the criterion and correlation it was installed with are restated, because
+	// TS 33.128 makes both mandatory on the trigger and a modification that dropped
+	// them would be refused.
+	if seids := poi.elements("ModifyTaskRequest", "SEID"); len(seids) != 1 || seids[0] != "2752413510594253201" {
+		t.Errorf("modification carried SEID %v, want the session's own", seids)
+	}
+	if corr := poi.elements("ModifyTaskRequest", "correlationID"); len(corr) != 1 || corr[0] != "7" {
+		t.Errorf("modification carried correlationID %v, want the session's own", corr)
+	}
+}
+
+// TestAModificationThatChangesNoLabelSendsNothing is the other half. A ModifyTask that
+// leaves the delivery identifier, the correlation value and the destinations alone has
+// nothing for a POI to do differently, and sending one anyway would put a message on
+// the triggering interface for every unrelated modification an ADMF makes.
+func TestAModificationThatChangesNoLabelSendsNothing(t *testing.T) {
+	poi := newFakePOI(t)
+	s := triggerSubsystem(poi)
+	s.taskReporter = &recordingTaskReporter{}
+
+	targets := []types.TargetIdentifier{{Type: types.TargetSUPI, Value: "262019876543210"}}
+	prev := types.InterceptTask{
+		XID:      "11111111-1111-4111-8111-111111111111",
+		Targets:  targets,
+		Products: []types.ProductType{types.ProductCC},
+	}
+	s.installFor("session-ref-1", []types.InterceptTask{prev},
+		[]upfSession{{node: upfNode("10.0.1.5"), addr: "10.0.1.5", seid: 0x2632898145f4d191}}, 7)
+
+	s.modifyInterception(prev, prev)
+
+	// Nothing to wait for, so a moment to let a stray goroutine be wrong in.
+	time.Sleep(50 * time.Millisecond)
+
+	if n := poi.countMessages("ModifyTaskRequest"); n != 0 {
+		t.Errorf("sent %d modifications for a task whose labelling did not change", n)
+	}
+}
+
+// pooledSession puts a targeted session in the global pool, which is where
+// sessionsCovered reaches sessions from.
+func pooledSession(t *testing.T, supi string, id int32) *smfctx.SMContext {
+	t.Helper()
+
+	// RemoveSMContext publishes a state change that dereferences a configuration these
+	// tests otherwise never build, as establishingSession explains.
+	if factory.SmfConfig.Configuration == nil {
+		off := false
+		factory.SmfConfig.Configuration = &factory.Configuration{
+			KafkaInfo: factory.KafkaInfo{EnableKafka: &off},
+		}
+		t.Cleanup(func() { factory.SmfConfig.Configuration = nil })
+	}
+
+	sc := smfctx.NewSMContext(supi, id)
+	t.Cleanup(func() { smfctx.RemoveSMContext(sc.Ref) })
+	// No PDUAddress: releasing the context returns the address to a pool these tests do
+	// not build, and the task matches on SUPI.
+	sc.Supi = supi
+
+	return sc
+}
+
+// TestAModificationDoesNotWalkTheSessionPool.
+//
+// A ModifyTask on a content task reconciles the triggers held for that warrant against
+// the sessions it still covers. It computed the second set by walking *every live
+// session* and taking every session's lock — on the X1 request goroutine, so the SMF's
+// answer to a provisioning function took time proportional to the element's subscriber
+// population, and each acquisition could block behind a PFCP handler holding that lock.
+//
+// The set was almost entirely discarded: `keep` is consulted only by
+// takeForWarrantExcept, which tests it while iterating this warrant's installed triggers,
+// so a session no trigger exists for could never be looked at. The work is now bounded by
+// the warrant's own triggers.
+//
+// There were **two** such walks on this path, and this test covers both — it was written
+// for the first and failed on the second, which is how the second was found. scanSessions
+// matched its sessions on the caller's goroutine too, one call below. That one cannot be
+// bounded (nothing indexes target identity to session, so finding out is the work), so it
+// moved off the request goroutine entirely, as the AMF's UE-pool scan already had.
+//
+// Asserted by holding the lock of a session that is targeted but has *no* trigger. Either
+// walk blocks on that lock; the fixed pair never takes it on this goroutine. Reverting
+// either fix alone fails this test, which is what says it covers them both rather than
+// resting on whichever happens to run first.
+func TestAModificationDoesNotWalkTheSessionPool(t *testing.T) {
+	poi := newFakePOI(t)
+	s := triggerSubsystem(poi)
+	s.taskReporter = &recordingTaskReporter{}
+
+	const (
+		supi       = "262019876543210"
+		warrantXID = "11111111-1111-4111-8111-111111111111"
+	)
+	targets := []types.TargetIdentifier{{Type: types.TargetSUPI, Value: supi}}
+
+	// The session the warrant has a trigger for.
+	triggered := pooledSession(t, "imsi-"+supi, 5)
+	task := types.InterceptTask{
+		XID: warrantXID, Targets: targets,
+		Products: []types.ProductType{types.ProductCC},
+	}
+	s.installFor(triggered.Ref, []types.InterceptTask{task},
+		[]upfSession{{node: upfNode("10.0.1.5"), addr: "10.0.1.5", seid: 0x2632898145f4d191}}, 7)
+
+	// A second session the same warrant targets, with no trigger of its own — the kind
+	// the pool walk used to visit and the bounded read never does.
+	untriggered := pooledSession(t, "imsi-"+supi, 6)
+	untriggered.SMLock.Lock()
+	defer untriggered.SMLock.Unlock()
+
+	// A modification that changes the targets, so the reconciliation actually runs.
+	next := task
+	next.Targets = []types.TargetIdentifier{
+		{Type: types.TargetSUPI, Value: supi},
+		{Type: types.TargetPEI, Value: "3534250000000151"},
+	}
+
+	done := make(chan struct{})
+	go func() {
+		s.modifyInterception(task, next)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the modification blocked on the lock of a session it holds no trigger for: " +
+			"a walk of the session pool is still on the X1 request goroutine — either the " +
+			"trigger reconciliation's (bound it to the warrant's own triggers) or " +
+			"scanSessions' target match (move it onto its goroutine) — so the SMF's answer " +
+			"to a provisioning function scales with the number of established sessions")
+	}
+}
+
+// TestSessionsWithTriggersNamesOnlyThisWarrantsSessions is the bounding read itself. It
+// has to be exact in both directions: a session omitted has its trigger withdrawn by the
+// pass that was meant to keep it, and a session from another warrant would keep a trigger
+// that warrant's own modification should decide about.
+func TestSessionsWithTriggersNamesOnlyThisWarrantsSessions(t *testing.T) {
+	poi := newFakePOI(t)
+	s := triggerSubsystem(poi)
+	s.taskReporter = &recordingTaskReporter{}
+
+	const (
+		mine   = "11111111-1111-4111-8111-111111111111"
+		theirs = "22222222-2222-4222-8222-222222222222"
+	)
+	upfs := []upfSession{{node: upfNode("10.0.1.5"), addr: "10.0.1.5", seid: 0x2632898145f4d191}}
+	cc := func(xid string) types.InterceptTask {
+		return types.InterceptTask{XID: types.XID(xid), Products: []types.ProductType{types.ProductCC}}
+	}
+
+	s.installFor("session-a", []types.InterceptTask{cc(mine)}, upfs, 7)
+	s.installFor("session-b", []types.InterceptTask{cc(mine)}, upfs, 7)
+	s.installFor("session-c", []types.InterceptTask{cc(theirs)}, upfs, 7)
+
+	got := s.triggers.sessionsWithTriggers(types.XID(mine))
+	slices.Sort(got)
+
+	if want := []string{"session-a", "session-b"}; !slices.Equal(got, want) {
+		t.Errorf("sessionsWithTriggers = %v, want %v", got, want)
+	}
+}
+
+// TestAnActivationThatTimesOutIsWithdrawnNotForgotten is the literal timeout, which is
+// the member of the ambiguous class the requirement names first and the one the code's
+// own comment leads with — and until this test, the one member not exercised. Its
+// sibling above covers an answer that arrives and cannot be bound; this covers no answer
+// at all.
+//
+// The distinction the whole guard turns on is between a negative answer and no answer,
+// and a timeout is the purest case of the second: the POI received the request, may have
+// applied it, and said nothing. So releasing the bookkeeping here is what leaves a
+// trigger installed at the POI that this process can no longer name — duplicating and
+// delivering a subject's content past the revocation of the warrant that authorised it.
+//
+// Worth exercising for real rather than with a fabricated error, because the classifying
+// test is `errors.As(err, &refused)` against `*x1.RequestError`: if a transport failure
+// ever came back wrapped in that type, a timeout would be *silently released*, and no
+// test written against a hand-made error would notice.
+//
+// It is arranged so the error the classification actually sees is the timeout:
+//
+//  1. `CreateDestination` is answered normally, so the sequence reaches the activation.
+//  2. The `ActivateTask` is taken and never answered. The requester's 10s deadline
+//     (li/x1/trigger.go) is what ends it — which is why this test costs those 10s, and
+//     the elapsed-time assertion below is what makes them worth paying.
+//  3. From that moment the POI answers nothing, so the retry's `CreateDestination`
+//     fails at once and no second activation is sent. Without that the retry would
+//     produce its own, later error and the classification would be reading *that*
+//     rather than the timeout — a test that passes for the wrong reason.
+//  4. The withdrawal is refused once, and the retry clock belongs to the test, so the
+//     sleep hook restores the POI and the withdrawal converges instead of looping past
+//     the end of the test.
+func TestAnActivationThatTimesOutIsWithdrawnNotForgotten(t *testing.T) {
+	poi := newFakePOI(t)
+	s := triggerSubsystem(poi)
+	s.taskReporter = &recordingTaskReporter{}
+
+	poi.setHangOn("ActivateTaskRequest")
+	s.triggers.sleep = func(time.Duration) { poi.setRefuse(false) }
+
+	warrant := types.InterceptTask{
+		XID:      "11111111-1111-4111-8111-111111111111",
+		Products: []types.ProductType{types.ProductCC},
+	}
+
+	started := time.Now()
+	s.installFor("session-ref-1", []types.InterceptTask{warrant},
+		[]upfSession{{node: upfNode("10.0.1.5"), seid: 0x2632898145f4d191}}, 7)
+	elapsed := time.Since(started)
+
+	// It really was the requester's clock that ended the activation. Everything else in
+	// this test is sub-millisecond, so an activation that failed promptly failed for
+	// some other reason — a different member of the class, covered elsewhere — and this
+	// test would be asserting the right outcome about the wrong cause.
+	if elapsed < 5*time.Second {
+		t.Fatalf("the activation failed after %s, too soon to have been the requester's "+
+			"10s deadline: this test is no longer exercising a timeout", elapsed)
+	}
+
+	// Retained and acted on. Asserted on the withdrawal reaching the POI, because an
+	// entry kept in a map and never sent would be the same defect with better
+	// bookkeeping.
+	awaitMessages(t, poi, "DeactivateTaskRequest", 1)
+	awaitPending(t, s.triggers, 0)
+
+	if len(s.triggers.installed) != 0 {
+		t.Errorf("registry still holds %d installed triggers after the withdrawal completed",
+			len(s.triggers.installed))
 	}
 }
