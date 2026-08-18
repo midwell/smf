@@ -25,8 +25,10 @@ import (
 // Production behaviour is unchanged: these are the same two functions, and both
 // remain silent no-ops when LI is not configured.
 var (
-	liReportRelease = lawfulintercept.ReportRelease
-	liUntriggerCC   = lawfulintercept.UntriggerCC
+	liReportRelease       = lawfulintercept.ReportRelease
+	liUntriggerCC         = lawfulintercept.UntriggerCC
+	liRestoreInterception = lawfulintercept.RestoreInterception
+	liReportReleaseReject = lawfulintercept.ReportReleaseReject
 )
 
 // reportAndUntask ends a session's interception state: the release record for the
@@ -43,4 +45,16 @@ var (
 func reportAndUntask(smContext *smf_context.SMContext) {
 	liReportRelease(smContext)
 	liUntriggerCC(smContext)
+}
+
+// restoreInterception puts back what reportAndUntask took down, for a release that did
+// not happen: the session is live again, so it is reportable and intercepted again.
+//
+// It is the counterpart of reportAndUntask and is named beside it for the same reason —
+// a branch that restores the session's state and not its interception state is then
+// visibly an omission rather than a plausible line of code.
+//
+// Caller holds smContext.SMLock.
+func restoreInterception(smContext *smf_context.SMContext) {
+	liRestoreInterception(smContext)
 }

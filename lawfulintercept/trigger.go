@@ -740,6 +740,40 @@ func UntriggerCC(sc *smfctx.SMContext) {
 	}
 }
 
+// RestoreInterception undoes a release-time teardown for a session whose release did
+// not happen. Caller holds sc.SMLock.
+//
+// The SMF reports the release and withdraws the session's triggers *before* PFCP
+// deletion, and that order is right rather than wrong: releaseTunnel may nil sc.Tunnel,
+// withdrawal needs the serving-UPF list that hangs off it, and stopping interception
+// before or as the session goes is the fail-closed direction. What was missing is that
+// nothing put the state back on the branches where the deletion times out or fails and
+// the session is restored to service.
+//
+// Two things are restored, and they fix two different silences. The release record is
+// made reportable again, so the release that eventually happens is reported rather than
+// suppressed as a duplicate of one that never occurred — otherwise the agency's record
+// of the session ends at a failed attempt, permanently. And the triggers are
+// re-installed, so a session this element still holds is not left duplicating into a
+// POI that discards every copy as untasked.
+//
+// Re-installing cannot collide with a withdrawal that is still retrying, and that falls
+// out of the registry's existing claim-and-withdraw state machine rather than needing a
+// second mechanism beside it: take() deletes the installed entry and files the
+// withdrawal under pendingKey(key, xid) with the trigger's *own* XID, while a fresh
+// claim allocates a new one. The two entries are therefore distinct, the old
+// acknowledgement clears only the old one, and stillHolds keeps counting the key as
+// held throughout. That is the same property the registry already documents for a
+// warrant deactivated and re-activated while its POI is unreachable.
+func RestoreInterception(sc *smfctx.SMContext) {
+	sub := active.Load()
+	if sub == nil || sc == nil {
+		return
+	}
+	sc.LiReleaseReported = false
+	sub.triggerCC(sc)
+}
+
 // triggerCC tasks each serving UPF's CC-POI for each CC warrant covering sc.
 //
 // The X1 exchange runs in a goroutine: it is a synchronous HTTPS round trip, and
@@ -781,26 +815,38 @@ func (s *subsystem) triggerCC(sc *smfctx.SMContext) {
 	// Only the detection criterion is per UPF.
 	planned, unreachable, undeliverable := s.triggers.plan(sc.Ref, tasks, upfs, servingUPFSEID(sc))
 
-	// A UPF we have no triggering endpoint for is carrying a tasked session's
-	// traffic and cannot be told whose warrant it serves. The interception is
-	// authorised and will produce nothing, which only the LIPF can resolve.
-	for _, warrant := range unreachable {
-		s.reportTaskIssue(warrant, "no triggering endpoint configured for a UPF serving the target")
-	}
-
-	// And a warrant whose content has nowhere to go at all: it named no X3
-	// destination this element can resolve and there is no configured endpoint to
-	// fall back to. Reported separately from the above because the remedy is a
-	// different one — provision the destination, or configure the fallback.
-	for _, warrant := range undeliverable {
-		s.reportTaskIssue(warrant, "no X3 delivery destination could be resolved for this task")
-	}
-
-	if len(planned) == 0 {
+	if len(planned) == 0 && len(unreachable) == 0 && len(undeliverable) == 0 {
 		return
 	}
 
-	go s.installTriggers(planned)
+	// Everything that talks to a peer goes off this goroutine, the reports included.
+	//
+	// This runs on HandlePfcpSessionEstablishmentResponse's path with sc.SMLock held,
+	// for the very subscriber being intercepted. ReportTaskIssue is a synchronous mTLS
+	// POST bounded only by its own 10s timeout, and — unlike an NE-level report — it is
+	// deliberately *not* throttled, because each task's failure is its own fact. So
+	// every affected warrant used to cost the establishment a full timeout while an
+	// ADMF was unreachable, under the session's own lock: a tasked subscriber's session
+	// setup measurably slower than an untasked one's, which is the target-observable
+	// timing difference this element must never produce.
+	go func() {
+		// A UPF we have no triggering endpoint for is carrying a tasked session's
+		// traffic and cannot be told whose warrant it serves. The interception is
+		// authorised and will produce nothing, which only the LIPF can resolve.
+		for _, warrant := range unreachable {
+			s.reportTaskIssue(warrant, "no triggering endpoint configured for a UPF serving the target")
+		}
+
+		// And a warrant whose content has nowhere to go at all: it named no X3
+		// destination this element can resolve and there is no configured endpoint to
+		// fall back to. Reported separately from the above because the remedy is a
+		// different one — provision the destination, or configure the fallback.
+		for _, warrant := range undeliverable {
+			s.reportTaskIssue(warrant, "no X3 delivery destination could be resolved for this task")
+		}
+
+		s.installTriggers(planned)
+	}()
 }
 
 // installTriggers performs the X1 exchanges off the signalling path. Every
@@ -1206,10 +1252,22 @@ func (r *triggerRegistry) plan(
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	// A warrant is reported unreachable once, however many of the session's UPFs this
+	// element has no endpoint for. The fault is about the warrant — it is authorised
+	// and some of its content cannot be attributed — and it is one fault whether one
+	// UPF or three are missing an entry; a per-UPF report multiplied one condition into
+	// as many unthrottled POSTs as the session had unmatched endpoints (two UPFs and
+	// three warrants produced six), all of them naming the same remedy at the LIPF.
+	reportedUnreachable := make(map[types.XID]bool, len(tasks))
+
 	for _, u := range upfs {
 		nodeKey, endpoint, ok := r.matchEndpoint(u)
 		if !ok {
 			for _, t := range tasks {
+				if reportedUnreachable[t.XID] {
+					continue
+				}
+				reportedUnreachable[t.XID] = true
 				unreachable = append(unreachable, t.XID)
 			}
 
@@ -1659,8 +1717,13 @@ func (s *subsystem) relabelWarrant(prev, next types.InterceptTask) {
 	if s.triggers == nil || !next.WantsProduct(types.ProductCC) {
 		return
 	}
+	// The task's own CorrelationID is deliberately absent from this test. relabel sends
+	// installed.correlation — the session's, which is what the POI must stamp so content
+	// joins to signalling — so a change to the provisioned value changed nothing at
+	// either end and cost an X1 exchange to every POI to do it. The field is now refused
+	// at this element anyway (x1.HonoursCorrelationID is not set here), which makes it
+	// unreachable rather than merely inert.
 	if prev.DeliveryXID() == next.DeliveryXID() &&
-		prev.CorrelationID == next.CorrelationID &&
 		slices.Equal(s.triggers.x3Destinations(prev), s.triggers.x3Destinations(next)) {
 		return
 	}

@@ -715,6 +715,18 @@ func HandlePDUSessionSMContextRelease(eventData interface{}) error {
 	case smf_context.SessionReleaseTimeout:
 		smContext.SubCtxLog.Debugln("PDUSessionSMContextRelease, PFCP SessionReleaseTimeout")
 		smContext.ChangeState(smf_context.SmStateActive)
+		// Lawful Interception: the release was reported and the session's triggers
+		// withdrawn before the deletion was attempted, and the deletion did not happen.
+		// The session is back in service, so its interception state goes back with it —
+		// otherwise the release that eventually occurs is suppressed as a duplicate of
+		// the one reported for this attempt, and the session goes on duplicating into a
+		// POI that discards every copy as untasked.
+		restoreInterception(smContext)
+		// And the unsuccessful-procedure record the other two failure branches already
+		// emit. A timeout and a stated refusal are both the procedure not completing,
+		// and which of them occurred is exactly the distinction a mediation function
+		// cannot make: without this it sees a release record and then silence.
+		liReportReleaseReject(smContext, nasMessage.Cause5GSMRequestRejectedUnspecified)
 		httpResponse = &httpwrapper.Response{
 			Status: int(http.StatusInternalServerError),
 		}
@@ -729,12 +741,15 @@ func HandlePDUSessionSMContextRelease(eventData interface{}) error {
 		}
 		smContext.ChangeState(smf_context.SmStateActive)
 		smContext.SubCtxLog.Debugln("PDUSessionSMContextRelease, SMContextState Change State:", smContext.SMContextState.String())
+		// The session is restored to service, so its interception state is restored
+		// with it — see the timeout branch above.
+		restoreInterception(smContext)
 		jsonData := models.NewSmContextUpdateError(problemDetail)
 		errResponse := models.NewUpdateSmContext400Response()
 		errResponse.SetJsonData(*jsonData)
 		// The reject carries a hardcoded 5GSM cause; report the same value so the
 		// record cannot disagree with the wire (design D7).
-		lawfulintercept.ReportReleaseReject(smContext, nasMessage.Cause5GSMRequestRejectedUnspecified)
+		liReportReleaseReject(smContext, nasMessage.Cause5GSMRequestRejectedUnspecified)
 		if buf, err := smf_context.BuildGSMPDUSessionReleaseReject(smContext); err != nil {
 			smContext.SubPduSessLog.Errorf("PDUSessionSMContextRelease, build GSM PDUSessionReleaseReject failed: %+v", err)
 		} else {
@@ -762,12 +777,15 @@ func HandlePDUSessionSMContextRelease(eventData interface{}) error {
 		}
 		smContext.ChangeState(smf_context.SmStateActive)
 		smContext.SubCtxLog.Debugln("PDUSessionSMContextRelease, SMContextState Change State:", smContext.SMContextState.String())
+		// The session is restored to service, so its interception state is restored
+		// with it — see the timeout branch above.
+		restoreInterception(smContext)
 		jsonData := models.NewSmContextUpdateError(problemDetail)
 		errResponse := models.NewUpdateSmContext400Response()
 		errResponse.SetJsonData(*jsonData)
 		// The reject carries a hardcoded 5GSM cause; report the same value so the
 		// record cannot disagree with the wire (design D7).
-		lawfulintercept.ReportReleaseReject(smContext, nasMessage.Cause5GSMRequestRejectedUnspecified)
+		liReportReleaseReject(smContext, nasMessage.Cause5GSMRequestRejectedUnspecified)
 		if buf, err := smf_context.BuildGSMPDUSessionReleaseReject(smContext); err != nil {
 			smContext.SubPduSessLog.Errorf("PDUSessionSMContextRelease, build GSM PDUSessionReleaseReject failed: %+v", err)
 		} else {

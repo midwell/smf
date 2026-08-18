@@ -169,3 +169,40 @@ func TestAStatedEmptyWindowIsHonoured(t *testing.T) {
 		t.Error("interception did not start with the fail-safe deliberately off")
 	}
 }
+
+// TestASubFloorKeepaliveWindowStopsInterceptionRatherThanTheProcess is the second path
+// on which an LI configuration mistake still cost the network function.
+//
+// "1ns" is a well-formed Go duration, so it passes the chart's regex — ns is a unit —
+// and it is positive, so it passed this element's own test. The fail-safe window is then
+// halved to produce the watchdog's tick interval, and integer division reaches zero:
+// time.NewTicker panics, on a goroutine, and the SMF goes down. An element that
+// terminates under an LI misconfiguration when one without interception configured does
+// not is distinguishable to anybody who can see whether it is running — the class of
+// leak this capability exists to prevent, arrived at from the configuration file.
+//
+// The policy is the one already applied to an unreadable window: interception does not
+// start, the ADMF is told, and the network function serves.
+func TestASubFloorKeepaliveWindowStopsInterceptionRatherThanTheProcess(t *testing.T) {
+	cert, key, ca := liPKI(t)
+	admf := newADMFStub(t)
+	t.Cleanup(func() { active.Store(nil) })
+
+	err := Init(Config{
+		NEID:     "smf-1",
+		X1Listen: "127.0.0.1:0",
+		MDF2:     "10.0.60.122:42069",
+		Cert:     cert, Key: key, CACert: ca,
+		AdmfURL: admf.srv.URL, AdmfID: "admf-1",
+		KeepaliveTimeout: "1ns",
+	})
+	if err == nil {
+		t.Fatal("Init accepted a fail-safe window shorter than the watchdog can measure")
+	}
+	if sub := active.Load(); sub != nil {
+		t.Error("interception was started despite the refusal")
+	}
+	if joined := strings.Join(admf.received(), "\n"); !strings.Contains(joined, "invalidConfig") {
+		t.Errorf("the refusal was not reported to the ADMF:\n%s", joined)
+	}
+}

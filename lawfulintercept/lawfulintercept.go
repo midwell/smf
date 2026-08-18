@@ -249,10 +249,15 @@ func newX1Server(st *store.Store, cfg Config, sub *subsystem) *x1.Server {
 			// X1 channel — and makes the element's response time depend on whether the
 			// ADMF is up, which is observable to whoever is probing it.
 			//
-			// The goroutine is bounded in effect rather than in count: Notify's throttle
-			// is checked before anything is sent, so under a flood of refusals each of
-			// these returns immediately and at most one report per window is dispatched.
-			go sub.reporter.Notify(x1.NEIssueX1AuthFailed,
+			// The dispatch is bounded in effect rather than in count, and it is
+			// NotifyAsync that makes that true rather than the `go` this used to be.
+			// The throttle is consulted on this goroutine before anything is spawned,
+			// so under a flood of refusals each of these costs a mutex; spawning first
+			// would have been a goroutine per refusal, which is the shape that made the
+			// same fix wrong at the UPF, where the equivalent sites are driven by packet
+			// rate rather than by request rate. One form, so the three elements cannot
+			// reason about this hazard three times and reach three answers.
+			sub.reporter.NotifyAsync(x1.NEIssueX1AuthFailed,
 				fmt.Sprintf("X1 provisioning refused: peer failed authentication (error %d)", code))
 		}),
 	}
@@ -320,7 +325,27 @@ func Init(cfg Config) error {
 	pool := x2x3.NewPool(mat.ClientTLS(),
 		keepaliveConfig(cfg, reporter),
 		func(error) { watcher.Nudge() },
-		nil, // drops are covered by the same MDF-unreachable report from the worker
+		// Product dropped because the queue was full is reported as it happens, and
+		// this hook is the only place that can report it.
+		//
+		// It was nil, with a comment saying drops were covered by the worker's
+		// MDF-unreachable report — which AsyncSender.Unreachable's own documentation
+		// contradicts in terms. Queue saturation is deliberately excluded from
+		// reachability, because a full queue at one instant is a burst the buffer
+		// exists to absorb rather than a fault an ADMF can act on, and that doc says
+		// so and then says the drops themselves are reported as they happen. At the
+		// UPF they are (x3DeliveryLost). Here nothing reported them, so a reachable
+		// but slow MDF2 lost xIRI while the destination watcher went on
+		// reporting the destination healthy — product missing from an agency's
+		// record with every channel that could have said so reporting normality.
+		//
+		// Off the offering path, which is a signalling goroutine: this fires exactly
+		// when delivery is already behind, so blocking here would add the reporting
+		// stall to the condition being reported.
+		func() {
+			reporter.NotifyAsync(x1.NEIssueX2DeliveryLost,
+				"xIRI dropped from the X2 delivery queue")
+		},
 	)
 	sub := &subsystem{
 		store:     st,
@@ -672,7 +697,21 @@ func (s *subsystem) applyTaskChange(prev, next *types.InterceptTask) {
 func (s *subsystem) modifyInterception(prev, next types.InterceptTask) {
 	wantedCC := prev.WantsProduct(types.ProductCC)
 	wantsCC := next.WantsProduct(types.ProductCC)
-	if slices.Equal(prev.Targets, next.Targets) && wantedCC == wantsCC {
+	// Both products, not just content. A test that compared the targets and the CC
+	// flag alone found "nothing changed" when IRI was *added* to a task that already
+	// had CC — and returned before reportStartOfInterception, so the target's
+	// already-established sessions produced no SMFStartOfInterceptionWithEstablishedPDUSession
+	// at all. Interception of that product genuinely began, at a moment the ADMF chose,
+	// and the only record that would have said so is the one this comparison skipped.
+	// Each product is a separate authority that can be granted on its own, so the test
+	// for "nothing about this interception has moved" has to cover each of them.
+	//
+	// covered() already tests the product on the other side, so a previous task that
+	// did not want IRI does not suppress the record once the branch is reached. That is
+	// the whole of the fix, and it is what the AMF's applyTaskChange already did.
+	wantedIRI := prev.WantsProduct(types.ProductIRI)
+	wantsIRI := next.WantsProduct(types.ProductIRI)
+	if slices.Equal(prev.Targets, next.Targets) && wantedCC == wantsCC && wantedIRI == wantsIRI {
 		// Nothing about *which* traffic is intercepted has moved. What may still have
 		// moved is how this warrant's product is labelled and where its content goes,
 		// and those reach the two interfaces by different routes: this element reads
@@ -693,6 +732,22 @@ func (s *subsystem) modifyInterception(prev, next types.InterceptTask) {
 	// trigger it has. Withdrawing everything and reinstalling would stop and restart
 	// content interception for a session whose tasking did not change.
 	s.retriggerWarrant(next)
+
+	// And the labelling, on this branch too. relabelWarrant was reached only from the
+	// early-return branch, so a ModifyTask that changed the targets *and* the productID
+	// or the X3 destinations took this path — where retriggerWarrant withdraws triggers
+	// for sessions the task no longer covers and leaves the rest untouched, still
+	// labelling their content with the superseded value. That reintroduces, for the
+	// combined case, exactly the divergence the labelling requirement was written to
+	// close: signalling arrives at the mediation function under one warrant identifier
+	// and content under another, both well-formed, with nothing in either stream to
+	// show they were meant to join.
+	//
+	// The combined case is where it is hardest to notice, because part of the
+	// modification visibly took effect. Called after the reconciliation so it acts on
+	// the triggers that survived it, and safe on both paths because relabelWarrant
+	// opens with an exact no-change test.
+	s.relabelWarrant(prev, next)
 
 	// Duplication re-derives from the task set, which already holds next, so a
 	// session reached by either scan is evaluated the same way. Only sessions the
@@ -809,6 +864,24 @@ func (s *subsystem) scanSessions(task types.InterceptTask, fn func(*smfctx.SMCon
 		})
 
 		for _, sc := range matched {
+			// **Re-read before each session, and act under what the store holds now.**
+			// This scan is unbounded in duration by design — it is off the X1 goroutine
+			// precisely so a provisioning answer does not scale with the subscriber
+			// population — so "the warrant was valid when the scan started" and "the
+			// warrant is valid now" are two different statements, and only the second
+			// authorises a record or a duplication change. A DeactivateTask
+			// acknowledged mid-scan otherwise leaves this loop delivering for a
+			// withdrawn warrant, and a ModifyTask leaves it delivering to destinations
+			// it has just replaced.
+			//
+			// Per session rather than per scan: a withdrawal landing mid-scan must stop
+			// the remainder, not merely the next one.
+			current, held := s.store.Get(task.XID)
+			if !held {
+				return
+			}
+			task = current
+
 			sc.SMLock.Lock()
 			corr := correlationOf(sc)   // read under the lock (reads sc.PFCPContext)
 			subjectIDs := targetsOf(sc) // likewise: reads the session's identity fields
@@ -1391,6 +1464,14 @@ func canApply(task types.InterceptTask) error {
 //
 // A non-positive duration is refused for the same reason it is at the UPF: "0s" and
 // "-5m" are values an operator wrote, and neither can mean the window they asked for.
+//
+// So is one below x1.MinKeepaliveWindow. "1ns" passes the chart's duration regex — ns
+// is a Go duration unit — and passed the positive test here, and then panicked the
+// process: the window is halved to produce the watchdog's tick interval, and integer
+// division reached zero inside time.NewTicker, on a goroutine. An LI configuration
+// mistake is permitted to cost interception and never the network function, so this is
+// refused here, reported to the ADMF by the caller, and refused again in the library
+// itself for any caller that does not check.
 func parseKeepaliveTimeout(v string) (time.Duration, error) {
 	if v == "" {
 		return 0, nil
@@ -1402,6 +1483,9 @@ func parseKeepaliveTimeout(v string) (time.Duration, error) {
 	}
 	if d <= 0 {
 		return 0, fmt.Errorf("li: keepaliveTimeout %q is not a positive duration", v)
+	}
+	if d < x1.MinKeepaliveWindow {
+		return 0, fmt.Errorf("li: keepaliveTimeout %q is shorter than the minimum fail-safe window %s", v, x1.MinKeepaliveWindow)
 	}
 
 	return d, nil

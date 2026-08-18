@@ -9,6 +9,7 @@ package handler
 import (
 	"context"
 	"fmt"
+	"github.com/omec-project/smf/pfcp/lisequence"
 	"net"
 
 	"github.com/omec-project/openapi/v2/models"
@@ -610,7 +611,7 @@ func HandlePfcpSessionModificationResponse(msg *udp.Message) {
 	// and completes that procedure on an answer never sent to it. Nothing about the
 	// LI modification needs handling here: it carries no session-state transition
 	// and nothing waits on it.
-	if pfcp_message.IsLISequence(rsp.Sequence()) {
+	if lisequence.Is(rsp.Sequence()) {
 		return
 	}
 

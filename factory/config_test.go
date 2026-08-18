@@ -6,6 +6,7 @@
 package factory
 
 import (
+	"strings"
 	"testing"
 
 	"go.yaml.in/yaml/v4"
@@ -113,4 +114,47 @@ func TestLiBulkSwitchesAreTriState(t *testing.T) {
 				cfg.Configuration.Li.DeactivateAllTasks)
 		}
 	})
+}
+
+// TestAQuotedTriStateBooleanIsRefusedByTheConfigLoader pins why the charts validate
+// these keys, so the chart test and this one cannot drift apart about what they guard.
+//
+// The three LI booleans are tri-state — unset means "the specification's default", which
+// is why they are *bool — and the chart's own default for them is the empty string. That
+// is exactly what invites an operator to replace it with a quoted value: `helm template
+// … --set-string config.smf.li.x2x3KeepaliveEnabled=false` renders
+// `x2x3KeepaliveEnabled: "false"`, which is a YAML string and not a YAML bool.
+//
+// What follows is the whole SMF configuration failing to load, not the LI block being
+// ignored: the element crashloops over a lawful-interception key, which is the one cost
+// an LI configuration mistake may never have. The chart refuses the render instead; this
+// test is the reason that refusal is not decoration.
+func TestAQuotedTriStateBooleanIsRefusedByTheConfigLoader(t *testing.T) {
+	for _, key := range []string{"x2x3KeepaliveEnabled", "deactivateAllTasks", "removeAllDestinations"} {
+		t.Run(key, func(t *testing.T) {
+			var li Li
+
+			err := yaml.Unmarshal([]byte(key+`: "false"`), &li)
+			if err == nil {
+				t.Fatalf("a quoted %s was accepted; the chart guard would be guarding nothing", key)
+			}
+			// The stable part of the message across YAML libraries is the type clash
+			// itself. This module is on go.yaml.in/yaml/v4, which words it "cannot
+			// construct !!str `false` into bool"; gopkg.in/yaml.v2 and v3 say "cannot
+			// unmarshal". Asserting on the tag rather than the verb keeps this pinned to
+			// the fact — a YAML string reaching a *bool — rather than to a library's
+			// phrasing.
+			if !strings.Contains(err.Error(), "!!str") {
+				t.Errorf("refused for an unexpected reason, which may mean the type changed: %v", err)
+			}
+		})
+	}
+
+	// The unquoted forms are what the chart must emit, and both must load.
+	for _, doc := range []string{"x2x3KeepaliveEnabled: false", "x2x3KeepaliveEnabled: true"} {
+		var li Li
+		if err := yaml.Unmarshal([]byte(doc), &li); err != nil {
+			t.Errorf("a real YAML boolean was refused (%q): %v", doc, err)
+		}
+	}
 }

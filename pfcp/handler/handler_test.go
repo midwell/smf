@@ -5,6 +5,7 @@
 package handler_test
 
 import (
+	"github.com/omec-project/smf/pfcp/lisequence"
 	"net"
 	"testing"
 	"time"
@@ -328,7 +329,7 @@ func TestLIModificationResponseDoesNotCompleteTheSessionsOwnProcedure(t *testing
 	// An LI modification goes out while it is: a warrant changed, which happens on
 	// the provisioning plane's schedule and not the session's.
 	const liSeq = uint32(4242)
-	pfcp_message.MarkLISequenceForTest(liSeq)
+	lisequence.Mark(liSeq)
 
 	handler.HandlePfcpSessionModificationResponse(modificationResponse(liSeq, seid))
 

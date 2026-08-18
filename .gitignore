@@ -26,4 +26,10 @@ vendor*
 *.patch
 
 # coverage
-./.coverage
+# Leading "./" is not a gitignore path — the previous "./.coverage" matched
+# nothing, which is why coverage output has always shown up as untracked.
+.coverage/
+
+# Build output. The binary is named after the module, so a plain `go build` drops it
+# here and it has been shipped inside an image once already.
+/smf

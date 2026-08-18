@@ -5,6 +5,7 @@ package adapter
 
 import (
 	"fmt"
+	"github.com/omec-project/smf/pfcp/lisequence"
 	"net"
 	"sync"
 
@@ -363,6 +364,22 @@ func HandlePfcpSessionModificationResponse(msg *udp.Message) {
 	logger.PfcpLog.Infof("in HandlePfcpSessionModificationResponse smContext found by SEID %v", smContext)
 	if smContext == nil {
 		logger.PfcpLog.Warnf("PFCP Session Modification Response found SM context nil for SEID %d, response discarded", SEID)
+		return
+	}
+
+	// A modification this element sent for Lawful Interception, not one the session's
+	// own procedures sent — the same guard the native handler applies, on the path
+	// taken when enableUPFAdapter is set. sendSessionModification routes the response
+	// through HandleAdapterPfcpRsp in that mode, and this handler had none: an LI
+	// modification's response landing during SmStatePfcpModify cleared the pending-UPF
+	// entry the subscriber's own concurrent modification was waiting on and completed
+	// that procedure on an answer never sent to it. The correlation below — SEID,
+	// serving UPF, procedure state — cannot tell the two apart, which is why the
+	// sequence number is what answers it.
+	//
+	// Note that Is *consumes* the record. Before this, nothing in adapter mode consumed
+	// it, so every LI-originated sequence number lingered until the two-minute age-out.
+	if lisequence.Is(pfcpRsp.Sequence()) {
 		return
 	}
 

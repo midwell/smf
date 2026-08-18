@@ -11,6 +11,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/omec-project/smf/pfcp/lisequence"
 	"io"
 	"net"
 	"net/http"
@@ -354,7 +355,7 @@ func sendSessionModification(
 ) error {
 	seqNum := getSeqNumber()
 	if forLI {
-		markLISequence(seqNum)
+		lisequence.Mark(seqNum)
 	}
 	upNodeIDStr := upNodeID.ResolveNodeIdToIp().String()
 	pfcpContext, ok := ctx.PFCPContext[upNodeIDStr]
@@ -685,55 +686,3 @@ func SendPfcpMsgToAdapter(upNodeID smf_context.NodeID, msg message.Message, addr
 
 	return rsp, nil
 }
-
-// liSequences records the sequence numbers of PFCP modifications sent for Lawful
-// Interception, so their responses can be recognised and kept out of the session's
-// own procedure handling.
-//
-// Bounded on purpose. Entries are normally consumed by the response they describe,
-// but a response that never arrives — a lost datagram, a UPF that restarts — would
-// otherwise leave one behind forever, and an unbounded map that grows with traffic
-// while nothing prunes it is a fault this project has already had to fix once.
-// Each insert drops anything older than the window, so what is held is bounded by
-// the rate of LI modifications rather than by uptime.
-var (
-	liSequences      = map[uint32]time.Time{}
-	liSequenceLock   sync.Mutex
-	liSequenceMaxAge = 2 * time.Minute
-)
-
-// markLISequence records that seqNum belongs to an LI-initiated modification.
-func markLISequence(seqNum uint32) {
-	liSequenceLock.Lock()
-	defer liSequenceLock.Unlock()
-
-	cutoff := time.Now().Add(-liSequenceMaxAge)
-	for seq, at := range liSequences {
-		if at.Before(cutoff) {
-			delete(liSequences, seq)
-		}
-	}
-	liSequences[seqNum] = time.Now()
-}
-
-// IsLISequence reports whether seqNum was an LI-initiated modification, consuming
-// the record. A response arrives once, so holding the entry past it would only
-// keep a sequence number that the counter will eventually reuse.
-func IsLISequence(seqNum uint32) bool {
-	liSequenceLock.Lock()
-	defer liSequenceLock.Unlock()
-
-	if _, ok := liSequences[seqNum]; !ok {
-		return false
-	}
-	delete(liSequences, seqNum)
-
-	return true
-}
-
-// MarkLISequenceForTest records an LI-originated sequence number without sending
-// anything, so a handler test can drive the response path with an LI-marked
-// message. It exists because what has to be asserted is what the *handler* does
-// with such a response, and building one by hand is the only way to place it
-// against a concurrent session procedure deterministically.
-func MarkLISequenceForTest(seqNum uint32) { markLISequence(seqNum) }

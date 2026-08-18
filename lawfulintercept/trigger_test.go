@@ -9,6 +9,7 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
+	"github.com/omec-project/li/store"
 	"io"
 	"log"
 	"net"
@@ -366,9 +367,14 @@ func triggerSubsystem(poi *fakePOI) *subsystem {
 		},
 	}
 
+	// A store, because a production subsystem always has one and the paths that
+	// consult it — matchingTasks, and the scans' revalidation before each delivery —
+	// are reached from the trigger paths these tests drive. A test that wants a scan
+	// to run activates its task in here.
 	return &subsystem{
 		neID:     "smf-1",
 		triggers: mustRegistry(cfg),
+		store:    store.New(),
 	}
 }
 
@@ -2894,6 +2900,14 @@ func TestAModificationDoesNotWalkTheSessionPool(t *testing.T) {
 		{Type: types.TargetPEI, Value: "3534250000000151"},
 	}
 
+	// Held, so the scan the modification triggers actually runs: it revalidates the
+	// task against the store before each session, and a task the store does not hold
+	// stops it before it can walk anything — which would make the timing below pass
+	// for a reason that has nothing to do with what it asserts.
+	if !s.store.Activate(next) {
+		t.Fatal("Activate failed")
+	}
+
 	done := make(chan struct{})
 	go func() {
 		s.modifyInterception(task, next)
@@ -3007,5 +3021,71 @@ func TestAnActivationThatTimesOutIsWithdrawnNotForgotten(t *testing.T) {
 	if len(s.triggers.installed) != 0 {
 		t.Errorf("registry still holds %d installed triggers after the withdrawal completed",
 			len(s.triggers.installed))
+	}
+}
+
+// TestALabelChangeArrivingWithATargetChangeStillReachesTheTrigger is the combined case,
+// and it is the one where the divergence is hardest to notice because part of the
+// modification visibly takes effect.
+//
+// relabelWarrant was reached only from modifyInterception's early-return branch — the
+// path taken when nothing but the labelling moved. A ModifyTask that changes the
+// targets *and* the productID takes the other branch, where retriggerWarrant withdraws
+// triggers for sessions the task no longer covers and leaves the rest untouched. A
+// trigger that survives that reconciliation is precisely a trigger that keeps its
+// original labelling: the session is still covered, so nothing reinstalls it, and its
+// content keeps arriving at the mediation function under the superseded warrant
+// identifier while this element's own records use the new one.
+func TestALabelChangeArrivingWithATargetChangeStillReachesTheTrigger(t *testing.T) {
+	poi := newFakePOI(t)
+	s := triggerSubsystem(poi)
+	s.taskReporter = &recordingTaskReporter{}
+
+	const (
+		warrantXID = "11111111-1111-4111-8111-111111111111"
+		oldLabel   = "22222222-2222-4222-8222-222222222222"
+		newLabel   = "33333333-3333-4333-8333-333333333333"
+		supi       = "262019876543210"
+	)
+
+	// A session in the pool rather than a synthetic reference: the reconciliation
+	// resolves each ref it holds a trigger for and reads the session's identity to
+	// decide whether the new task still covers it, which is the decision this test
+	// depends on being made correctly.
+	session := pooledSession(t, "imsi-"+supi, 5)
+
+	prev := types.InterceptTask{
+		XID: warrantXID, ProductID: oldLabel,
+		Targets:  []types.TargetIdentifier{{Type: types.TargetSUPI, Value: supi}},
+		Products: []types.ProductType{types.ProductCC},
+	}
+	s.installFor(session.Ref, []types.InterceptTask{prev},
+		[]upfSession{{node: upfNode("10.0.1.5"), addr: "10.0.1.5", seid: 0x2632898145f4d191}}, 7)
+
+	if got := poi.elements("ActivateTaskRequest", "productID"); len(got) != 1 || got[0] != oldLabel {
+		t.Fatalf("activation carried productID %v, want [%s]", got, oldLabel)
+	}
+
+	// Both at once: a target is added and the label changes. The session installed
+	// above is covered before and after, so its trigger survives the reconciliation —
+	// which is exactly the trigger that used to keep the old label.
+	next := prev
+	next.ProductID = newLabel
+	next.Targets = []types.TargetIdentifier{
+		{Type: types.TargetSUPI, Value: supi},
+		{Type: types.TargetPEI, Value: "3534250000000151"},
+	}
+	if !s.store.Activate(next) {
+		t.Fatal("Activate failed")
+	}
+	s.modifyInterception(prev, next)
+
+	awaitMessages(t, poi, "ModifyTaskRequest", 1)
+
+	modified := poi.elements("ModifyTaskRequest", "productID")
+	if len(modified) != 1 || modified[0] != newLabel {
+		t.Fatalf("modification carried productID %v, want [%s]; content for a session the "+
+			"warrant still covers keeps the superseded label while this element's own "+
+			"records carry the new one", modified, newLabel)
 	}
 }
