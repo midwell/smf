@@ -3136,3 +3136,95 @@ func TestTwoTriggeringEndpointsMayNotShareAnElementIdentifier(t *testing.T) {
 		t.Errorf("two properly distinguished points of interception were refused: %v", err)
 	}
 }
+
+// TestTwoPointsOfInterceptionServingOneSessionShareTheWarrantAndNotTheirIdentity is the
+// positive half of the identity requirement, and it is the half that says what the
+// refusal is protecting.
+//
+// One session steered through a branching point and a session anchor is served by both at
+// once — the ordinary ULCL case. Both must be tasked for the same warrant, and TS 103
+// 221-2 clause 5.3.9's sequence context is formed from the delivery identifier, the
+// correlation value, and the identifiers that follow from each element's own ne_id. So
+// the first two are deliberately *shared* — that is what joins one warrant's content to
+// its signalling and to the other point of interception's content — and only the element
+// identity separates the two sequence spaces.
+//
+// Asserting the shared halves matters as much as refusing a duplicate ne_id: an element
+// that gave each UPF its own correlation would produce two streams a mediation function
+// could not join, which is the same warrant broken in the other direction.
+func TestTwoPointsOfInterceptionServingOneSessionShareTheWarrantAndNotTheirIdentity(t *testing.T) {
+	anchor := newFakePOI(t)
+	branch := newFakePOI(t)
+
+	s := &subsystem{
+		neID:  "smf-1",
+		store: store.New(),
+		triggers: mustRegistry(Config{
+			NEID: "smf-1", MDF3: "192.0.2.1:42069",
+			UPFTriggers: []UPFTrigger{
+				{NodeID: "10.0.1.5", X1URL: anchor.srv.URL, NEID: "upf-anchor"},
+				{NodeID: "10.0.1.6", X1URL: branch.srv.URL, NEID: "upf-branch"},
+			},
+		}),
+	}
+	s.taskReporter = &recordingTaskReporter{}
+
+	const (
+		warrantXID = "11111111-1111-4111-8111-111111111111"
+		label      = "22222222-2222-4222-8222-222222222222"
+	)
+
+	warrant := types.InterceptTask{
+		XID: warrantXID, ProductID: label,
+		Targets:  []types.TargetIdentifier{{Type: types.TargetSUPI, Value: "262019876543210"}},
+		Products: []types.ProductType{types.ProductCC},
+	}
+
+	// One session, two serving UPFs, one correlation — the session's.
+	const correlation = 7
+	upfs := []upfSession{
+		{node: upfNode("10.0.1.5"), addr: "10.0.1.5", seid: 0x2632898145f4d191},
+		{node: upfNode("10.0.1.6"), addr: "10.0.1.6", seid: 0x51f4d1912632898a},
+	}
+	s.installFor("session-ref-1", []types.InterceptTask{warrant}, upfs, correlation)
+
+	awaitMessages(t, anchor, "ActivateTaskRequest", 1)
+	awaitMessages(t, branch, "ActivateTaskRequest", 1)
+
+	// Shared: the warrant's label and the session's correlation. If these ever diverge
+	// the mediation function receives two unrelated intercepts.
+	for name, poi := range map[string]*fakePOI{"anchor": anchor, "branch": branch} {
+		if got := poi.elements("ActivateTaskRequest", "productID"); len(got) != 1 || got[0] != label {
+			t.Errorf("%s was tasked with productID %v, want the warrant's %s", name, got, label)
+		}
+		if got := poi.elements("ActivateTaskRequest", "correlationID"); len(got) != 1 || got[0] != "7" {
+			t.Errorf("%s was tasked with correlationID %v, want the session's 7", name, got)
+		}
+	}
+
+	// Distinct: the trigger XIDs, so each POI's own tasking is separately withdrawable,
+	// and the element identities the registry addressed them by.
+	anchorXID := anchor.elements("ActivateTaskRequest", "xId")
+	branchXID := branch.elements("ActivateTaskRequest", "xId")
+	if len(anchorXID) != 1 || len(branchXID) != 1 {
+		t.Fatalf("trigger identifiers: anchor %v branch %v", anchorXID, branchXID)
+	}
+	if anchorXID[0] == branchXID[0] {
+		t.Error("both points of interception were tasked under one trigger identifier; withdrawing " +
+			"one would clear the registry's record of the other")
+	}
+
+	// And the detection criteria are per UPF, because each holds its own PFCP session.
+	// The element is ext:SEID inside the extension's FSEID, not an ns1: one — asserted
+	// on a name that exists, or this check would pass by finding nothing.
+	anchorSEID := anchor.elements("ActivateTaskRequest", "SEID")
+	branchSEID := branch.elements("ActivateTaskRequest", "SEID")
+	if len(anchorSEID) == 0 || len(branchSEID) == 0 {
+		t.Fatalf("no detection criterion was read from either trigger (anchor %v, branch %v); "+
+			"this assertion would otherwise pass without comparing anything", anchorSEID, branchSEID)
+	}
+	if anchorSEID[0] == branchSEID[0] {
+		t.Errorf("both were given the same detection criterion (%s); one of them cannot match it",
+			anchorSEID[0])
+	}
+}
