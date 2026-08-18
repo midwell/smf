@@ -9,7 +9,6 @@ package handler
 import (
 	"context"
 	"fmt"
-	"github.com/omec-project/smf/pfcp/lisequence"
 	"net"
 
 	"github.com/omec-project/openapi/v2/models"
@@ -20,6 +19,7 @@ import (
 	"github.com/omec-project/smf/logger"
 	"github.com/omec-project/smf/metrics"
 	"github.com/omec-project/smf/pfcp/ies"
+	"github.com/omec-project/smf/pfcp/lisequence"
 	pfcp_message "github.com/omec-project/smf/pfcp/message"
 	"github.com/omec-project/smf/pfcp/udp"
 	"github.com/omec-project/smf/producer"

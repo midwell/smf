@@ -5,12 +5,12 @@ package adapter
 
 import (
 	"fmt"
-	"github.com/omec-project/smf/pfcp/lisequence"
 	"net"
 	"sync"
 
 	"github.com/omec-project/smf/context"
 	"github.com/omec-project/smf/logger"
+	"github.com/omec-project/smf/pfcp/lisequence"
 	"github.com/omec-project/smf/pfcp/udp"
 	"github.com/wmnsk/go-pfcp/ie"
 	"github.com/wmnsk/go-pfcp/message"

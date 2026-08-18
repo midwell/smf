@@ -66,8 +66,9 @@ func loopbackPKI(t *testing.T) (certPath, keyPath, caPath string, pair tls.Certi
 		}
 	}
 
-	if pair, err = tls.X509KeyPair(certPEM, keyPEM); err != nil {
-		t.Fatal(err)
+	pair, pairErr := tls.X509KeyPair(certPEM, keyPEM)
+	if pairErr != nil {
+		t.Fatal(pairErr)
 	}
 
 	return certPath, keyPath, caPath, pair

@@ -25,7 +25,7 @@ func modificationResponse(seq uint32, seid uint64) *udp.Message {
 	}
 }
 
-func modifyingSession(t *testing.T) (*context.SMContext, string, uint64) {
+func modifyingSession(t *testing.T) (*context.SMContext, uint64) {
 	t.Helper()
 
 	if factory.SmfConfig.Configuration == nil {
@@ -49,7 +49,7 @@ func modifyingSession(t *testing.T) (*context.SMContext, string, uint64) {
 	smContext.ChangeState(context.SmStatePfcpModify)
 	smContext.PendingUPF = context.PendingUPF{upfIP: true}
 
-	return smContext, upfIP, seid
+	return smContext, seid
 }
 
 // TestLIModificationResponseDoesNotCompleteTheSessionsOwnProcedureInAdapterMode is the
@@ -63,7 +63,7 @@ func modifyingSession(t *testing.T) (*context.SMContext, string, uint64) {
 // thing interception may never do. Nothing about the deployment mode changes that;
 // only which function saw the message.
 func TestLIModificationResponseDoesNotCompleteTheSessionsOwnProcedureInAdapterMode(t *testing.T) {
-	smContext, _, seid := modifyingSession(t)
+	smContext, seid := modifyingSession(t)
 
 	// An LI modification goes out while the subscriber's is outstanding: a warrant
 	// changed, which happens on the provisioning plane's schedule and not the session's.
@@ -88,7 +88,7 @@ func TestLIModificationResponseDoesNotCompleteTheSessionsOwnProcedureInAdapterMo
 // guard: it must recognise only LI-originated sequences, or in adapter mode every
 // ordinary modification stops being answered and every session update hangs.
 func TestOrdinaryModificationResponseStillCompletesInAdapterMode(t *testing.T) {
-	smContext, _, seid := modifyingSession(t)
+	smContext, seid := modifyingSession(t)
 
 	adapter.HandlePfcpSessionModificationResponse(modificationResponse(7373, seid))
 

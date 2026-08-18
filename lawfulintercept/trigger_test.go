@@ -9,7 +9,6 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
-	"github.com/omec-project/li/store"
 	"io"
 	"log"
 	"net"
@@ -23,6 +22,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/omec-project/li/store"
 	"github.com/omec-project/li/types"
 	"github.com/omec-project/li/x1"
 	smfctx "github.com/omec-project/smf/context"
@@ -2822,6 +2822,11 @@ func TestAModificationThatChangesNoLabelSendsNothing(t *testing.T) {
 
 // pooledSession puts a targeted session in the global pool, which is where
 // sessionsCovered reaches sessions from.
+// supi is a parameter although every current caller passes the same value: which
+// subscriber a test is about belongs at the call site, and a helper that hid it would
+// make the tasking and the session silently agree.
+//
+//nolint:unparam // see above
 func pooledSession(t *testing.T, supi string, id int32) *smfctx.SMContext {
 	t.Helper()
 

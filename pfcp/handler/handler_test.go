@@ -5,7 +5,6 @@
 package handler_test
 
 import (
-	"github.com/omec-project/smf/pfcp/lisequence"
 	"net"
 	"testing"
 	"time"
@@ -13,6 +12,7 @@ import (
 	"github.com/omec-project/smf/context"
 	"github.com/omec-project/smf/factory"
 	"github.com/omec-project/smf/pfcp/handler"
+	"github.com/omec-project/smf/pfcp/lisequence"
 	pfcp_message "github.com/omec-project/smf/pfcp/message"
 	"github.com/omec-project/smf/pfcp/udp"
 	"github.com/wmnsk/go-pfcp/ie"
