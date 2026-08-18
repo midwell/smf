@@ -125,6 +125,14 @@ type triggerRegistry struct {
 	// before the subsystem holds the registry — a field assigned afterwards would be
 	// written while that goroutine was already reading it.
 	reportUnattributable func(error)
+	// reportCadenceMissed tells the LIPF that a keepalive round overran the interval it
+	// is supposed to keep, so a point of interception may be about to purge live tasking
+	// this element is still answering for.
+	//
+	// It exists because that condition is invisible from the other side: a POI cannot
+	// tell a triggering function that has gone away from one that is merely late, and
+	// will report the first. nil when no ADMF is configured.
+	reportCadenceMissed func(time.Duration)
 
 	// sleep and now are the withdrawal retry loop's clock, held here so a test can
 	// drive a backoff measured in minutes without spending it. Nil means the real
@@ -235,7 +243,12 @@ const (
 // newTriggerRegistry builds the CC-TF's endpoints from configuration. A UPF with
 // no configured triggering endpoint cannot be tasked, so CC for a session it
 // serves is reported as a fault rather than silently skipped.
-func newTriggerRegistry(cfg Config, clientTLS *tls.Config, onUnattributable func(error)) (*triggerRegistry, error) {
+func newTriggerRegistry(
+	cfg Config,
+	clientTLS *tls.Config,
+	onUnattributable func(error),
+	onCadenceMissed func(time.Duration),
+) (*triggerRegistry, error) {
 	reg := &triggerRegistry{
 		mdf3:                 cfg.MDF3,
 		endpoints:            make(map[string]*upfEndpoint, len(cfg.UPFTriggers)),
@@ -243,7 +256,11 @@ func newTriggerRegistry(cfg Config, clientTLS *tls.Config, onUnattributable func
 		installed:            make(map[string]installedTrigger),
 		pending:              make(map[string]*pendingWithdrawal),
 		reportUnattributable: onUnattributable,
+		reportCadenceMissed:  onCadenceMissed,
 	}
+	// The element identifiers already claimed, so two endpoints cannot share one.
+	claimedNEIDs := make(map[string]string, len(cfg.UPFTriggers))
+
 	for _, t := range cfg.UPFTriggers {
 		// Key by the NodeID exactly as configured, and resolve nothing here. An
 		// earlier version keyed by the address the NodeID resolved to at this moment,
@@ -259,6 +276,32 @@ func newTriggerRegistry(cfg Config, clientTLS *tls.Config, onUnattributable func
 			// displaced UPF's content was never attributable.
 			return nil, fmt.Errorf("upfTriggers names the same node twice: %q", t.NodeID)
 		}
+		// **Two points of interception may not share an element identifier**, and this
+		// is the only place the collision is visible: neither UPF can see it, because
+		// each is numbering its own product correctly.
+		//
+		// Every UPF serving one session is deliberately given the *same* delivery
+		// identifier and correlation value — that is what joins one warrant's content
+		// to its signalling and to the other UPF's content. TS 103 221-2 clause 5.3.9
+		// then counts sequence numbers within a context formed from those two plus the
+		// network function and interception point identifiers, both of which follow
+		// from ne_id. So ne_id is the only thing separating two UPFs' sequence
+		// contexts, and two that share it number one context from zero independently.
+		//
+		// The mediation function receives a single sequence with duplicated numbers and
+		// apparent gaps, for a warrant whose product is otherwise entirely correct — and
+		// gaps are how loss is made visible on this interface, so the collision forges
+		// the signal an agency uses to decide whether it has everything. Under ULCL,
+		// where a branching point and a session anchor both serve one session, this is
+		// the ordinary multi-UPF case rather than an exotic one.
+		if first, dup := claimedNEIDs[t.NEID]; dup {
+			return nil, fmt.Errorf(
+				"upfTriggers gives %q and %q the same neId %q: two points of interception sharing an "+
+					"element identifier number one delivery context independently, which reaches the "+
+					"mediation function as duplicated sequence numbers and apparent loss",
+				first, t.NodeID, t.NEID)
+		}
+		claimedNEIDs[t.NEID] = t.NodeID
 		reg.endpoints[t.NodeID] = &upfEndpoint{
 			node: *smfctx.NewNodeID(t.NodeID),
 			req:  x1.NewRequester(t.X1URL, cfg.NEID, t.NEID, clientTLS),
@@ -485,25 +528,68 @@ func (r *triggerRegistry) keepalive() {
 
 // keepaliveRound signals every POI that owes one. Separated from the ticker so the
 // behaviour can be driven directly rather than waited for.
+//
+// **The endpoints are signalled concurrently, and that is a correctness property rather
+// than a performance one.** Signalled in line, a round takes as long as the sum of its
+// failures: each Keepalive is bounded only by the requester's 10s timeout, on a 60s
+// ticker, so around fifteen unreachable UPFs push a round past the POI's own 150s
+// fail-safe window. A *healthy* point of interception then goes unsignalled for longer
+// than its window allows, purges the tasking it holds, and reports that its triggering
+// function went silent — which is true of the interval and false of the cause. An
+// operator is sent to investigate a healthy element while the warrant that mattered has
+// already stopped producing.
+//
+// That is the exact fault minTriggerKeepalive exists to prevent, reached by a route the
+// floor cannot see: the floor protects the window from the operator's side, and this
+// protects the cadence from the sending side. The two are halves of one property, and
+// this is the half the element controls. Fanned out, a round costs one peer timeout
+// however many endpoints are configured or unreachable.
 func (r *triggerRegistry) keepaliveRound() {
+	r.mu.Lock()
+	due := make(map[string]*upfEndpoint, len(r.endpoints))
 	for nodeID, endpoint := range r.endpoints {
+		due[nodeID] = endpoint
+	}
+	r.mu.Unlock()
+
+	var wg sync.WaitGroup
+
+	started := time.Now()
+
+	for nodeID, endpoint := range due {
 		if !r.keepaliveDue(nodeID, endpoint) {
 			continue
 		}
-		// Best-effort: a missed keepalive is transient, and a POI that has really
-		// gone away trips its own fail-safe; nothing here to act on per tick.
-		//
-		// A response that could not be *bound* to the request is a different fault
-		// and is not best-effort. A keepalive answered by an endpoint naming another
-		// element means this triggering function believes a POI is alive on the
-		// strength of an answer from something else — the same silent condition the
-		// tasking paths report, on the one exchange whose whole purpose is to say the
-		// peer is still there. reportUnattributable filters for exactly that and
-		// ignores every transient failure, so handing it the error keeps the
-		// best-effort behaviour this loop was written for.
-		if err := endpoint.req.Keepalive(); err != nil && r.reportUnattributable != nil {
-			r.reportUnattributable(err)
-		}
+
+		wg.Add(1)
+		go func(endpoint *upfEndpoint) {
+			defer wg.Done()
+
+			// Best-effort: a missed keepalive is transient, and a POI that has really
+			// gone away trips its own fail-safe; nothing here to act on per tick.
+			//
+			// A response that could not be *bound* to the request is a different fault
+			// and is not best-effort. A keepalive answered by an endpoint naming another
+			// element means this triggering function believes a POI is alive on the
+			// strength of an answer from something else — the same silent condition the
+			// tasking paths report, on the one exchange whose whole purpose is to say the
+			// peer is still there. reportUnattributable filters for exactly that and
+			// ignores every transient failure, so handing it the error keeps the
+			// best-effort behaviour this loop was written for.
+			if err := endpoint.req.Keepalive(); err != nil && r.reportUnattributable != nil {
+				r.reportUnattributable(err)
+			}
+		}(endpoint)
+	}
+
+	wg.Wait()
+
+	// And where the cadence still cannot be kept, say so rather than leaving it to be
+	// inferred from a purge at the other end. From the POI's side an overrun is
+	// indistinguishable from a triggering function that has gone away — it will purge
+	// and report exactly that — so the element that can tell the difference is this one.
+	if elapsed := time.Since(started); elapsed > liKeepaliveInterval && r.reportCadenceMissed != nil {
+		r.reportCadenceMissed(elapsed)
 	}
 }
 
@@ -729,6 +815,25 @@ func sessionUPFs(sc *smfctx.SMContext) []upfSession {
 func TriggerCC(sc *smfctx.SMContext) {
 	if sub := active.Load(); sub != nil && sc != nil {
 		sub.triggerCC(sc)
+	}
+}
+
+// POIRestarted tells the CC Triggering Function that a triggered point of interception
+// has restarted, so the tasking this element believes it holds there is discarded and
+// subsequent establishments and scans re-install it. Silent no-op unless LI is
+// configured. nodeID is the UPF's PFCP node identifier as configured.
+func POIRestarted(nodeID string) {
+	sub := active.Load()
+	if sub == nil || sub.triggers == nil {
+		return
+	}
+	if n := sub.triggers.ForgetPOI(nodeID); n > 0 && sub.reporter != nil {
+		// NE-level and countable, naming no warrant: which interceptions were lost is
+		// the ADMF's to work out from its own provisioning, and this element cannot
+		// name them without disclosing tasking on a channel that must not carry it.
+		sub.reporter.NotifyAsync(x1.NEIssueReconcileFailed,
+			"a triggered point of interception restarted; the tasking this element believed it held "+
+				"there has been discarded and will be re-installed as sessions are established or scanned")
 	}
 }
 
@@ -1402,6 +1507,55 @@ func (r *triggerRegistry) takeForWarrantExcept(warrant types.XID, keep map[strin
 	return r.take(func(w, session, _ string) bool {
 		return w == string(warrant) && !keep[session]
 	})
+}
+
+// ForgetPOI discards this element's record of what a triggered point of interception
+// holds, because that point of interception has restarted and holds none of it.
+//
+// A triggered POI keeps its tasking in memory, so a restart takes all of it. This
+// element's record of what it installed survives, and every claim in that record now
+// describes tasking that does not exist. The planning path then finds each triple
+// already claimed and installs nothing — so the restarted POI holds no tasking, produces
+// no content, and discards the copies it is told to make as untasked, while this element
+// goes on reporting the interception as running. Nothing else corrects it: claims are
+// released by a withdrawal, and there is nothing left to withdraw.
+//
+// It is the mirror of the rule that a triggering function which cannot say what a POI
+// holds must stay silent and let the fail-safe act. There this element restarted; here
+// the POI did, and the conclusion is the same for the same reason — a claim that cannot
+// be true must not be treated as one.
+//
+// Dropping the claims also makes the liveness signal correct again, and that falls out
+// rather than needing its own step: keepaliveDue owes a signal for tasking this element
+// can name, so an endpoint it now names none for stops being kept alive. That is the
+// right answer — keeping a restarted POI alive on the strength of tasking that no longer
+// exists is what disables its own fail-safe.
+//
+// **What this does not do is restore the subscriber's sessions.** Those are lost on the
+// same path, which is the pre-existing `// TODO: Session cleanup required` beside the
+// caller and a larger problem than this one. What is in scope is that the interception
+// bookkeeping stops being the reason re-tasking cannot happen once that TODO is
+// addressed: after this, an establishment or a scan at the restarted POI installs the
+// trigger instead of skipping it as already claimed.
+func (r *triggerRegistry) ForgetPOI(nodeID string) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	forgotten := 0
+	for key := range r.installed {
+		_, _, keyNode, ok := parseTriggerKey(key)
+		if !ok || keyNode != nodeID {
+			continue
+		}
+		// Deleted outright rather than moved to pending: a pending withdrawal is a
+		// trigger this element is still trying to remove *from a POI that holds it*,
+		// and retrying against one that restarted would report a fault about tasking
+		// that is already gone.
+		delete(r.installed, key)
+		forgotten++
+	}
+
+	return forgotten
 }
 
 // take moves every installed trigger whose key matches into pending, and returns

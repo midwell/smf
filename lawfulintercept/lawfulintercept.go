@@ -382,7 +382,17 @@ func Init(cfg Config) error {
 	}
 	if len(cfg.UPFTriggers) > 0 {
 		var triggers *triggerRegistry
-		triggers, err = newTriggerRegistry(cfg, mat.ClientTLS(), sub.reportUnattributable)
+		triggers, err = newTriggerRegistry(cfg, mat.ClientTLS(), sub.reportUnattributable,
+			func(elapsed time.Duration) {
+				// NE-level: which point of interception was late is not the fault. The
+				// fault is that this element could not keep the cadence its POIs'
+				// fail-safe windows are chosen against, so any of them may purge live
+				// tasking and report that this element went silent.
+				sub.reporter.NotifyAsync(x1.NEIssueTriggerFaulty,
+					fmt.Sprintf("a keepalive round to the triggered points of interception took %s, "+
+						"longer than the interval it must keep; tasking may be purged at a point of "+
+						"interception this element is still answering for", elapsed.Round(time.Second)))
+			})
 		if err != nil {
 			// A CC-TF whose triggering configuration is ambiguous cannot task the POI
 			// it displaced, so content for sessions that UPF serves would be

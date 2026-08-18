@@ -107,6 +107,18 @@ func HandlePfcpHeartbeatResponse(msg *udp.Message) {
 		upf.UPFStatus = smf_context.NotAssociated
 		logger.PfcpLog.Warnf("PFCP Heartbeat Response, upf [%v] recovery timestamp changed, previous [%v], new [%v] ", upf.NodeID, upf.RecoveryTimeStamp, *rsp.RecoveryTimeStamp)
 
+		// Lawful Interception: this UPF restarted, so the LI_T3 triggers this element
+		// believes it installed there are gone with its memory. Discard the record, or
+		// the planning path finds every triple already claimed and installs nothing —
+		// the restarted UPF holding no tasking, discarding the copies it is told to
+		// make as untasked, while this element reports the interception as running.
+		//
+		// This does not address the TODO below, and is not a step toward it: the
+		// subscriber's PFCP sessions are lost on this path too, which is larger and
+		// separate. What it does is stop the interception bookkeeping from being the
+		// reason re-tasking cannot happen once that TODO is addressed.
+		lawfulintercept.POIRestarted(upf.NodeID.ResolveNodeIdToIp().String())
+
 		// TODO: Session cleanup required and updated to AMF/PCF
 		metrics.IncrementN4MsgStats(smf_context.SMF_Self().NfInstanceID, rsp.MessageTypeName(), "In", "Failure", "RecoveryTimeStamp_mismatch")
 	}

@@ -113,7 +113,7 @@ const wrongNE = "upf-2"
 // Construction only fails on an ambiguous configuration, which the tests that care
 // about that assert on explicitly.
 func mustRegistry(cfg Config) *triggerRegistry {
-	reg, err := newTriggerRegistry(cfg, nil, nil)
+	reg, err := newTriggerRegistry(cfg, nil, nil, nil)
 	if err != nil {
 		panic(err)
 	}
@@ -976,7 +976,7 @@ func TestTriggerRegistryRejectsAmbiguousNode(t *testing.T) {
 			{NodeID: "10.0.1.5", X1URL: "https://upf-1:8443/X1/NE", NEID: "upf-1"},
 			{NodeID: "10.0.1.5", X1URL: "https://upf-2:8443/X1/NE", NEID: "upf-2"},
 		},
-	}, nil, nil)
+	}, nil, nil, nil)
 	if err == nil {
 		t.Error("an ambiguous upfTriggers configuration was accepted; one UPF's endpoint " +
 			"silently replaces another's and its content cannot be attributed")
@@ -3087,5 +3087,47 @@ func TestALabelChangeArrivingWithATargetChangeStillReachesTheTrigger(t *testing.
 		t.Fatalf("modification carried productID %v, want [%s]; content for a session the "+
 			"warrant still covers keeps the superseded label while this element's own "+
 			"records carry the new one", modified, newLabel)
+	}
+}
+
+// TestTwoTriggeringEndpointsMayNotShareAnElementIdentifier is a deployment guard, and
+// the only place the collision is visible at all.
+//
+// Every UPF serving one session is deliberately given the *same* delivery identifier and
+// correlation value — that is what joins one warrant's content to its signalling and to
+// the other UPF's content. TS 103 221-2 clause 5.3.9 then counts sequence numbers within
+// a context formed from those two plus the identifiers that follow from ne_id, so ne_id
+// is the only thing separating two points of interception. Two that share it number one
+// context from zero independently.
+//
+// Neither element can detect that: each is numbering its own product correctly. What the
+// mediation function receives is a single sequence with duplicated numbers and apparent
+// gaps, for a warrant whose product is otherwise entirely correct — and gaps are how loss
+// is made visible on this interface, so the collision forges the signal an agency uses to
+// decide whether it has everything. Under ULCL, where a branching point and a session
+// anchor both serve one session, this is the ordinary multi-UPF case.
+func TestTwoTriggeringEndpointsMayNotShareAnElementIdentifier(t *testing.T) {
+	shared := Config{
+		NEID: "smf-1", MDF3: "192.0.2.1:42069",
+		UPFTriggers: []UPFTrigger{
+			{NodeID: "10.0.1.5", X1URL: "https://upf-a:8443/X1/NE", NEID: "upf-1"},
+			{NodeID: "10.0.1.6", X1URL: "https://upf-b:8443/X1/NE", NEID: "upf-1"},
+		},
+	}
+	if _, err := newTriggerRegistry(shared, nil, nil, nil); err == nil {
+		t.Error("a configuration giving two points of interception one element identifier was accepted; " +
+			"their sequence numbering collides at the mediation function and neither element can see it")
+	} else if !strings.Contains(err.Error(), "upf-1") {
+		t.Errorf("the refusal does not name the identifier at fault: %v", err)
+	}
+
+	// Distinct identifiers are the ordinary multi-UPF case and must still build.
+	distinct := shared
+	distinct.UPFTriggers = []UPFTrigger{
+		{NodeID: "10.0.1.5", X1URL: "https://upf-a:8443/X1/NE", NEID: "upf-1"},
+		{NodeID: "10.0.1.6", X1URL: "https://upf-b:8443/X1/NE", NEID: "upf-2"},
+	}
+	if _, err := newTriggerRegistry(distinct, nil, nil, nil); err != nil {
+		t.Errorf("two properly distinguished points of interception were refused: %v", err)
 	}
 }
