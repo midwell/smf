@@ -108,7 +108,12 @@ func scanFixture(t *testing.T, task types.InterceptTask, sessions int) (*subsyst
 		// by the scan as still establishing rather than reported.
 		node := smfctx.NewDataPathNode()
 		node.UPF = &smfctx.UPF{NodeID: upfNode("10.0.1.5")}
-		node.UpLinkTunnel.PDR["default"] = &smfctx.PDR{FAR: &smfctx.FAR{}}
+		// ApplyAction.Forw, because forEachForwardingFAR — which is what applies and
+		// clears duplication — only visits forwarding FARs. A FAR without it is
+		// invisible to every part of this path.
+		node.UpLinkTunnel.PDR["default"] = &smfctx.PDR{
+			FAR: &smfctx.FAR{ApplyAction: smfctx.ApplyAction{Forw: true}},
+		}
 		sc.Tunnel = &smfctx.UPTunnel{DataPathPool: smfctx.DataPathPool{
 			1: &smfctx.DataPath{FirstDPNode: node, IsDefaultPath: true},
 		}}
@@ -265,4 +270,74 @@ func TestAModificationThatAddsIRIBeginsIt(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestAWithdrawalStopsDuplicationEvenThoughTheTaskIsGone is the regression this
+// change's own revalidation introduced, and it is the one a cluster run caught rather
+// than a unit test.
+//
+// A deactivation scan exists to take duplication down, and it runs *because* the task
+// was removed from the store — removal is what triggers the callback. Applying the
+// "product is delivered only under authority the element currently holds" check to it
+// therefore finds the task gone and returns before clearing anything: the datapath keeps
+// duplicating for a warrant that no longer exists, which is interception outliving its
+// authority — the failure the rule is about, reached by applying the rule to the path
+// that enforces it.
+//
+// **Driven through reportDeactivation, not through scanSessions.** The first version of
+// this test called the scan directly and passed the flag itself, so flipping the
+// production call site back to the defect left it green: it asserted that a function
+// does what its argument says, one layer below the decision that was wrong. Every other
+// scan test exercised activation and modification, where the task *is* in the store,
+// which is why the whole suite passed while the cluster reported "the datapath stops
+// duplicating once the warrant is withdrawn" and it did not.
+func TestAWithdrawalStopsDuplicationEvenThoughTheTaskIsGone(t *testing.T) {
+	task := types.InterceptTask{
+		XID:      "11111111-1111-4111-8111-111111111111",
+		Targets:  []types.TargetIdentifier{{Type: types.TargetSUPI, Value: "262019876543210"}},
+		Products: []types.ProductType{types.ProductCC},
+		State:    types.TaskActive,
+	}
+
+	sub, st, _ := scanFixture(t, task, 1)
+
+	// The session is being duplicated, as a tasked one is.
+	var duplicating []*smfctx.FAR
+	smfctx.RangeSMContexts(func(sc *smfctx.SMContext) bool {
+		forEachForwardingFAR(sc, func(far *smfctx.FAR) {
+			setDuplication(far, true)
+			duplicating = append(duplicating, far)
+		})
+
+		return true
+	})
+	if len(duplicating) == 0 {
+		t.Fatal("no forwarding FAR to duplicate on; this test would assert nothing")
+	}
+
+	// Exactly the state the callback runs in: the store no longer holds the task,
+	// because its removal is what caused this.
+	if !st.Deactivate(task.XID) {
+		t.Fatal("Deactivate failed")
+	}
+
+	sub.reportDeactivation(task)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		stillOn := 0
+		for _, far := range duplicating {
+			if far.ApplyAction.Dupl {
+				stillOn++
+			}
+		}
+		if stillOn == 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	t.Error("duplication is still set on a withdrawn warrant's session: the datapath goes on " +
+		"copying a subject's traffic under authority that has been taken away, and the only " +
+		"thing that would have stopped it returned early because the task was already gone")
 }

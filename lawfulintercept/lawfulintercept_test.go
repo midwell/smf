@@ -1241,7 +1241,7 @@ func TestWarrantActivatingDuringEstablishmentIsAppliedOnArrival(t *testing.T) {
 	}
 
 	done := make(chan struct{})
-	sub.scanSessions(task, func(*smfctx.SMContext) any { close(done); return nil })
+	sub.scanSessions(task, true, func(*smfctx.SMContext) any { close(done); return nil })
 	select {
 	case <-done:
 		t.Fatal("the X1 scan acted on a session whose PFCP session does not exist yet — " +
@@ -1381,7 +1381,7 @@ func TestConcurrentEstablishmentAndTasking(t *testing.T) {
 
 	// The X1 path: repeated tasking scans, each taking SMLock per session.
 	for range 200 {
-		sub.scanSessions(task, func(s *smfctx.SMContext) any {
+		sub.scanSessions(task, true, func(s *smfctx.SMContext) any {
 			sub.applyCC(s)
 			return nil
 		})

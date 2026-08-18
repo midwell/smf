@@ -763,7 +763,10 @@ func (s *subsystem) modifyInterception(prev, next types.InterceptTask) {
 	// session reached by either scan is evaluated the same way. Only sessions the
 	// old task covered need the extra visit — the new task's own scan covers its.
 	if wantedCC {
-		s.scanSessions(prev, func(sc *smfctx.SMContext) any {
+		// Not under authority: this re-evaluates duplication for sessions the *previous*
+		// task covered, against the task set as it now stands. It produces no records,
+		// and prev is the task being replaced.
+		s.scanSessions(prev, false, func(sc *smfctx.SMContext) any {
 			if s.applyCC(sc) {
 				s.modifySession(sc)
 			}
@@ -786,7 +789,7 @@ func (s *subsystem) modifyInterception(prev, next types.InterceptTask) {
 // is unaffected, since that re-derives from the task set either way.
 func (s *subsystem) reportStartOfInterception(task types.InterceptTask, already *types.InterceptTask) {
 	wantIRI := task.WantsProduct(types.ProductIRI)
-	s.scanSessions(task, func(sc *smfctx.SMContext) any {
+	s.scanSessions(task, true, func(sc *smfctx.SMContext) any {
 		var event any
 		// uEEndpoint is mandatory in this record, and an empty list would assert
 		// the session has no endpoint address. A session with no address assigned
@@ -827,7 +830,10 @@ func (s *subsystem) reportDeactivation(task types.InterceptTask) {
 	if !task.WantsProduct(types.ProductCC) {
 		return
 	}
-	s.scanSessions(task, func(sc *smfctx.SMContext) any {
+	// Not under authority, and this is the call that made the distinction necessary: a
+	// deactivation runs *because* the task was removed, so requiring it to still be in
+	// the store would leave every withdrawn warrant's duplication running.
+	s.scanSessions(task, false, func(sc *smfctx.SMContext) any {
 		if s.applyCC(sc) {
 			s.modifySession(sc)
 		}
@@ -858,7 +864,19 @@ func (s *subsystem) reportDeactivation(task types.InterceptTask) {
 // What must not move is the instant. It is the activation's, not the scan's, so it is
 // still taken here (design D5); reading it inside the goroutine would date every
 // record by when this element got round to the session.
-func (s *subsystem) scanSessions(task types.InterceptTask, fn func(*smfctx.SMContext) any) {
+// underAuthority says whether this scan *produces product*, and therefore whether the
+// warrant has to still authorise each session at the moment it is reached.
+//
+// **It is not true for every scan, and getting that wrong stops a withdrawal.** An
+// activation or a modification applies tasking to sessions that already exist, and its
+// records are only licensed by a warrant the element currently holds — so it re-reads
+// the store per session. A *deactivation* scan is the opposite operation: it exists to
+// take duplication down, and it runs after the task has been removed from the store,
+// because removal is what triggers it. Revalidating there finds the task gone and
+// returns before clearing anything, leaving the datapath duplicating for a warrant that
+// no longer exists. That is interception outliving its authority — the failure this
+// whole rule is about — reached by applying the rule to the path that enforces it.
+func (s *subsystem) scanSessions(task types.InterceptTask, underAuthority bool, fn func(*smfctx.SMContext) any) {
 	activated := time.Now()
 	go func() {
 		var matched []*smfctx.SMContext
@@ -886,11 +904,13 @@ func (s *subsystem) scanSessions(task types.InterceptTask, fn func(*smfctx.SMCon
 			//
 			// Per session rather than per scan: a withdrawal landing mid-scan must stop
 			// the remainder, not merely the next one.
-			current, held := s.store.Get(task.XID)
-			if !held {
-				return
+			if underAuthority {
+				current, held := s.store.Get(task.XID)
+				if !held {
+					return
+				}
+				task = current
 			}
-			task = current
 
 			sc.SMLock.Lock()
 			corr := correlationOf(sc)   // read under the lock (reads sc.PFCPContext)
