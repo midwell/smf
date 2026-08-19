@@ -1220,6 +1220,18 @@ func (s *subsystem) deliverIRI(tasks []types.InterceptTask, corr [8]byte, subjec
 	}
 	payload, err := iri.EncodeXIRI(s.iriCtx, event)
 	if err != nil {
+		// **A record this element could not encode is product it produced and did not
+		// deliver, so it is reported.** It used to return silently, which was defensible
+		// while the only way to fail was an internal codec error — but the encoder now also
+		// refuses a record whose values violate the constraints its own definition carries. A
+		// conformant mediation function would discard such a record anyway; what must not
+		// happen is that neither side knows.
+		//
+		// NE-level and naming no target or warrant, and off this goroutine: this runs on the
+		// PDU-session signalling path with the session's lock held.
+		s.reporter.NotifyAsync(x1.NEIssueX2DeliveryLost,
+			"a record could not be encoded and was not delivered")
+
 		return
 	}
 	for _, t := range tasks {
