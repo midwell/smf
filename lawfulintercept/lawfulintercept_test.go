@@ -486,7 +486,10 @@ func subWith(t *testing.T, tasks ...types.InterceptTask) *subsystem {
 			t.Fatalf("activate %+v", task)
 		}
 	}
-	return &subsystem{store: st}
+	sub := &subsystem{store: st}
+	waitForScans(t, sub)
+
+	return sub
 }
 
 // TestApplyCCActivation covers the mid-session CC switch-on: a CC task

@@ -148,6 +148,48 @@ type triggerRegistry struct {
 	// this registry's own refresh loop rather than the caller's.
 	lookup func(ctx context.Context, host string) (string, error)
 
+	// stop, stopOnce and wg are the registry's lifecycle. Its background work — the
+	// address refresh, the keepalive cadence, and the per-warrant propagations it
+	// dispatches — is started by Start and ended by Stop, not by the constructor.
+	//
+	// Two reasons, one in production and one in test. In production, construction
+	// happens before the X1 listener is bound and before this subsystem is committed
+	// to running; an initialisation that fails after this point must leave nothing
+	// behind, and it used to leave a resolver and a keepalive loop running for the
+	// life of the process, one set per attempt. In test, a registry built to exercise
+	// planning or matching should start no background work at all, and a goroutine
+	// outliving its test fails the next one.
+	//
+	// stop is nil on a registry built as a literal, which several tests do; a nil
+	// channel never fires in a select, so those loops are simply not stoppable, and
+	// Stop tolerates it rather than closing nil.
+	stop     chan struct{}
+	stopOnce sync.Once
+	// wg counts everything this registry owns — the two loops and each per-warrant
+	// propagation runner — so Stop can wait for all of it.
+	wg sync.WaitGroup
+
+	// serialMu guards the per-warrant dispatch queues. A separate lock from mu
+	// because dispatch happens with the registry already planned and must not be
+	// ordered against registry reads.
+	serialMu sync.Mutex
+	// stopped refuses new dispatch after Stop, which is also what makes wg.Add safe
+	// against the wg.Wait inside Stop.
+	stopped bool
+	// queued and draining are one FIFO queue of outbound propagations per warrant,
+	// and whether a runner is currently draining it.
+	//
+	// **Ordering is the correctness property here, not fairness.** Two ModifyTasks
+	// for one warrant dispatched on bare goroutines complete in either order, and both
+	// succeed — so a POI can end up labelling content with a delivery identifier the
+	// ADMF has already superseded, with both exchanges acknowledged and nothing
+	// anywhere recording that the element applied them backwards. Installs need no
+	// ordering (plan skips a claimed triple, so two cannot overwrite each other) and
+	// withdrawals own their own retry loop keyed by the pending entry; it is the
+	// relabel that is last-writer-wins.
+	queued   map[types.XID][]func()
+	draining map[types.XID]bool
+
 	mu sync.Mutex
 	// installed maps a (warrant, session, UPF) triple to the trigger this CC-TF
 	// installed for it. The trigger's XID is the CC-TF's own — the warrant's travels
@@ -251,6 +293,9 @@ func newTriggerRegistry(
 ) (*triggerRegistry, error) {
 	reg := &triggerRegistry{
 		mdf3:                 cfg.MDF3,
+		stop:                 make(chan struct{}),
+		queued:               make(map[types.XID][]func()),
+		draining:             make(map[types.XID]bool),
 		endpoints:            make(map[string]*upfEndpoint, len(cfg.UPFTriggers)),
 		resolved:             make(map[string]string, len(cfg.UPFTriggers)),
 		installed:            make(map[string]installedTrigger),
@@ -328,10 +373,109 @@ func newTriggerRegistry(
 	// resolved at all.
 	reg.seedResolvedLiterals()
 
-	go reg.resolveLoop()
-	go reg.keepalive()
+	// The loops are NOT started here. See the lifecycle fields: a registry is built
+	// before the caller knows whether the subsystem will run at all, and an
+	// initialisation that fails after this point has to leave nothing behind. Start
+	// is called once the subsystem is committed.
 
 	return reg, nil
+}
+
+// Start begins the registry's background work: the address index refresh and the
+// keepalive cadence to every triggered point of interception.
+//
+// Called once, by the initialisation that has decided this subsystem is running.
+// Everything it starts is counted in wg, so Stop can prove it has ended.
+func (r *triggerRegistry) Start() {
+	r.wg.Add(2)
+	go func() {
+		defer r.wg.Done()
+		r.resolveLoop()
+	}()
+	go func() {
+		defer r.wg.Done()
+		r.keepalive()
+	}()
+}
+
+// Stop ends the registry's background work and waits for it.
+//
+// It refuses further per-warrant dispatch first — which is also what makes the
+// wg.Add in dispatchForWarrant safe against the wg.Wait here — then releases the
+// loops and waits for everything in flight. A propagation already running is
+// bounded by the X1 requester's own timeout, so this returns.
+//
+// Idempotent, and safe on a registry whose loops were never started.
+func (r *triggerRegistry) Stop() {
+	r.serialMu.Lock()
+	r.stopped = true
+	r.serialMu.Unlock()
+
+	if r.stop != nil {
+		r.stopOnce.Do(func() { close(r.stop) })
+	}
+	r.wg.Wait()
+}
+
+// dispatchForWarrant runs job off the caller's goroutine — the caller is the X1
+// request goroutine, and these are synchronous HTTPS round trips — and in dispatch
+// order against every other job dispatched for the same warrant.
+//
+// One runner per warrant with work outstanding, so warrants do not serialise
+// against each other. See the queued/draining fields for why the ordering is a
+// correctness property.
+func (r *triggerRegistry) dispatchForWarrant(warrant types.XID, job func()) {
+	r.serialMu.Lock()
+	if r.stopped {
+		// The subsystem is going away. A propagation that cannot be ordered against
+		// the ones already queued is worse than one not sent: the POI keeps the label
+		// it has, which is a task-level fault the LIPF is told about by the caller.
+		r.serialMu.Unlock()
+
+		return
+	}
+	if r.queued == nil {
+		r.queued = make(map[types.XID][]func())
+	}
+	if r.draining == nil {
+		r.draining = make(map[types.XID]bool)
+	}
+	r.queued[warrant] = append(r.queued[warrant], job)
+	if r.draining[warrant] {
+		r.serialMu.Unlock()
+
+		return
+	}
+	r.draining[warrant] = true
+	r.wg.Add(1)
+	r.serialMu.Unlock()
+
+	go func() {
+		defer r.wg.Done()
+		r.drainWarrant(warrant)
+	}()
+}
+
+// drainWarrant runs one warrant's queued propagations in order until none is left.
+// A job dispatched while this is running joins the queue rather than starting a
+// second runner, which is what keeps the order.
+func (r *triggerRegistry) drainWarrant(warrant types.XID) {
+	for {
+		r.serialMu.Lock()
+		queue := r.queued[warrant]
+		if len(queue) == 0 {
+			delete(r.queued, warrant)
+			delete(r.draining, warrant)
+			r.serialMu.Unlock()
+
+			return
+		}
+		job := queue[0]
+		r.queued[warrant] = queue[1:]
+		r.serialMu.Unlock()
+
+		job()
+	}
 }
 
 // matchEndpoint finds the triggering endpoint for the UPF serving a session.
@@ -493,8 +637,13 @@ func (r *triggerRegistry) resolveLoop() {
 	ticker := time.NewTicker(endpointRefreshInterval)
 	defer ticker.Stop()
 
-	for range ticker.C {
-		r.refreshResolved()
+	for {
+		select {
+		case <-r.stop:
+			return
+		case <-ticker.C:
+			r.refreshResolved()
+		}
 	}
 }
 
@@ -521,8 +670,13 @@ func (r *triggerRegistry) keepalive() {
 	ticker := time.NewTicker(liKeepaliveInterval)
 	defer ticker.Stop()
 
-	for range ticker.C {
-		r.keepaliveRound()
+	for {
+		select {
+		case <-r.stop:
+			return
+		case <-ticker.C:
+			r.keepaliveRound()
+		}
 	}
 }
 
@@ -1037,13 +1191,39 @@ func (s *subsystem) installTriggers(planned []plannedTrigger) {
 		// runs only at startup, and the POI's fail-safe only fires once this SMF
 		// stops answering it, so nothing would ever take it down. Withdraw it here.
 		if !s.triggers.stillHolds(p.key, p.trigger.XID) {
-			// Best-effort as to whether the withdrawal lands — the POI's fail-safe is
-			// the last resort — but an answer that cannot be bound to it is reported
-			// all the same, since that says nothing about whether the POI accepted the
-			// withdrawal and everything about who answered.
-			if err := p.endpoint.req.DeactivateTask(p.trigger.XID); err != nil {
-				s.reportUnattributable(err)
+			// **Durably, not best-effort.** This was one DeactivateTask whose failure
+			// left the trigger installed and untracked, on the reasoning that the POI's
+			// fail-safe is the last resort — and the requirement beside this one records
+			// why that fail-safe cannot help here: the element's *other* tasking at this
+			// POI keeps the keepalive relationship alive, so the POI never concludes its
+			// triggering function has gone and never purges. The single attempt was
+			// relying on a mechanism this project has documented as unable to reclaim
+			// exactly this orphan.
+			//
+			// So it goes into the same pending-removal state every other withdrawal
+			// uses, and the retrying deactivate path owns it until the POI says the task
+			// is gone. takeOrphan is the shape: this trigger's claim is no longer in the
+			// registry under its key — that is what stillHolds just reported — so the
+			// pending entry gets a synthetic key, as reconciliation's orphans do.
+			//
+			// Exactly one party withdraws, as before: stillHolds reports true while a
+			// withdrawal of this XID is pending, so a session release that raced this
+			// activation is already owned by its own retry loop and this branch does not
+			// run. What reaches here is the trigger that is in neither map — released
+			// without a withdrawal, or displaced by a newer claim under the same key —
+			// which is precisely the orphan nothing else can name.
+			_, _, nodeID, ok := parseTriggerKey(p.key)
+			if !ok {
+				// Unaddressable, so no withdrawal can be sent anywhere. Every key this
+				// element builds parses; reported rather than looped on forever.
+				s.reportTaskIssue(p.warrant,
+					"a content trigger installed after its own withdrawal cannot be addressed for removal")
+
+				continue
 			}
+			// On its own goroutine: the retry loop runs until the POI acknowledges, and
+			// the triggers behind this one in the batch must not wait for it.
+			go s.deactivate([]withdrawal{s.triggers.takeOrphan(nodeID, p.trigger.XID)})
 		}
 	}
 }
@@ -1887,12 +2067,19 @@ func (s *subsystem) relabelWarrant(prev, next types.InterceptTask) {
 		return
 	}
 
-	go s.modifyTriggers(planned)
+	// Ordered per warrant rather than dispatched on a bare goroutine: two
+	// modifications in quick succession must leave the POI holding the second one's
+	// values, and on bare goroutines they complete in either order with both
+	// exchanges acknowledged.
+	s.triggers.dispatchForWarrant(next.XID, func() { s.modifyTriggers(planned) })
 }
 
-// modifyTriggers sends the ModifyTask for each relabelled trigger, off the caller's
-// goroutine as installTriggers is, and for the same reason: these are synchronous
-// HTTPS round trips and the caller is the X1 request goroutine.
+// modifyTriggers sends the ModifyTask for each relabelled trigger.
+//
+// Off the caller's goroutine as installTriggers is, and for the same reason — these
+// are synchronous HTTPS round trips and the caller is the X1 request goroutine —
+// but through the registry's per-warrant queue rather than a bare go, because two
+// relabels of one warrant must reach the POI in the order the ADMF sent them.
 func (s *subsystem) modifyTriggers(planned []plannedTrigger) {
 	for _, p := range planned {
 		dids, err := s.ensureDestinations(p.endpoint, p.addresses)

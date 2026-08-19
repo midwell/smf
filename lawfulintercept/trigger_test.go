@@ -164,6 +164,18 @@ type fakePOI struct {
 	// answers: 2020 says the XID is not held, which for a withdrawal is the
 	// outcome, not a failure.
 	refuseCode int
+	// refuseOn refuses only the requests whose body contains it, leaving the rest of a
+	// sequence working. refuse refuses everything, which cannot express "the activation
+	// lands and the withdrawal that follows it does not".
+	refuseOn string
+	// delayOn and delay hold one class of request back before it is answered, so a
+	// test can make one exchange of a sequence complete after a later one. It is
+	// what distinguishes "these two requests were sent in order" from "these two
+	// requests happened to finish in order", which is the whole subject of the
+	// per-warrant ordering: two relabels dispatched on bare goroutines both succeed,
+	// and the POI is left holding whichever finished last.
+	delayOn string
+	delay   func()
 }
 
 // poiEnvelope builds the response envelope a conformant NE returns: the response
@@ -223,6 +235,9 @@ func newFakePOI(t *testing.T) *fakePOI {
 		p.bodies = append(p.bodies, string(body))
 		p.requests++
 		refuse := p.refuse
+		if p.refuseOn != "" && strings.Contains(string(body), p.refuseOn) {
+			refuse = true
+		}
 		refuseCode := p.refuseCode
 		if refuseCode == 0 {
 			refuseCode = 1000
@@ -235,6 +250,13 @@ func newFakePOI(t *testing.T) *fakePOI {
 				refuse = true
 			}
 		}
+		var delay func()
+		if p.delayOn != "" && strings.Contains(string(body), p.delayOn) {
+			delay = p.delay
+			// One request only: what is being arranged is an out-of-order completion,
+			// and holding every request back would just slow the sequence down.
+			p.delayOn = ""
+		}
 		hang := false
 		if p.hangOn != "" && strings.Contains(string(body), p.hangOn) {
 			hang = true
@@ -246,6 +268,12 @@ func newFakePOI(t *testing.T) *fakePOI {
 			p.refuse = true
 		}
 		p.mu.Unlock()
+
+		// Outside the lock: whatever the test does in here, the POI must still be able
+		// to answer the requests that overtake this one.
+		if delay != nil {
+			delay()
+		}
 
 		if hang {
 			// Never answer. The requester's own deadline is what ends this exchange,
@@ -358,7 +386,9 @@ func (p *fakePOI) countMessages(msgType string) int {
 
 // triggerSubsystem builds a subsystem whose only configured capability is CC
 // triggering, pointed at poi.
-func triggerSubsystem(poi *fakePOI) *subsystem {
+func triggerSubsystem(t *testing.T, poi *fakePOI) *subsystem {
+	t.Helper()
+
 	cfg := Config{
 		NEID: "smf-1",
 		MDF3: "192.0.2.1:42069",
@@ -371,11 +401,32 @@ func triggerSubsystem(poi *fakePOI) *subsystem {
 	// consult it — matchingTasks, and the scans' revalidation before each delivery —
 	// are reached from the trigger paths these tests drive. A test that wants a scan
 	// to run activates its task in here.
-	return &subsystem{
+	s := &subsystem{
 		neID:     "smf-1",
 		triggers: mustRegistry(cfg),
 		store:    store.New(),
 	}
+	waitForScans(t, s)
+
+	return s
+}
+
+// waitForScans joins everything a subsystem dispatched before the test that built it
+// returns: its scan goroutines, and its trigger registry's own background work.
+//
+// A goroutine that outlives its test does not merely leak. It reaches the sessions
+// and the fake POI the finished test built, so what -race reports is a race in
+// whichever test happens to be running next — a rotating victim, which is the hardest
+// kind of failure to attribute. The suite has to be hermetic, not merely green.
+func waitForScans(t *testing.T, s *subsystem) {
+	t.Helper()
+
+	t.Cleanup(func() {
+		s.scans.Wait()
+		if s.triggers != nil {
+			s.triggers.Stop()
+		}
+	})
 }
 
 // TestInstallTriggersSendsWarrantIdentity is the core of the triggering interface: the trigger a
@@ -384,7 +435,7 @@ func triggerSubsystem(poi *fakePOI) *subsystem {
 // destination it references.
 func TestInstallTriggersSendsWarrantIdentity(t *testing.T) {
 	poi := newFakePOI(t)
-	s := triggerSubsystem(poi)
+	s := triggerSubsystem(t, poi)
 
 	warrant := types.InterceptTask{
 		XID:      "11111111-1111-4111-8111-111111111111",
@@ -438,7 +489,7 @@ func TestInstallTriggersSendsWarrantIdentity(t *testing.T) {
 // session would make it deliver every packet twice.
 func TestInstallTriggersIsIdempotent(t *testing.T) {
 	poi := newFakePOI(t)
-	s := triggerSubsystem(poi)
+	s := triggerSubsystem(t, poi)
 
 	warrant := types.InterceptTask{
 		XID:      "11111111-1111-4111-8111-111111111111",
@@ -508,7 +559,7 @@ func TestInstallTriggersReportsRefusal(t *testing.T) {
 	poi := newFakePOI(t)
 	poi.refuse = true
 
-	s := triggerSubsystem(poi)
+	s := triggerSubsystem(t, poi)
 	rec := &recordingTaskReporter{}
 	s.taskReporter = rec
 
@@ -542,7 +593,7 @@ func TestInstallTriggersRetriesAfterFailure(t *testing.T) {
 	poi := newFakePOI(t)
 	poi.refuse = true
 
-	s := triggerSubsystem(poi)
+	s := triggerSubsystem(t, poi)
 	s.taskReporter = &recordingTaskReporter{}
 
 	warrant := types.InterceptTask{
@@ -573,7 +624,7 @@ func TestInstallTriggersRetriesAfterFailure(t *testing.T) {
 // authorised and will produce nothing, so it must not pass silently.
 func TestInstallTriggersReportsMissingEndpoint(t *testing.T) {
 	poi := newFakePOI(t)
-	s := triggerSubsystem(poi)
+	s := triggerSubsystem(t, poi)
 	rec := &recordingTaskReporter{}
 	s.taskReporter = rec
 
@@ -669,7 +720,7 @@ func TestTakeForSessionAndWarrant(t *testing.T) {
 // discarded every copy while we were told interception was running.
 func TestInstallTriggersReprovisionsAfterRestart(t *testing.T) {
 	poi := newFakePOI(t)
-	s := triggerSubsystem(poi)
+	s := triggerSubsystem(t, poi)
 	s.taskReporter = &recordingTaskReporter{}
 
 	warrant := types.InterceptTask{
@@ -716,7 +767,7 @@ func TestReconcileWithdrawsTaskingFromAPreviousLife(t *testing.T) {
 	poi.holds = []string{"aaaaaaaa-1111-4111-8111-111111111111", "bbbbbbbb-2222-4222-8222-222222222222"}
 	poi.mu.Unlock()
 
-	s := triggerSubsystem(poi)
+	s := triggerSubsystem(t, poi)
 	s.taskReporter = &recordingTaskReporter{}
 
 	s.reconcileOne()
@@ -732,7 +783,7 @@ func TestReconcileWithdrawsTaskingFromAPreviousLife(t *testing.T) {
 // establishing at that moment must not have its brand-new trigger cleaned up.
 func TestReconcileLeavesThisProcesssOwnTasking(t *testing.T) {
 	poi := newFakePOI(t)
-	s := triggerSubsystem(poi)
+	s := triggerSubsystem(t, poi)
 	s.taskReporter = &recordingTaskReporter{}
 
 	warrant := types.InterceptTask{
@@ -808,7 +859,7 @@ func (s *subsystem) installFor(ref string, tasks []types.InterceptTask, upfs []u
 // which is the point — two would each read an answer meant for the other.
 func TestTriggerInstalledAfterReleaseIsWithdrawn(t *testing.T) {
 	poi := newFakePOI(t)
-	s := triggerSubsystem(poi)
+	s := triggerSubsystem(t, poi)
 
 	warrant := types.InterceptTask{
 		XID:      "11111111-1111-4111-8111-111111111111",
@@ -855,7 +906,7 @@ func TestTriggerInstalledAfterReleaseIsWithdrawn(t *testing.T) {
 // the CC-TF back here.
 func TestTriggerNotInstalledBeforeCorrelationExists(t *testing.T) {
 	poi := newFakePOI(t)
-	s := triggerSubsystem(poi)
+	s := triggerSubsystem(t, poi)
 	rec := &recordingTaskReporter{}
 	s.taskReporter = rec
 
@@ -1036,7 +1087,7 @@ func TestReconcileReportsATriggerThePOISaysIsNotRunning(t *testing.T) {
 	defer admf.Close()
 
 	poi := newFakePOI(t)
-	s := triggerSubsystem(poi)
+	s := triggerSubsystem(t, poi)
 	s.taskReporter = &recordingTaskReporter{}
 	s.reporter = x1.NewReporter(admf.URL, "admf", "smf", nil)
 
@@ -1128,7 +1179,7 @@ func installOneTrigger(t *testing.T, s *subsystem) (warrant types.InterceptTask,
 // mediation function received well-formed, correctly attributed product.
 func TestWithdrawnWarrantIsStillTrackedWhenThePOIRefuses(t *testing.T) {
 	poi := newFakePOI(t)
-	s := triggerSubsystem(poi)
+	s := triggerSubsystem(t, poi)
 	s.taskReporter = &recordingTaskReporter{}
 
 	warrant, trigger := installOneTrigger(t, s)
@@ -1186,7 +1237,7 @@ func TestWithdrawnWarrantIsStillTrackedWhenThePOIRefuses(t *testing.T) {
 // change's defect arriving later.
 func TestWithdrawalRetriesOnBackoff(t *testing.T) {
 	poi := newFakePOI(t)
-	s := triggerSubsystem(poi)
+	s := triggerSubsystem(t, poi)
 	s.taskReporter = &recordingTaskReporter{}
 
 	warrant, _ := installOneTrigger(t, s)
@@ -1249,7 +1300,7 @@ func TestWithdrawalFailureAndStuckAreDistinctReports(t *testing.T) {
 	defer admf.Close()
 
 	poi := newFakePOI(t)
-	s := triggerSubsystem(poi)
+	s := triggerSubsystem(t, poi)
 	s.taskReporter = &recordingTaskReporter{}
 	s.reporter = x1.NewReporter(admf.URL, "admf", "smf", nil)
 
@@ -1311,7 +1362,7 @@ func TestWithdrawalFailureAndStuckAreDistinctReports(t *testing.T) {
 // answers "mine, and on its way out", which is what keeps reconciliation off it.
 func TestReconcileLeavesAWithdrawalInFlightAlone(t *testing.T) {
 	poi := newFakePOI(t)
-	s := triggerSubsystem(poi)
+	s := triggerSubsystem(t, poi)
 	s.taskReporter = &recordingTaskReporter{}
 
 	warrant, trigger := installOneTrigger(t, s)
@@ -1338,7 +1389,7 @@ func TestReconcileLeavesAWithdrawalInFlightAlone(t *testing.T) {
 // that the function responsible for it was alive and well.
 func TestKeepalivesFollowTaskingRatherThanConfiguration(t *testing.T) {
 	poi := newFakePOI(t)
-	s := triggerSubsystem(poi)
+	s := triggerSubsystem(t, poi)
 	s.taskReporter = &recordingTaskReporter{}
 	endpoint := s.triggers.endpoints["10.0.1.5"]
 
@@ -1379,7 +1430,7 @@ func TestKeepalivesFollowTaskingRatherThanConfiguration(t *testing.T) {
 // "interception stops", which is the direction a fail-safe must fail in.
 func TestKeepalivesWaitForReconciliation(t *testing.T) {
 	poi := newFakePOI(t)
-	s := triggerSubsystem(poi)
+	s := triggerSubsystem(t, poi)
 	s.taskReporter = &recordingTaskReporter{}
 	endpoint := s.triggers.endpoints["10.0.1.5"]
 
@@ -1408,7 +1459,7 @@ func TestReconcileRetriesUntilThePOIAnswers(t *testing.T) {
 	poi.holds = []string{"aaaaaaaa-1111-4111-8111-111111111111"}
 	poi.mu.Unlock()
 
-	s := triggerSubsystem(poi)
+	s := triggerSubsystem(t, poi)
 	s.taskReporter = &recordingTaskReporter{}
 	endpoint := s.triggers.endpoints["10.0.1.5"]
 
@@ -1452,7 +1503,7 @@ func TestReconcileWithdrawalIsRetriedLikeAnyOther(t *testing.T) {
 	poi.refuse = true // GetAllDetails still answers; DeactivateTask does not
 	poi.mu.Unlock()
 
-	s := triggerSubsystem(poi)
+	s := triggerSubsystem(t, poi)
 	s.taskReporter = &recordingTaskReporter{}
 
 	attempts := 0
@@ -1486,7 +1537,7 @@ func TestReconcileWithdrawalIsRetriedLikeAnyOther(t *testing.T) {
 // endpoint's last task was the one that failed to withdraw.
 func TestFailSafeCannotReclaimAnOrphanBesideLiveTasking(t *testing.T) {
 	poi := newFakePOI(t)
-	s := triggerSubsystem(poi)
+	s := triggerSubsystem(t, poi)
 	s.taskReporter = &recordingTaskReporter{}
 	endpoint := s.triggers.endpoints["10.0.1.5"]
 	endpoint.markReconciled()
@@ -1535,7 +1586,7 @@ func TestRetargetDoesNotReapTheTriggerItInstalled(t *testing.T) {
 
 	for range 200 {
 		poi := newFakePOI(t)
-		s := triggerSubsystem(poi)
+		s := triggerSubsystem(t, poi)
 		s.taskReporter = &recordingTaskReporter{}
 		task := types.InterceptTask{XID: warrant, Products: []types.ProductType{types.ProductCC}}
 
@@ -1580,7 +1631,7 @@ func TestRetargetDoesNotReapTheTriggerItInstalled(t *testing.T) {
 // record, which would leave a trigger installed with nothing tracking it.
 func TestAReactivatedWarrantDoesNotDisplaceTheWithdrawalInFlight(t *testing.T) {
 	poi := newFakePOI(t)
-	s := triggerSubsystem(poi)
+	s := triggerSubsystem(t, poi)
 	s.taskReporter = &recordingTaskReporter{}
 
 	warrant, first := installOneTrigger(t, s)
@@ -1665,7 +1716,7 @@ func TestAReactivatedWarrantDoesNotDisplaceTheWithdrawalInFlight(t *testing.T) {
 // downstream would ever contradict it.
 func TestAKeepaliveAnsweredByTheWrongElementIsReported(t *testing.T) {
 	poi := newFakePOI(t)
-	s := triggerSubsystem(poi)
+	s := triggerSubsystem(t, poi)
 
 	var reported []error
 	s.triggers.reportUnattributable = func(err error) { reported = append(reported, err) }
@@ -1710,7 +1761,7 @@ func TestAKeepaliveAnsweredByTheWrongElementIsReported(t *testing.T) {
 
 func TestAnUnattributableAnswerKeepsTheWithdrawalPending(t *testing.T) {
 	poi := newFakePOI(t)
-	s := triggerSubsystem(poi)
+	s := triggerSubsystem(t, poi)
 	s.taskReporter = &recordingTaskReporter{}
 
 	warrant, _ := installOneTrigger(t, s)
@@ -1770,7 +1821,7 @@ func TestAWithdrawalStuckOnOurOwnRefusalIsDistinguishable(t *testing.T) {
 	defer admf.Close()
 
 	poi := newFakePOI(t)
-	s := triggerSubsystem(poi)
+	s := triggerSubsystem(t, poi)
 	s.taskReporter = &recordingTaskReporter{}
 	s.reporter = x1.NewReporter(admf.URL, "admf", "smf", nil)
 
@@ -1859,7 +1910,7 @@ func TestAnUnbindableActivationAnswerIsReportedAsElementLevel(t *testing.T) {
 	defer admf.Close()
 
 	poi := newFakePOI(t)
-	s := triggerSubsystem(poi)
+	s := triggerSubsystem(t, poi)
 	s.taskReporter = &recordingTaskReporter{}
 	s.reporter = x1.NewReporter(admf.URL, "admf", "smf", nil)
 
@@ -1922,7 +1973,7 @@ func TestAnUnbindableActivationAnswerIsReportedAsElementLevel(t *testing.T) {
 // differs from its XID: a test that leaves it unset passes against the defect.
 func TestTriggerCarriesDeliveryXIDNotTaskXID(t *testing.T) {
 	poi := newFakePOI(t)
-	s := triggerSubsystem(poi)
+	s := triggerSubsystem(t, poi)
 
 	const (
 		taskXID   = "11111111-1111-4111-8111-111111111111"
@@ -1982,7 +2033,7 @@ func TestTriggerCarriesDeliveryXIDNotTaskXID(t *testing.T) {
 // test.
 func TestTriggerWithoutProductIDCarriesTheTaskXID(t *testing.T) {
 	poi := newFakePOI(t)
-	s := triggerSubsystem(poi)
+	s := triggerSubsystem(t, poi)
 
 	const taskXID = "11111111-1111-4111-8111-111111111111"
 	warrant := types.InterceptTask{
@@ -2041,7 +2092,7 @@ func withdrawOne(t *testing.T, s *subsystem) []withdrawal {
 // change, so the loop runs forever against a POI that is behaving correctly.
 func TestWithdrawalCompletesWhenPOIDoesNotHoldTheTask(t *testing.T) {
 	poi := newFakePOI(t)
-	s := triggerSubsystem(poi)
+	s := triggerSubsystem(t, poi)
 	pending := withdrawOne(t, s)
 
 	// The POI restarted between the install and the withdrawal: it no longer holds
@@ -2070,7 +2121,7 @@ func TestWithdrawalCompletesWhenPOIDoesNotHoldTheTask(t *testing.T) {
 // the retry loop exist for.
 func TestWithdrawalStillRetriesOtherFailures(t *testing.T) {
 	poi := newFakePOI(t)
-	s := triggerSubsystem(poi)
+	s := triggerSubsystem(t, poi)
 	pending := withdrawOne(t, s)
 
 	poi.mu.Lock()
@@ -2108,7 +2159,7 @@ func TestWithdrawalStillRetriesOtherFailures(t *testing.T) {
 // is what lets the endpoint go quiet and the backstop work.
 func TestKeepaliveLapsesAfterNoSuchTaskWithdrawal(t *testing.T) {
 	poi := newFakePOI(t)
-	s := triggerSubsystem(poi)
+	s := triggerSubsystem(t, poi)
 	pending := withdrawOne(t, s)
 
 	endpoint := s.triggers.endpoints["10.0.1.5"]
@@ -2142,7 +2193,7 @@ func TestKeepaliveLapsesAfterNoSuchTaskWithdrawal(t *testing.T) {
 // the session that authorised it with every party behaving as designed.
 func TestSessionTeardownLeavesNoTaskingBehind(t *testing.T) {
 	poi := newFakePOI(t)
-	s := triggerSubsystem(poi)
+	s := triggerSubsystem(t, poi)
 	pending := withdrawOne(t, s)
 
 	endpoint := s.triggers.endpoints["10.0.1.5"]
@@ -2212,7 +2263,7 @@ func (p *fakePOI) elements(msgType, local string) []string {
 // delivery path.
 func TestTriggerNamesTheTasksOwnX3Destinations(t *testing.T) {
 	poi := newFakePOI(t)
-	s := triggerSubsystem(poi)
+	s := triggerSubsystem(t, poi)
 	s.taskReporter = &recordingTaskReporter{}
 
 	const (
@@ -2302,7 +2353,7 @@ func TestTriggerNamesTheTasksOwnX3Destinations(t *testing.T) {
 // equivalent IRI task — and the task is not refused.
 func TestTriggerFallsBackToTheConfiguredMDF3(t *testing.T) {
 	poi := newFakePOI(t)
-	s := triggerSubsystem(poi)
+	s := triggerSubsystem(t, poi)
 	reporter := &recordingTaskReporter{}
 	s.taskReporter = reporter
 
@@ -2335,7 +2386,7 @@ func TestTriggerFallsBackToTheConfiguredMDF3(t *testing.T) {
 // ADMF to work out that its two destinations are one.
 func TestTwoWarrantsToOneEndpointShareItsDestination(t *testing.T) {
 	poi := newFakePOI(t)
-	s := triggerSubsystem(poi)
+	s := triggerSubsystem(t, poi)
 	s.taskReporter = &recordingTaskReporter{}
 
 	const shared = "198.51.100.10:5000"
@@ -2362,7 +2413,7 @@ func TestTwoWarrantsToOneEndpointShareItsDestination(t *testing.T) {
 // stream while the element reported the interception as running.
 func TestTriggerCarriesEveryDestinationATaskNames(t *testing.T) {
 	poi := newFakePOI(t)
-	s := triggerSubsystem(poi)
+	s := triggerSubsystem(t, poi)
 	s.taskReporter = &recordingTaskReporter{}
 
 	s.installFor("session-ref-1", []types.InterceptTask{
@@ -2384,7 +2435,7 @@ func TestTriggerCarriesEveryDestinationATaskNames(t *testing.T) {
 // party that can provision the destination.
 func TestWarrantWithNoResolvableDestinationAndNoFallbackIsReported(t *testing.T) {
 	poi := newFakePOI(t)
-	s := triggerSubsystem(poi)
+	s := triggerSubsystem(t, poi)
 	s.triggers.mdf3 = ""
 	reporter := &recordingTaskReporter{}
 	s.taskReporter = reporter
@@ -2479,7 +2530,7 @@ func awaitPending(t *testing.T, r *triggerRegistry, want int) {
 // applied, and only the envelope of the reply is unusable.
 func TestAmbiguousActivationIsWithdrawnNotForgotten(t *testing.T) {
 	poi := newFakePOI(t)
-	s := triggerSubsystem(poi)
+	s := triggerSubsystem(t, poi)
 	s.taskReporter = &recordingTaskReporter{}
 
 	// The retry clock is the test's. Correcting the POI's identity on the first
@@ -2515,7 +2566,7 @@ func TestAmbiguousActivationIsWithdrawnNotForgotten(t *testing.T) {
 // pending entry whose keepalives hold that POI's own fail-safe open.
 func TestRefusedActivationIsReleasedNotWithdrawn(t *testing.T) {
 	poi := newFakePOI(t)
-	s := triggerSubsystem(poi)
+	s := triggerSubsystem(t, poi)
 	s.taskReporter = &recordingTaskReporter{}
 
 	poi.mu.Lock()
@@ -2545,7 +2596,7 @@ func TestRefusedActivationIsReleasedNotWithdrawn(t *testing.T) {
 // fault reported for a condition that resolved itself.
 func TestWithdrawalOfATriggerThePOINeverReceivedCompletesAtOnce(t *testing.T) {
 	poi := newFakePOI(t)
-	s := triggerSubsystem(poi)
+	s := triggerSubsystem(t, poi)
 	reporter := &recordingTaskReporter{}
 	s.taskReporter = reporter
 
@@ -2584,7 +2635,7 @@ func TestWithdrawalOfATriggerThePOINeverReceivedCompletesAtOnce(t *testing.T) {
 // activation's failure had already dropped the only record of the trigger.
 func TestWarrantWithdrawnAfterAnAmbiguousActivationStillReachesThePOI(t *testing.T) {
 	poi := newFakePOI(t)
-	s := triggerSubsystem(poi)
+	s := triggerSubsystem(t, poi)
 	s.taskReporter = &recordingTaskReporter{}
 	s.triggers.sleep = func(time.Duration) { poi.setMisname("", "") }
 
@@ -2734,7 +2785,7 @@ func TestSessionUPFsCarriesTheAddressItAlreadyResolved(t *testing.T) {
 // deliverable, with nothing in either stream to show they were meant to join.
 func TestProductIDChangeReachesTheInstalledTrigger(t *testing.T) {
 	poi := newFakePOI(t)
-	s := triggerSubsystem(poi)
+	s := triggerSubsystem(t, poi)
 	s.taskReporter = &recordingTaskReporter{}
 
 	const (
@@ -2798,7 +2849,7 @@ func TestProductIDChangeReachesTheInstalledTrigger(t *testing.T) {
 // the triggering interface for every unrelated modification an ADMF makes.
 func TestAModificationThatChangesNoLabelSendsNothing(t *testing.T) {
 	poi := newFakePOI(t)
-	s := triggerSubsystem(poi)
+	s := triggerSubsystem(t, poi)
 	s.taskReporter = &recordingTaskReporter{}
 
 	targets := []types.TargetIdentifier{{Type: types.TargetSUPI, Value: "262019876543210"}}
@@ -2874,7 +2925,7 @@ func pooledSession(t *testing.T, supi string, id int32) *smfctx.SMContext {
 // resting on whichever happens to run first.
 func TestAModificationDoesNotWalkTheSessionPool(t *testing.T) {
 	poi := newFakePOI(t)
-	s := triggerSubsystem(poi)
+	s := triggerSubsystem(t, poi)
 	s.taskReporter = &recordingTaskReporter{}
 
 	const (
@@ -2936,7 +2987,7 @@ func TestAModificationDoesNotWalkTheSessionPool(t *testing.T) {
 // that warrant's own modification should decide about.
 func TestSessionsWithTriggersNamesOnlyThisWarrantsSessions(t *testing.T) {
 	poi := newFakePOI(t)
-	s := triggerSubsystem(poi)
+	s := triggerSubsystem(t, poi)
 	s.taskReporter = &recordingTaskReporter{}
 
 	const (
@@ -2992,7 +3043,7 @@ func TestSessionsWithTriggersNamesOnlyThisWarrantsSessions(t *testing.T) {
 //     the end of the test.
 func TestAnActivationThatTimesOutIsWithdrawnNotForgotten(t *testing.T) {
 	poi := newFakePOI(t)
-	s := triggerSubsystem(poi)
+	s := triggerSubsystem(t, poi)
 	s.taskReporter = &recordingTaskReporter{}
 
 	poi.setHangOn("ActivateTaskRequest")
@@ -3043,7 +3094,7 @@ func TestAnActivationThatTimesOutIsWithdrawnNotForgotten(t *testing.T) {
 // identifier while this element's own records use the new one.
 func TestALabelChangeArrivingWithATargetChangeStillReachesTheTrigger(t *testing.T) {
 	poi := newFakePOI(t)
-	s := triggerSubsystem(poi)
+	s := triggerSubsystem(t, poi)
 	s.taskReporter = &recordingTaskReporter{}
 
 	const (

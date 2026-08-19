@@ -17,6 +17,7 @@ import (
 	"net"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -117,6 +118,14 @@ type taskIssueReporter interface {
 }
 
 type subsystem struct {
+	// scans counts the activation and deactivation scan goroutines this subsystem has
+	// dispatched. Nothing in production waits on it — the whole point of the scan is
+	// that a provisioning answer does not — but a scan is this subsystem's work, and
+	// owning it is what lets a test wait for the walk it started rather than leaving a
+	// goroutine to fail the next test with a race against a session it has finished
+	// with. See waitForScans.
+	scans sync.WaitGroup
+
 	store *store.Store
 	// senderFor returns the delivery client for one X2 destination address. It is a
 	// function rather than a single client because a task's destinations arrive over
@@ -407,10 +416,8 @@ func Init(cfg Config) error {
 			return err
 		}
 		sub.triggers = triggers
-		// A POI may still hold triggers from this process's previous life, which it
-		// has no record of and could never withdraw — including after the warrant is
-		// revoked.
-		go sub.reconcileTriggers()
+		// Reconciliation is NOT started here, and neither are the registry's own
+		// loops. See below, after the bind.
 	}
 	x1srv := newX1Server(st, cfg, sub)
 	// Bind the X1 listener synchronously so a bind/permission failure is reported
@@ -423,6 +430,13 @@ func Init(cfg Config) error {
 		if sub.reporter != nil {
 			sub.reporter.Notify(x1.NEIssueX1ListenFailed, "X1 listener bind failed")
 		}
+		// Everything built above that runs on its own is stopped, because this
+		// initialisation is over: the caller gets an error, nothing is stored in
+		// active, and a retry would otherwise accumulate a second set of loops.
+		if sub.triggers != nil {
+			sub.triggers.Stop()
+		}
+
 		return fmt.Errorf("lawful interception: X1 listen on %s: %w", cfg.X1Listen, err)
 	}
 	// NewListener supplies the properties every X1 endpoint needs and none of the
@@ -441,6 +455,22 @@ func Init(cfg Config) error {
 		go x1srv.WatchKeepalive(keepalive, nil)
 	}
 	active.Store(sub)
+	// **Only now.** Reconciliation withdraws every trigger a POI reports that this
+	// registry cannot account for, and a just-started registry accounts for none — so
+	// on a start-up that does not complete it untasks every live content interception
+	// at every UPF this SMF can reach. The bind above is what fails when another
+	// process already holds the port, which is what a rolling restart or a duplicated
+	// deployment looks like: the process most likely to abandon its start-up is the one
+	// running alongside a healthy instance whose interception it would withdraw.
+	//
+	// A POI may still hold triggers from this process's previous life, which it has no
+	// record of and could never withdraw — including after the warrant is revoked. That
+	// is what reconciliation is for, and it is safe from here because this subsystem is
+	// now the one running.
+	if sub.triggers != nil {
+		sub.triggers.Start()
+		go sub.reconcileTriggers()
+	}
 	// Tasking lives in memory, so this element has just discarded every warrant it
 	// held. Nothing else tells the ADMF that — it goes on believing the
 	// interceptions it provisioned are running — and the standard's audit path is a
@@ -878,7 +908,10 @@ func (s *subsystem) reportDeactivation(task types.InterceptTask) {
 // whole rule is about — reached by applying the rule to the path that enforces it.
 func (s *subsystem) scanSessions(task types.InterceptTask, underAuthority bool, fn func(*smfctx.SMContext) any) {
 	activated := time.Now()
+	s.scans.Add(1)
 	go func() {
+		defer s.scans.Done()
+
 		var matched []*smfctx.SMContext
 		smfctx.RangeSMContexts(func(sc *smfctx.SMContext) bool {
 			sc.SMLock.Lock()

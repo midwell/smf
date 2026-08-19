@@ -103,7 +103,7 @@ func TestAnUnreachableEndpointDoesNotDelayAHealthyOnesKeepalive(t *testing.T) {
 // as untasked, while this element reports the interception as running.
 func TestARestartedPointOfInterceptionIsReTasked(t *testing.T) {
 	poi := newFakePOI(t)
-	s := triggerSubsystem(poi)
+	s := triggerSubsystem(t, poi)
 	s.taskReporter = &recordingTaskReporter{}
 
 	warrant := types.InterceptTask{

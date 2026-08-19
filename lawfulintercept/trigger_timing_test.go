@@ -94,7 +94,7 @@ func TestATaskedEstablishmentIsNotSlowedByAnUnreachableLIPF(t *testing.T) {
 	)
 
 	poi := newFakePOI(t)
-	s := triggerSubsystem(poi)
+	s := triggerSubsystem(t, poi)
 	admf := newUnansweringADMF(t)
 	s.taskReporter = x1.NewReporter(admf.url, "admfID", "smf-1", nil)
 

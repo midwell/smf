@@ -87,6 +87,7 @@ func scanFixture(t *testing.T, task types.InterceptTask, sessions int) (*subsyst
 	}
 	active.Store(sub)
 	t.Cleanup(func() { active.Store(nil) })
+	waitForScans(t, sub)
 
 	for i := range sessions {
 		sc := pooledSession(t, "imsi-262019876543210", int32(i+1))
@@ -301,13 +302,23 @@ func TestAWithdrawalStopsDuplicationEvenThoughTheTaskIsGone(t *testing.T) {
 
 	sub, st, _ := scanFixture(t, task, 1)
 
-	// The session is being duplicated, as a tasked one is.
-	var duplicating []*smfctx.FAR
+	// The session is being duplicated, as a tasked one is. Each FAR is kept beside
+	// the session that owns it, because sc.SMLock is what serialises this test's reads
+	// against the scan's writes — scanSessions takes it per session, so a bare *FAR
+	// list would leave the assertion below with no lock to take. Reading the field
+	// unlocked is what reddened `go test ./lawfulintercept/... -race`.
+	type duplicatedFAR struct {
+		sc  *smfctx.SMContext
+		far *smfctx.FAR
+	}
+	var duplicating []duplicatedFAR
 	smfctx.RangeSMContexts(func(sc *smfctx.SMContext) bool {
+		sc.SMLock.Lock()
 		forEachForwardingFAR(sc, func(far *smfctx.FAR) {
 			setDuplication(far, true)
-			duplicating = append(duplicating, far)
+			duplicating = append(duplicating, duplicatedFAR{sc: sc, far: far})
 		})
+		sc.SMLock.Unlock()
 
 		return true
 	})
@@ -326,10 +337,12 @@ func TestAWithdrawalStopsDuplicationEvenThoughTheTaskIsGone(t *testing.T) {
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		stillOn := 0
-		for _, far := range duplicating {
-			if far.ApplyAction.Dupl {
+		for _, d := range duplicating {
+			d.sc.SMLock.Lock()
+			if d.far.ApplyAction.Dupl {
 				stillOn++
 			}
+			d.sc.SMLock.Unlock()
 		}
 		if stillOn == 0 {
 			return
