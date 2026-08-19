@@ -36,6 +36,7 @@ import (
 	"github.com/omec-project/smf/oam"
 	"github.com/omec-project/smf/pdusession"
 	"github.com/omec-project/smf/pfcp"
+	"github.com/omec-project/smf/pfcp/adapter"
 	"github.com/omec-project/smf/pfcp/message"
 	"github.com/omec-project/smf/pfcp/udp"
 	"github.com/omec-project/smf/pfcp/upf"
@@ -169,6 +170,13 @@ func (smf *SMF) Start() {
 		// needs. Done before Init mounts the X1 listener so the hook is in place
 		// before any tasking can arrive.
 		lawfulintercept.SetSessionModifier(producer.ModifySessionForLI)
+		// And the restart notification the adapter's PFCP handlers raise. It is a package
+		// variable there rather than a direct call because pfcp/adapter may not import
+		// lawfulintercept — pfcp/message imports the adapter, and lawfulintercept's tests
+		// import pfcp/message — so this is where the two are joined. Only one of the native
+		// and adapter handlers is active in a deployment, and a remedy present in one of them
+		// is a remedy whose presence depends on enableUPFAdapter.
+		adapter.POIRestarted = lawfulintercept.POIRestarted
 		triggers := make([]lawfulintercept.UPFTrigger, 0, len(li.UPFTriggers))
 		for _, t := range li.UPFTriggers {
 			triggers = append(triggers, lawfulintercept.UPFTrigger{

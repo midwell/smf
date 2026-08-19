@@ -974,14 +974,32 @@ func TriggerCC(sc *smfctx.SMContext) {
 
 // POIRestarted tells the CC Triggering Function that a triggered point of interception
 // has restarted, so the tasking this element believes it holds there is discarded and
-// subsequent establishments and scans re-install it. Silent no-op unless LI is
-// configured. nodeID is the UPF's PFCP node identifier as configured.
-func POIRestarted(nodeID string) {
+// subsequent establishments and scans re-install it. Silent no-op unless LI is configured.
+//
+// **It takes the node identity and its address, not a pre-resolved string**, because the
+// registry has to be allowed to apply its own matching rule. Trigger keys carry
+// `li.upfTriggers[].nodeId` exactly as configured — which the chart and the blueprint default
+// to `upf`, a name — while every caller here holds a `smfctx.NodeID` whose resolved form is
+// an address. Handed the address, ForgetPOI's string equality matched nothing and this
+// notification did nothing at all: the registry kept every claim for the restarted POI, so
+// `plan` found each triple already claimed and installed nothing, while the POI held no
+// tasking and discarded the copies it was told to make. The only existing test passed
+// because it configured an IP literal, the one spelling in which the two forms coincide.
+//
+// So the two values travel in the shape sessionUPFs already builds, and matchEndpoint
+// resolves them to a configured key — identity first, then the refreshed address index —
+// which is the same rule the trigger path uses. ForgetPOI stays as the key-level primitive.
+//
+// **What this does not do is restore the subscriber's sessions.** Those are lost on the same
+// path, which is the pre-existing upstream `// TODO: Session cleanup required` beside each
+// caller and a larger problem than this one. What is in scope is that the interception
+// bookkeeping stops being the reason re-tasking cannot happen once that TODO is addressed.
+func POIRestarted(node smfctx.NodeID, addr string) {
 	sub := active.Load()
 	if sub == nil || sub.triggers == nil {
 		return
 	}
-	if n := sub.triggers.ForgetPOI(nodeID); n > 0 && sub.reporter != nil {
+	if n := sub.triggers.forgetRestartedPOI(upfSession{node: node, addr: addr}); n > 0 && sub.reporter != nil {
 		// NE-level and countable, naming no warrant: which interceptions were lost is
 		// the ADMF's to work out from its own provisioning, and this element cannot
 		// name them without disclosing tasking on a channel that must not carry it.
@@ -1736,6 +1754,31 @@ func (r *triggerRegistry) takeForWarrantExcept(warrant types.XID, keep map[strin
 // bookkeeping stops being the reason re-tasking cannot happen once that TODO is
 // addressed: after this, an establishment or a scan at the restarted POI installs the
 // trigger instead of skipping it as already claimed.
+// forgetRestartedPOI discards the claims held for the POI serving one node, matched the way
+// every other trigger path matches it.
+//
+// It exists because the caller knows a node and its address and the registry is keyed by a
+// configured string, and only the registry can turn one into the other. Doing it here rather
+// than at the call site is also what keeps the *one* matching rule in one place: an
+// unresolvable node never matches, which is right — a claim discarded for the wrong POI would
+// re-install one element's tasking at another's, which is the defect matchEndpoint's own
+// documentation exists to prevent.
+//
+// The lock is taken twice deliberately. matchEndpoint documents needing r.mu and ForgetPOI
+// takes it itself; nothing between the two can invalidate the key, because endpoints and
+// order are written once at construction.
+func (r *triggerRegistry) forgetRestartedPOI(session upfSession) int {
+	r.mu.Lock()
+	key, _, ok := r.matchEndpoint(session)
+	r.mu.Unlock()
+
+	if !ok {
+		return 0
+	}
+
+	return r.ForgetPOI(key)
+}
+
 func (r *triggerRegistry) ForgetPOI(nodeID string) int {
 	r.mu.Lock()
 	defer r.mu.Unlock()

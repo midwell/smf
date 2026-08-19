@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/omec-project/smf/context"
+	"github.com/omec-project/smf/lawfulintercept"
 	"github.com/omec-project/smf/logger"
 	"github.com/omec-project/smf/metrics"
 	"github.com/omec-project/smf/pfcp/message"
@@ -44,6 +45,24 @@ func InitPfcpHeartbeatRequest() {
 				heartbeatRequest := pfcp_message.HeartbeatRequest{}
 				metrics.IncrementN4MsgStats(context.SMF_Self().NfInstanceID, heartbeatRequest.MessageTypeName(), "Out", "Failure", "Timeout")
 				upf.UPF.UPFStatus = context.NotAssociated
+
+				// Lawful Interception: this UPF has stopped answering, so what it holds is
+				// no longer knowable — and the claims this element keeps for it are worse
+				// than useless. They make `plan` skip every triple as already claimed, so
+				// nothing re-installs when the UPF comes back, and they keep
+				// `keepaliveDue` true, so this element goes on telling a POI it may not be
+				// reaching that its triggering function is present — which is precisely
+				// what disables that POI's own fail-safe.
+				//
+				// Discarding them is the same conclusion the heartbeat mismatch and the
+				// re-association paths reach, by the route that reaches it first: a claim
+				// that cannot be true must not be treated as one.
+				//
+				// This does not restore the subscriber's sessions. Those are the upstream
+				// `// TODO: Session cleanup required` on the association paths, which is
+				// larger and separate; what is in scope is that the interception
+				// bookkeeping stops being the reason re-tasking cannot happen.
+				lawfulintercept.POIRestarted(upf.NodeID, upf.NodeID.ResolveNodeIdToIp().String())
 			}
 
 			upf.UPF.UpfLock.Unlock()

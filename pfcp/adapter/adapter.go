@@ -20,6 +20,25 @@ func init() {
 	PfcpTxns = make(map[uint32]*context.NodeID)
 }
 
+// POIRestarted is the Lawful Interception hook this package calls when a UPF's recovery
+// timestamp shows it restarted, or when it stops answering. Nil unless LI is wired, and
+// nil-checked at every call site.
+//
+// **A package variable rather than a direct call, because this package may not import
+// lawfulintercept.** pfcp/message imports this one, and lawfulintercept's own tests import
+// pfcp/message, so the direct call is an import cycle. The same shape the producer's
+// teardown hooks take, for the same reason, and it is assigned once by the service wiring
+// that already builds the LI subsystem.
+var POIRestarted func(node context.NodeID, addr string)
+
+// notifyPOIRestarted calls the hook if one is wired. Written once so a new call site cannot
+// forget the nil check — a nil function value panics, and these are PFCP message handlers.
+func notifyPOIRestarted(node context.NodeID, addr string) {
+	if POIRestarted != nil {
+		POIRestarted(node, addr)
+	}
+}
+
 var (
 	PfcpTxns    map[uint32]*context.NodeID
 	PfcpTxnLock sync.Mutex
@@ -141,6 +160,17 @@ func HandlePfcpAssociationSetupResponse(msg *udp.Message) {
 			logger.PfcpLog.Errorf("pfcp association setup response RecoveryTimeStamp error: %v", err)
 			return
 		}
+
+		// Lawful Interception: re-association is the common way a restart is discovered, and
+		// this is that path in adapter mode. Only one of the two handlers is active in a
+		// deployment, so a remedy in the native one alone is a remedy whose presence depends
+		// on enableUPFAdapter — which is exactly the asymmetry the lisequence guard already
+		// had to be fixed for. Compared before the overwrite, and only where it changed.
+		if restarted := !upf.RecoveryTimeStamp.RecoveryTimeStamp.IsZero() &&
+			upf.RecoveryTimeStamp.RecoveryTimeStamp != recoveryTimestamp; restarted {
+			notifyPOIRestarted(upf.NodeID, upf.NodeID.ResolveNodeIdToIp().String())
+		}
+
 		upf.RecoveryTimeStamp = context.RecoveryTimeStamp{
 			RecoveryTimeStamp: recoveryTimestamp,
 		}
@@ -190,6 +220,15 @@ func HandlePfcpHeartbeatResponse(msg *udp.Message) {
 		// PFCP Association can be initiated again
 		upf.UPFStatus = context.NotAssociated
 		logger.PfcpLog.Warnf("PFCP Heartbeat Response, upf [%v] recovery timestamp changed", upf.NodeID)
+
+		// Lawful Interception: the adapter's copy of the native handler's remedy. This UPF
+		// restarted, so the LI_T3 triggers this element believes it installed there are gone
+		// with its memory — and keeping the claims makes the planning path skip every triple
+		// as claimed, so nothing re-installs.
+		//
+		// This does not address the TODO below and is not a step toward it: the subscriber's
+		// PFCP sessions are lost on this path too, which is larger and separate.
+		notifyPOIRestarted(upf.NodeID, upf.NodeID.ResolveNodeIdToIp().String())
 
 		// TODO: Session cleanup required and updated to AMF/PCF
 		// metrics.IncrementN4MsgStats(context.SMF_Self().NfInstanceID, pfcpmsgtypes.PfcpMsgTypeString(msg.PfcpMessage.Header.MessageType), "In", "Failure", "RecoveryTimeStamp_mismatch")
@@ -478,4 +517,11 @@ func SetUpfInactive(nodeID context.NodeID) {
 
 	upf.UPFStatus = context.NotAssociated
 	upf.NHeartBeat = 0 // reset Heartbeat attempt to 0
+
+	// Lawful Interception: this UPF has stopped answering, so what it holds is no longer
+	// knowable and the claims this element keeps for it are worse than useless — they make
+	// the planning path skip every triple as already claimed, and they keep this element
+	// telling a POI it may not be reaching that its triggering function is present, which is
+	// what disables that POI's own fail-safe.
+	notifyPOIRestarted(upf.NodeID, upf.NodeID.ResolveNodeIdToIp().String())
 }

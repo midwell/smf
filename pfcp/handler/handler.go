@@ -49,6 +49,19 @@ func FindFTEID(createdPDRIEs []*ie.IE) (*ie.FTEIDFields, error) {
 	return nil, fmt.Errorf("FTEID not found in CreatedPDR")
 }
 
+// POIRestarted is the Lawful Interception restart notification this package raises: a
+// triggered point of interception has restarted, so the tasking this element believes it
+// holds there must be discarded and re-installed.
+//
+// Reached through a package variable so a test can observe *which* of this package's paths
+// raise it, which is the whole of what was wrong — it fired only from the heartbeat
+// recovery-timestamp mismatch, while both association handlers overwrote the recovery
+// timestamp silently and re-association is the common way a restart is discovered. Without a
+// seam a path that stopped raising it would look exactly like a path that raises it.
+//
+// Production behaviour is unchanged: it is the same function.
+var POIRestarted = lawfulintercept.POIRestarted
+
 func HandlePfcpHeartbeatRequest(msg *udp.Message) {
 	_, ok := msg.PfcpMessage.(*message.HeartbeatRequest)
 	if !ok {
@@ -113,11 +126,14 @@ func HandlePfcpHeartbeatResponse(msg *udp.Message) {
 		// the restarted UPF holding no tasking, discarding the copies it is told to
 		// make as untasked, while this element reports the interception as running.
 		//
+		// The node identity travels with its address, because the registry is keyed by
+		// the configured node name and only the registry can match one to the other.
+		//
 		// This does not address the TODO below, and is not a step toward it: the
 		// subscriber's PFCP sessions are lost on this path too, which is larger and
 		// separate. What it does is stop the interception bookkeeping from being the
 		// reason re-tasking cannot happen once that TODO is addressed.
-		lawfulintercept.POIRestarted(upf.NodeID.ResolveNodeIdToIp().String())
+		POIRestarted(upf.NodeID, upf.NodeID.ResolveNodeIdToIp().String())
 
 		// TODO: Session cleanup required and updated to AMF/PCF
 		metrics.IncrementN4MsgStats(smf_context.SMF_Self().NfInstanceID, rsp.MessageTypeName(), "In", "Failure", "RecoveryTimeStamp_mismatch")
@@ -202,6 +218,25 @@ func HandlePfcpAssociationSetupRequest(msg *udp.Message) {
 	upf.UpfLock.Lock()
 	defer upf.UpfLock.Unlock()
 
+	// Lawful Interception: **re-association is the common way a restart is discovered**, and
+	// it was the one path that overwrote the recovery timestamp without saying so. The
+	// heartbeat mismatch only fires for a UPF this element was still successfully
+	// heartbeating; a UPF that went away and came back re-associates, and until now that
+	// left every claim in the trigger registry pointing at a POI holding no tasking. The
+	// planning path then found each triple already claimed and installed nothing.
+	//
+	// Compared before the overwrite, and only where it changed: an association from a UPF
+	// whose timestamp is the one this element already held is a re-association without a
+	// restart, and discarding claims there would withdraw nothing and re-install everything
+	// for no reason.
+	//
+	// As at the heartbeat site, this does not address the TODO on that path: the subscriber's
+	// PFCP sessions are lost with the UPF's memory either way, which is larger and separate.
+	if restarted := !upf.RecoveryTimeStamp.RecoveryTimeStamp.IsZero() &&
+		upf.RecoveryTimeStamp.RecoveryTimeStamp != recoveryTimestamp; restarted {
+		POIRestarted(upf.NodeID, upf.NodeID.ResolveNodeIdToIp().String())
+	}
+
 	upf.RecoveryTimeStamp = smf_context.RecoveryTimeStamp{
 		RecoveryTimeStamp: recoveryTimestamp,
 	}
@@ -271,6 +306,16 @@ func HandlePfcpAssociationSetupResponse(msg *udp.Message) {
 			logger.PfcpLog.Errorf("failed to parse RecoveryTimeStamp: %+v", err)
 			return
 		}
+
+		// Lawful Interception: the other half of re-association — this element initiated it,
+		// which is what ProbeInactiveUpfs does for every UPF it has marked NotAssociated. See
+		// the request handler above for why this path matters and why the comparison is made
+		// before the overwrite.
+		if restarted := !upf.RecoveryTimeStamp.RecoveryTimeStamp.IsZero() &&
+			upf.RecoveryTimeStamp.RecoveryTimeStamp != recoveryTimestamp; restarted {
+			POIRestarted(upf.NodeID, upf.NodeID.ResolveNodeIdToIp().String())
+		}
+
 		upf.RecoveryTimeStamp = smf_context.RecoveryTimeStamp{
 			RecoveryTimeStamp: recoveryTimestamp,
 		}
