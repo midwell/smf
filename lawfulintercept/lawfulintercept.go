@@ -333,7 +333,30 @@ func Init(cfg Config) error {
 	var watcher *x1.DestinationWatcher
 	pool := x2x3.NewPool(mat.ClientTLS(),
 		keepaliveConfig(cfg, reporter),
-		func(error) { watcher.Nudge() },
+		// **The error is inspected, not discarded.** ErrUnitDropped says delivery to
+		// this destination is working and one product unit of it was lost: a partial
+		// write on a stream framer cannot be resumed without corrupting the framing, so
+		// the unit is dropped whole and the connection is remade. The library
+		// deliberately stops calling that unreachability — a healthy MDF must not be
+		// reported as unreachable over one truncated write — and this hook discarded the
+		// error, so the loss was then reported by nothing at all while the watcher
+		// sampled a destination it correctly considered reachable. Product missing from
+		// an agency's record with every channel that could have said so reporting
+		// normality, which is the failure direction this whole plane exists to prevent.
+		//
+		// Reported as the same delivery loss a full queue is: from the agency's side the
+		// two are one fact — an xIRI this element produced and did not deliver.
+		//
+		// The nudge stays for every error, this one included: what the sender concluded
+		// about reachability is its own business, and the watcher's job is to re-observe
+		// it promptly rather than one sampling interval later.
+		func(err error) {
+			if errors.Is(err, x2x3.ErrUnitDropped) {
+				reporter.NotifyAsync(x1.NEIssueX2DeliveryLost,
+					"an xIRI was partially written to a reachable mediation function and dropped")
+			}
+			watcher.Nudge()
+		},
 		// Product dropped because the queue was full is reported as it happens, and
 		// this hook is the only place that can report it.
 		//
