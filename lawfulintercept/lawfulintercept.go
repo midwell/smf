@@ -330,7 +330,12 @@ func Init(cfg Config) error {
 	// announces something nobody retracts, so both edges belong to whoever can see
 	// the transition. The hook nudges that watcher, which keeps the report as prompt
 	// as it was while moving the decision to one place.
-	var watcher *x1.DestinationWatcher
+	// Both declared before the pool because its callbacks close over them, and both are
+	// only *called* once delivery is under way — by which time each is assigned.
+	var (
+		watcher *x1.DestinationWatcher
+		sub     *subsystem
+	)
 	pool := x2x3.NewPool(mat.ClientTLS(),
 		keepaliveConfig(cfg, reporter),
 		// **The error is inspected, not discarded.** ErrUnitDropped says delivery to
@@ -350,13 +355,7 @@ func Init(cfg Config) error {
 		// The nudge stays for every error, this one included: what the sender concluded
 		// about reachability is its own business, and the watcher's job is to re-observe
 		// it promptly rather than one sampling interval later.
-		func(err error) {
-			if errors.Is(err, x2x3.ErrUnitDropped) {
-				reporter.NotifyAsync(x1.NEIssueX2DeliveryLost,
-					"an xIRI was partially written to a reachable mediation function and dropped")
-			}
-			watcher.Nudge()
-		},
+		func(err error) { sub.reportDeliveryError(err, watcher) },
 		// Product dropped because the queue was full is reported as it happens, and
 		// this hook is the only place that can report it.
 		//
@@ -379,7 +378,7 @@ func Init(cfg Config) error {
 				"xIRI dropped from the X2 delivery queue")
 		},
 	)
-	sub := &subsystem{
+	sub = &subsystem{
 		store:     st,
 		senderFor: func(addr string) sender { return pool.For(addr) },
 		mdf2:      cfg.MDF2,
@@ -504,6 +503,38 @@ func Init(cfg Config) error {
 			"network function started with interception enabled and no tasking present")
 	}
 	return nil
+}
+
+// reportDeliveryError is the delivery pool's onError hook: what this element does with a
+// failure its delivery worker reports.
+//
+// **The error is inspected, not discarded.** ErrUnitDropped says delivery to this
+// destination is working and one product unit of it was lost — a unit the write stopped
+// inside, which the library resends whole on a fresh connection and reports as dropped only
+// where that resend did not land either. The library deliberately refuses to call that
+// unreachability, because a healthy mediation function must not be reported unreachable over
+// one truncated write; this hook discarded the error, so the loss was then reported by
+// nothing at all while the watcher sampled a destination it correctly considered reachable.
+// Product missing from an agency's record with every channel that could have said so
+// reporting normality, which is the failure direction this whole plane exists to prevent.
+//
+// Reported as the same delivery loss a full queue is: from the agency's side the two are one
+// fact — an xIRI this element produced and did not deliver.
+//
+// The nudge is for every error, this one included: what the sender concluded about
+// reachability is its own business, and the watcher's job is to re-observe it promptly rather
+// than one sampling interval later.
+//
+// A method rather than a closure inside Init so the mapping can be asserted directly. What
+// produces ErrUnitDropped is the transport, and that is tested where it lives, in li/x2x3;
+// what this element does with it is this function, and a test that has to arrange a
+// partial write on a real socket to reach it would be testing the wrong half.
+func (s *subsystem) reportDeliveryError(err error, watcher *x1.DestinationWatcher) {
+	if errors.Is(err, x2x3.ErrUnitDropped) {
+		s.reporter.NotifyAsync(x1.NEIssueX2DeliveryLost,
+			"an xIRI was partially written to a reachable mediation function and dropped")
+	}
+	watcher.Nudge()
 }
 
 // ReportEstablishment emits an SMFPDUSessionEstablishment xIRI for sc if it
