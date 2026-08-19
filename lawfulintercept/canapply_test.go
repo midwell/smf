@@ -148,3 +148,22 @@ func TestX1ServerRefusesTaskingItCannotAct(t *testing.T) {
 		})
 	}
 }
+
+// TestAnX3OnlyTaskIsRealWorkHere is the counterpart of the AMF's product refusal, and the
+// reason that refusal is the AMF's alone.
+//
+// An IRI-POI that cannot produce xCC can produce nothing for an X3Only warrant, which is why
+// the AMF refuses one. This element is both an IRI-POI and the CC Triggering Function, so an
+// X3Only task is real work: it triggers the serving UPFs' CC-POIs and applies duplication,
+// delivering no xIRI because none was asked for. Refusing it here would refuse content
+// interception outright.
+func TestAnX3OnlyTaskIsRealWorkHere(t *testing.T) {
+	if err := canApply(types.InterceptTask{
+		XID:      taskXID,
+		Targets:  []types.TargetIdentifier{{Type: types.TargetSUPI, Value: "262019876543210"}},
+		Products: []types.ProductType{types.ProductCC},
+	}); err != nil {
+		t.Errorf("an X3Only warrant was refused: %v — this element is the CC Triggering "+
+			"Function, so refusing one refuses content interception outright", err)
+	}
+}

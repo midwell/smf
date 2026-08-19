@@ -834,7 +834,13 @@ func (s *subsystem) modifyInterception(prev, next types.InterceptTask) {
 	// the whole of the fix, and it is what the AMF's applyTaskChange already did.
 	wantedIRI := prev.WantsProduct(types.ProductIRI)
 	wantsIRI := next.WantsProduct(types.ProductIRI)
-	if slices.Equal(prev.Targets, next.Targets) && wantedCC == wantsCC && wantedIRI == wantsIRI {
+	// The record scope belongs in the same test, and for the same reason the products do:
+	// widening it makes records due that were previously excluded, for subjects the task
+	// already covered — so a scope-only modification *can* produce a record and must not take
+	// the early return. The AMF's predicate says the same three things; they had no business
+	// disagreeing.
+	if slices.Equal(prev.Targets, next.Targets) && wantedCC == wantsCC && wantedIRI == wantsIRI &&
+		prev.RecordScope == next.RecordScope {
 		// Nothing about *which* traffic is intercepted has moved. What may still have
 		// moved is how this warrant's product is labelled and where its content goes,
 		// and those reach the two interfaces by different routes: this element reads
@@ -996,6 +1002,18 @@ func (s *subsystem) scanSessions(task types.InterceptTask, underAuthority bool, 
 	go func() {
 		defer s.scans.Done()
 
+		// **Bounded, because bulk provisioning launches one of these per warrant at once.**
+		// TS 103 221-1's bulk operations and an ADMF restoring tasking after a restart both
+		// provision many warrants in quick succession, and each walk reads the whole session
+		// pool: unbounded, N warrants cost N concurrent full walks on an element whose
+		// ordinary job is establishing sessions in that pool. The bound turns that into a
+		// queue.
+		//
+		// Taken inside the goroutine, not before it: the provisioning answer must still not
+		// wait on any of this, which is the property that put the scan off the X1 goroutine.
+		scanSlots <- struct{}{}
+		defer func() { <-scanSlots }()
+
 		var matched []*smfctx.SMContext
 		smfctx.RangeSMContexts(func(sc *smfctx.SMContext) bool {
 			sc.SMLock.Lock()
@@ -1008,7 +1026,17 @@ func (s *subsystem) scanSessions(task types.InterceptTask, underAuthority bool, 
 			return true
 		})
 
-		for _, sc := range matched {
+		for i, sc := range matched {
+			// nil in production. The window between one record and the next is where a
+			// mid-scan ModifyTask lands, and it is a few instructions wide — so a property
+			// this consequential asserted by racing an X1 request against a scan is one
+			// that passes against the defect. Called before each session but the first, so
+			// a test can let one record out and then retarget the warrant. See
+			// TestARetargetMidScanStopsDeliveringForThePreviousSubject.
+			if i > 0 && beforeScanRecord != nil {
+				beforeScanRecord()
+			}
+
 			// **Re-read before each session, and act under what the store holds now.**
 			// This scan is unbounded in duration by design — it is off the X1 goroutine
 			// precisely so a provisioning answer does not scale with the subscriber
@@ -1030,6 +1058,28 @@ func (s *subsystem) scanSessions(task types.InterceptTask, underAuthority bool, 
 			}
 
 			sc.SMLock.Lock()
+			// **And that the task still names this session's subject.** The re-read above
+			// establishes that the task exists, and — because everything below is derived
+			// from `task` — which products it wants and where its product goes. It did not
+			// establish that the task still covers *this* subject: a ModifyTask that
+			// retargets a warrant mid-scan leaves the remaining sessions producing records
+			// under the warrant's own identifier, delivered to the new subject's agency and
+			// describing the previous one. Well-formed, correctly attributed, and about
+			// somebody the warrant no longer covers.
+			//
+			// What revalidation establishes is a list — existence, products, destinations
+			// and subject — so this sits beside the re-read rather than inside the caller's
+			// closure, and a later omission from that list reads as a gap in a list.
+			//
+			// Only where the scan is under authority. A deactivation scan runs *because*
+			// the task was removed, and its job is to take duplication down; testing the
+			// subject there would leave the datapath duplicating for a warrant that no
+			// longer exists, which is the failure this whole rule is about.
+			if underAuthority && !sessionTargets(task, sc) {
+				sc.SMLock.Unlock()
+
+				continue
+			}
 			corr := correlationOf(sc)   // read under the lock (reads sc.PFCPContext)
 			subjectIDs := targetsOf(sc) // likewise: reads the session's identity fields
 			// A session whose PFCP session does not exist yet belongs to the
@@ -1061,6 +1111,17 @@ func (s *subsystem) scanSessions(task types.InterceptTask, underAuthority bool, 
 		}
 	}()
 }
+
+// beforeScanRecord is called between the sessions an activation scan walks. Set only by
+// tests; nil otherwise.
+var beforeScanRecord func()
+
+// scanSlots bounds how many scans walk the session pool at once.
+//
+// Four rather than one: a single slot would serialise unrelated warrants behind one walk, and
+// what matters is that the cost is bounded rather than that it is one. Package-level because
+// the bound is a property of this element's session pool, of which there is one.
+var scanSlots = make(chan struct{}, 4)
 
 // applyCC makes sc's forwarding FARs match whether the target is currently
 // CC-tasked, marking any FAR it changes RULE_UPDATE so a PFCP modification
@@ -1633,6 +1694,11 @@ func canApply(task types.InterceptTask) error {
 			"it matches subjects by SUPI, PEI or GPSI")
 	}
 
+	// **No product test here, deliberately.** The AMF refuses an X3Only warrant, because an
+	// IRI-POI that cannot produce xCC can produce nothing at all for one. This element is
+	// both an IRI-POI *and* the CC Triggering Function, so an X3Only task is real work: it
+	// triggers the serving UPFs' CC-POIs and applies duplication, and it delivers no xIRI
+	// because none was asked for. Refusing it would refuse content interception outright.
 	return nil
 }
 
