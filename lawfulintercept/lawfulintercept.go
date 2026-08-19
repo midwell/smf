@@ -757,7 +757,23 @@ func (s *subsystem) applyTaskChange(prev, next *types.InterceptTask) {
 // old one let the teardown reclaim the triggers the activation had just installed,
 // and let Forget discard numbering the new task's records had already consumed.
 // Neither is possible from here, because there is only one pass.
+//
+// **Except where the modification moved the delivery label itself.** The numbering is
+// keyed by the *delivery* XID, which is the provisioned ProductID where there is one —
+// so a relabel does change it, and the contexts under the superseded label are stranded:
+// nothing will ever number under them again, because every record from here carries the
+// new one. Released below, and only there; a modification that leaves the labelling
+// alone must release nothing, since those contexts are the ones this task's own records
+// are still using and re-issuing a number the mediation function has already seen is how
+// loss is signalled on this interface.
 func (s *subsystem) modifyInterception(prev, next types.InterceptTask) {
+	// The superseded label's contexts, before anything below can number under the new
+	// one. Forget rather than ForgetContext because at an IRI-POI one task is one
+	// warrant, so every context under that label belonged to this task.
+	if s.ids != nil && prev.DeliveryXID() != next.DeliveryXID() {
+		s.ids.Forget(parseXID(prev.DeliveryXID()))
+	}
+
 	wantedCC := prev.WantsProduct(types.ProductCC)
 	wantsCC := next.WantsProduct(types.ProductCC)
 	// Both products, not just content. A test that compared the targets and the CC
@@ -786,7 +802,8 @@ func (s *subsystem) modifyInterception(prev, next types.InterceptTask) {
 		// to join.
 		s.relabelWarrant(prev, next)
 
-		// The numbering state belongs to the XID, which a modification never changes.
+		// The numbering state is dealt with at the top of this function: released where
+		// the delivery label moved, left alone where it did not.
 		return
 	}
 
