@@ -41,6 +41,14 @@ func InitConfigFactory(f string) error {
 		return err
 	}
 
+	// The lenient decode above is upstream's and stays lenient — this fork must keep starting
+	// when upstream adds a key it does not model. The LI block is held to a stricter standard,
+	// on its own, because a key dropped there lands on a default that fails unsafely and says
+	// nothing: see strictLiBlock.
+	if err = strictLiBlock(content); err != nil {
+		return err
+	}
+
 	if SmfConfig.Configuration.KafkaInfo.EnableKafka == nil {
 		enableKafka := true
 		SmfConfig.Configuration.KafkaInfo.EnableKafka = &enableKafka

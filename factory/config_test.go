@@ -6,6 +6,8 @@
 package factory
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -157,4 +159,97 @@ func TestAQuotedTriStateBooleanIsRefusedByTheConfigLoader(t *testing.T) {
 			t.Errorf("a real YAML boolean was refused (%q): %v", doc, err)
 		}
 	}
+}
+
+// TestLiBlockRefusesUnknownKeys covers the whole startup path, not strictLiBlock alone: the
+// property is that a mistyped LI key stops the network function from starting, and that is only
+// true if InitConfigFactory calls the check.
+//
+// Both keys below are chosen because their defaults fail *unsafely*. A dropped
+// `keepaliveTimeout` leaves the X1 fail-safe off, so the element keeps tasking that nothing will
+// ever reclaim; a dropped `admfUrl` leaves the fault channel a no-op, so nothing it is required to
+// report — including a misconfiguration — reaches the ADMF. Neither is visible from outside: the
+// element runs, answers X1, and looks provisioned.
+func TestLiBlockRefusesUnknownKeys(t *testing.T) {
+	write := func(t *testing.T, body string) string {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "smfcfg.yaml")
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatalf("write config: %v", err)
+		}
+
+		return path
+	}
+
+	const good = `info:
+  version: 1.0.0
+configuration:
+  li:
+    x1Listen: ":8443"
+    neId: smf-1
+    admfUrl: https://admf:9443
+    keepaliveTimeout: 30s
+`
+
+	t.Run("a conformant li block starts", func(t *testing.T) {
+		orig := SmfConfig
+		t.Cleanup(func() { SmfConfig = orig })
+
+		if err := InitConfigFactory(write(t, good)); err != nil {
+			t.Fatalf("a conformant li block was refused: %v", err)
+		}
+		if SmfConfig.Configuration.Li.KeepaliveTimeout != "30s" {
+			t.Errorf("keepaliveTimeout = %q, want 30s — the strict pass must not disturb the decode",
+				SmfConfig.Configuration.Li.KeepaliveTimeout)
+		}
+	})
+
+	for _, tt := range []struct {
+		name string
+		typo string
+	}{
+		{"a misspelled fail-safe window", "keepaliveTimeut"},
+		{"a misspelled ADMF endpoint", "admf_url"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			orig := SmfConfig
+			t.Cleanup(func() { SmfConfig = orig })
+
+			body := strings.Replace(good, "admfUrl", tt.typo, 1)
+			if tt.typo == "keepaliveTimeut" {
+				body = strings.Replace(good, "keepaliveTimeout", tt.typo, 1)
+			}
+			err := InitConfigFactory(write(t, body))
+			if err == nil {
+				t.Fatalf("%s was accepted, so the setting the operator wrote never reached the "+
+					"element and its unsafe default stands with nothing saying so", tt.typo)
+			}
+			if !strings.Contains(err.Error(), tt.typo) {
+				t.Errorf("the refusal does not name the key that was wrong: %v", err)
+			}
+		})
+	}
+
+	t.Run("a key outside the li block is still tolerated", func(t *testing.T) {
+		orig := SmfConfig
+		t.Cleanup(func() { SmfConfig = orig })
+
+		// The scope of the check, asserted rather than assumed. This fork tracks an upstream
+		// that adds configuration keys; if strictness leaked past the li block, the next
+		// upstream field would stop every deployment carrying it from starting.
+		body := strings.Replace(good, "configuration:\n", "configuration:\n  aKeyThisForkDoesNotModel: 1\n", 1)
+		if err := InitConfigFactory(write(t, body)); err != nil {
+			t.Fatalf("an unmodelled key outside the li block was refused, which would stop this "+
+				"fork starting on the next upstream field: %v", err)
+		}
+	})
+
+	t.Run("no li block at all", func(t *testing.T) {
+		orig := SmfConfig
+		t.Cleanup(func() { SmfConfig = orig })
+
+		if err := InitConfigFactory(write(t, "info:\n  version: 1.0.0\nconfiguration:\n  amfName: AMF\n")); err != nil {
+			t.Fatalf("a configuration without interception was refused: %v", err)
+		}
+	})
 }
