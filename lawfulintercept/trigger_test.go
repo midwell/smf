@@ -93,11 +93,15 @@ func staticRegistry(nodes map[string]string) *triggerRegistry {
 // resolved-address index, which this registry's own refresh loop writes, so the
 // contract has teeth: -race reports the read against that write, and the production
 // caller (plan) has held the lock all along.
-func matchOn(reg *triggerRegistry, session upfSession) (string, *upfEndpoint, bool) {
+const trigNodeA = "10.0.1.5"
+
+func matchOn(reg *triggerRegistry, session upfSession) (string, bool) {
 	reg.mu.Lock()
 	defer reg.mu.Unlock()
 
-	return reg.matchEndpoint(session)
+	key, _, ok := reg.matchEndpoint(session)
+
+	return key, ok
 }
 
 // upfNode parses a UPF's N4 node identity the way the session path carries it —
@@ -393,7 +397,7 @@ func triggerSubsystem(t *testing.T, poi *fakePOI) *subsystem {
 		NEID: "smf-1",
 		MDF3: "192.0.2.1:42069",
 		UPFTriggers: []UPFTrigger{
-			{NodeID: "10.0.1.5", X1URL: poi.srv.URL, NEID: "upf-1"},
+			{NodeID: trigNodeA, X1URL: poi.srv.URL, NEID: "upf-1"},
 		},
 	}
 
@@ -444,7 +448,7 @@ func TestInstallTriggersSendsWarrantIdentity(t *testing.T) {
 
 	s.installFor("session-ref-1",
 		[]types.InterceptTask{warrant},
-		[]upfSession{{node: upfNode("10.0.1.5"), seid: 14426627323429955319}},
+		[]upfSession{{node: upfNode(trigNodeA), seid: 14426627323429955319}},
 		0x2632898145f4d191)
 
 	if n := poi.countMessages("CreateDestinationRequest"); n != 1 {
@@ -495,7 +499,7 @@ func TestInstallTriggersIsIdempotent(t *testing.T) {
 		XID:      "11111111-1111-4111-8111-111111111111",
 		Products: []types.ProductType{types.ProductCC},
 	}
-	upfs := []upfSession{{node: upfNode("10.0.1.5"), seid: 42}}
+	upfs := []upfSession{{node: upfNode(trigNodeA), seid: 42}}
 
 	s.installFor("session-ref-1", []types.InterceptTask{warrant}, upfs, 7)
 	s.installFor("session-ref-1", []types.InterceptTask{warrant}, upfs, 7)
@@ -518,7 +522,7 @@ func TestInstallTriggersPerUPFAndWarrant(t *testing.T) {
 		NEID: "smf-1",
 		MDF3: "192.0.2.1:42069",
 		UPFTriggers: []UPFTrigger{
-			{NodeID: "10.0.1.5", X1URL: poi.srv.URL, NEID: "upf-1"},
+			{NodeID: trigNodeA, X1URL: poi.srv.URL, NEID: "upf-1"},
 			{NodeID: "10.0.1.6", X1URL: poi.srv.URL, NEID: "upf-2"},
 		},
 	}
@@ -528,7 +532,7 @@ func TestInstallTriggersPerUPFAndWarrant(t *testing.T) {
 		{XID: "11111111-1111-4111-8111-111111111111", Products: []types.ProductType{types.ProductCC}},
 		{XID: "22222222-2222-4222-8222-222222222222", Products: []types.ProductType{types.ProductCC}},
 	}
-	upfs := []upfSession{{node: upfNode("10.0.1.5"), seid: 42}, {node: upfNode("10.0.1.6"), seid: 43}}
+	upfs := []upfSession{{node: upfNode(trigNodeA), seid: 42}, {node: upfNode("10.0.1.6"), seid: 43}}
 
 	s.installFor("session-ref-1", warrants, upfs, 7)
 
@@ -569,7 +573,7 @@ func TestInstallTriggersReportsRefusal(t *testing.T) {
 	}
 
 	s.installFor("session-ref-1", []types.InterceptTask{warrant},
-		[]upfSession{{node: upfNode("10.0.1.5"), seid: 42}}, 7)
+		[]upfSession{{node: upfNode(trigNodeA), seid: 42}}, 7)
 
 	if len(rec.reports) != 1 {
 		t.Fatalf("task issues reported = %d, want 1", len(rec.reports))
@@ -600,7 +604,7 @@ func TestInstallTriggersRetriesAfterFailure(t *testing.T) {
 		XID:      "11111111-1111-4111-8111-111111111111",
 		Products: []types.ProductType{types.ProductCC},
 	}
-	upfs := []upfSession{{node: upfNode("10.0.1.5"), seid: 42}}
+	upfs := []upfSession{{node: upfNode(trigNodeA), seid: 42}}
 
 	s.installFor("session-ref-1", []types.InterceptTask{warrant}, upfs, 7)
 
@@ -659,7 +663,7 @@ func TestTakeForSessionAndWarrant(t *testing.T) {
 	// Two warrants, two sessions, two UPFs.
 	for _, w := range []types.XID{"warrant-a", "warrant-b"} {
 		for _, ref := range []string{"sess-1", "sess-2"} {
-			for _, node := range []string{"10.0.1.5", "10.0.1.6"} {
+			for _, node := range []string{trigNodeA, "10.0.1.6"} {
 				reg.installed[triggerKey(w, ref, node)] = installedTrigger{
 					xid: types.XID(string(w) + "|" + ref + "|" + node),
 				}
@@ -675,7 +679,7 @@ func TestTakeForSessionAndWarrant(t *testing.T) {
 	// the session, so a session whose PFCP state is already gone is still cleaned up.
 	got := reg.takeForSession("sess-1")
 	for _, w := range got {
-		if w.nodeID != "10.0.1.5" && w.nodeID != "10.0.1.6" {
+		if w.nodeID != trigNodeA && w.nodeID != "10.0.1.6" {
 			t.Errorf("takeForSession named an unexpected node %q", w.nodeID)
 		}
 	}
@@ -695,7 +699,7 @@ func TestTakeForSessionAndWarrant(t *testing.T) {
 	// must be deactivated at.
 	byWarrant := reg.takeForWarrant("warrant-a")
 	for _, w := range byWarrant {
-		if w.nodeID != "10.0.1.5" && w.nodeID != "10.0.1.6" {
+		if w.nodeID != trigNodeA && w.nodeID != "10.0.1.6" {
 			t.Errorf("takeForWarrant named an unexpected node %q", w.nodeID)
 		}
 	}
@@ -730,7 +734,7 @@ func TestInstallTriggersReprovisionsAfterRestart(t *testing.T) {
 
 	// First session: destination provisioned, trigger accepted.
 	s.installFor("session-1", []types.InterceptTask{warrant},
-		[]upfSession{{node: upfNode("10.0.1.5"), seid: 42}}, 7)
+		[]upfSession{{node: upfNode(trigNodeA), seid: 42}}, 7)
 
 	if n := poi.countMessages("CreateDestinationRequest"); n != 1 {
 		t.Fatalf("CreateDestination sent %d times, want 1", n)
@@ -743,7 +747,7 @@ func TestInstallTriggersReprovisionsAfterRestart(t *testing.T) {
 	poi.mu.Unlock()
 
 	s.installFor("session-2", []types.InterceptTask{warrant},
-		[]upfSession{{node: upfNode("10.0.1.5"), seid: 43}}, 9)
+		[]upfSession{{node: upfNode(trigNodeA), seid: 43}}, 9)
 
 	// We must have re-provisioned rather than given up.
 	if n := poi.countMessages("CreateDestinationRequest"); n != 2 {
@@ -791,7 +795,7 @@ func TestReconcileLeavesThisProcesssOwnTasking(t *testing.T) {
 		Products: []types.ProductType{types.ProductCC},
 	}
 	s.installFor("session-1", []types.InterceptTask{warrant},
-		[]upfSession{{node: upfNode("10.0.1.5"), seid: 42}}, 7)
+		[]upfSession{{node: upfNode(trigNodeA), seid: 42}}, 7)
 
 	// The POI reports exactly what this process just installed.
 	var mine []string
@@ -828,7 +832,7 @@ func (r *recordingTaskReporter) NotifyTask(xid, reportType, details string) {
 // fan-out exists so that one unreachable POI does not hold up the others; nothing
 // about one endpoint's reconciliation depends on it.
 func (s *subsystem) reconcileOne() {
-	s.reconcileEndpoint("10.0.1.5", s.triggers.endpoints["10.0.1.5"])
+	s.reconcileEndpoint(trigNodeA, s.triggers.endpoints[trigNodeA])
 }
 
 // installFor mirrors what triggerCC does — claim the triggers under the caller's
@@ -865,7 +869,7 @@ func TestTriggerInstalledAfterReleaseIsWithdrawn(t *testing.T) {
 		XID:      "11111111-1111-4111-8111-111111111111",
 		Products: []types.ProductType{types.ProductCC},
 	}
-	upfs := []upfSession{{node: upfNode("10.0.1.5"), seid: 0x2632898145f4d191}}
+	upfs := []upfSession{{node: upfNode(trigNodeA), seid: 0x2632898145f4d191}}
 
 	// Claim, as triggerCC does under the session lock.
 	planned, unreachable, undeliverable := s.triggers.plan("session-ref-1", []types.InterceptTask{warrant}, upfs, 7)
@@ -914,7 +918,7 @@ func TestTriggerNotInstalledBeforeCorrelationExists(t *testing.T) {
 		XID:      "11111111-1111-4111-8111-111111111111",
 		Products: []types.ProductType{types.ProductCC},
 	}
-	upfs := []upfSession{{node: upfNode("10.0.1.5"), seid: 0x2632898145f4d191}}
+	upfs := []upfSession{{node: upfNode(trigNodeA), seid: 0x2632898145f4d191}}
 
 	s.installFor("session-ref-1", []types.InterceptTask{warrant}, upfs, 0)
 
@@ -947,20 +951,20 @@ func TestMatchEndpointFollowsAUPFThatChangesAddress(t *testing.T) {
 		NEID: "smf-1", MDF3: "192.0.2.1:42069",
 		UPFTriggers: []UPFTrigger{{NodeID: name, X1URL: "https://upf-1:8443/X1/NE", NEID: "upf-1"}},
 	})
-	resolvingTo(reg, map[string]string{name: "10.0.1.5"})
+	resolvingTo(reg, map[string]string{name: trigNodeA})
 
-	if _, _, ok := matchOn(reg, sessionOn("10.0.1.5")); !ok {
+	if _, ok := matchOn(reg, sessionOn(trigNodeA)); !ok {
 		t.Fatal("a session on the UPF's current address found no triggering endpoint")
 	}
 
 	// The Service is recreated with a different address, and the refresh catches up.
 	resolvingTo(reg, map[string]string{name: "10.0.9.9"})
 
-	if _, _, ok := matchOn(reg, sessionOn("10.0.9.9")); !ok {
+	if _, ok := matchOn(reg, sessionOn("10.0.9.9")); !ok {
 		t.Error("the UPF changed address and its triggering endpoint became unreachable " +
 			"for the life of the process; content interception is silently dead until an SMF restart")
 	}
-	if _, _, ok := matchOn(reg, sessionOn("10.0.1.5")); ok {
+	if _, ok := matchOn(reg, sessionOn(trigNodeA)); ok {
 		t.Error("a session on the UPF's old address still matched; the endpoint is being " +
 			"selected from a stale address rather than the current one")
 	}
@@ -983,7 +987,7 @@ func TestMatchEndpointNeverMatchesUnresolvableNodes(t *testing.T) {
 	// Both shapes an unresolved session address can take: the zero address the
 	// session path yields for a name it could not resolve, and an empty one.
 	for _, addr := range []string{net.IPv4zero.String(), ""} {
-		if _, _, ok := matchOn(reg, upfSession{node: upfNode("upf-b.invalid"), addr: addr}); ok {
+		if _, ok := matchOn(reg, upfSession{node: upfNode("upf-b.invalid"), addr: addr}); ok {
 			t.Errorf("a session with address %q matched upf-a's triggering endpoint; "+
 				"one UPF's content would be tasked under another's warrant", addr)
 		}
@@ -1006,7 +1010,7 @@ func TestMatchEndpointPrefersIdentityOverResolution(t *testing.T) {
 		},
 	})
 
-	key, _, ok := matchOn(reg, sessionOn(name))
+	key, ok := matchOn(reg, sessionOn(name))
 	if !ok {
 		t.Fatal("a session identifying its UPF by name found no endpoint")
 	}
@@ -1024,8 +1028,8 @@ func TestTriggerRegistryRejectsAmbiguousNode(t *testing.T) {
 	_, err := newTriggerRegistry(Config{
 		NEID: "smf-1", MDF3: "192.0.2.1:42069",
 		UPFTriggers: []UPFTrigger{
-			{NodeID: "10.0.1.5", X1URL: "https://upf-1:8443/X1/NE", NEID: "upf-1"},
-			{NodeID: "10.0.1.5", X1URL: "https://upf-2:8443/X1/NE", NEID: "upf-2"},
+			{NodeID: trigNodeA, X1URL: "https://upf-1:8443/X1/NE", NEID: "upf-1"},
+			{NodeID: trigNodeA, X1URL: "https://upf-2:8443/X1/NE", NEID: "upf-2"},
 		},
 	}, nil, nil, nil)
 	if err == nil {
@@ -1050,12 +1054,12 @@ func TestMatchEndpointIsDeterministic(t *testing.T) {
 	})
 	resolvingTo(reg, map[string]string{"upf-one.test": "10.0.3.3", "upf-two.test": "10.0.3.3"})
 
-	first, _, ok := matchOn(reg, sessionOn("10.0.3.3"))
+	first, ok := matchOn(reg, sessionOn("10.0.3.3"))
 	if !ok {
 		t.Fatal("no endpoint matched an address both configured nodes resolve to")
 	}
 	for range 50 {
-		got, _, _ := matchOn(reg, sessionOn("10.0.3.3"))
+		got, _ := matchOn(reg, sessionOn("10.0.3.3"))
 		if got != first {
 			t.Fatalf("matched %q then %q: the same session would be triggered at a "+
 				"different UPF on re-establishment", first, got)
@@ -1096,7 +1100,7 @@ func TestReconcileReportsATriggerThePOISaysIsNotRunning(t *testing.T) {
 		Products: []types.ProductType{types.ProductCC},
 	}
 	s.installFor("session-1", []types.InterceptTask{warrant},
-		[]upfSession{{node: upfNode("10.0.1.5"), seid: 42}}, 7)
+		[]upfSession{{node: upfNode(trigNodeA), seid: 42}}, 7)
 
 	var mine []string
 	for _, installed := range s.triggers.installed {
@@ -1154,7 +1158,7 @@ func installOneTrigger(t *testing.T, s *subsystem) (warrant types.InterceptTask,
 		Products: []types.ProductType{types.ProductCC},
 	}
 	s.installFor("session-1", []types.InterceptTask{warrant},
-		[]upfSession{{node: upfNode("10.0.1.5"), seid: 42}}, 7)
+		[]upfSession{{node: upfNode(trigNodeA), seid: 42}}, 7)
 
 	for _, installed := range s.triggers.installed {
 		trigger = installed.xid
@@ -1391,18 +1395,18 @@ func TestKeepalivesFollowTaskingRatherThanConfiguration(t *testing.T) {
 	poi := newFakePOI(t)
 	s := triggerSubsystem(t, poi)
 	s.taskReporter = &recordingTaskReporter{}
-	endpoint := s.triggers.endpoints["10.0.1.5"]
+	endpoint := s.triggers.endpoints[trigNodeA]
 
 	// Reconciled and holding nothing: there is nothing to keep, so the POI is left
 	// to lapse whatever it still holds.
 	endpoint.markReconciled()
-	if s.triggers.keepaliveDue("10.0.1.5", endpoint) {
+	if s.triggers.keepaliveDue(trigNodeA, endpoint) {
 		t.Error("an SMF holding no content tasking keeps a POI alive, which is what makes " +
 			"its fail-safe unreachable")
 	}
 
 	warrant, _ := installOneTrigger(t, s)
-	if !s.triggers.keepaliveDue("10.0.1.5", endpoint) {
+	if !s.triggers.keepaliveDue(trigNodeA, endpoint) {
 		t.Error("a POI holding this SMF's live trigger is not kept alive; its fail-safe " +
 			"would purge an authorised interception")
 	}
@@ -1411,12 +1415,12 @@ func TestKeepalivesFollowTaskingRatherThanConfiguration(t *testing.T) {
 	// fail-safe to finish a job this process has not given up on, and the fail-safe
 	// takes everything at that POI with it.
 	pending := s.triggers.takeForWarrant(warrant.XID)
-	if !s.triggers.keepaliveDue("10.0.1.5", endpoint) {
+	if !s.triggers.keepaliveDue(trigNodeA, endpoint) {
 		t.Error("a POI is left to lapse while a withdrawal to it is still pending")
 	}
 
 	s.deactivate(pending)
-	if s.triggers.keepaliveDue("10.0.1.5", endpoint) {
+	if s.triggers.keepaliveDue(trigNodeA, endpoint) {
 		t.Error("keepalives continue after the last trigger was withdrawn and acknowledged")
 	}
 }
@@ -1432,18 +1436,18 @@ func TestKeepalivesWaitForReconciliation(t *testing.T) {
 	poi := newFakePOI(t)
 	s := triggerSubsystem(t, poi)
 	s.taskReporter = &recordingTaskReporter{}
-	endpoint := s.triggers.endpoints["10.0.1.5"]
+	endpoint := s.triggers.endpoints[trigNodeA]
 
 	// A session establishes before reconciliation has finished, so this process does
 	// hold tasking at the POI — and still owes it nothing, because what it cannot
 	// name is what the fail-safe is for.
 	installOneTrigger(t, s)
-	if s.triggers.keepaliveDue("10.0.1.5", endpoint) {
+	if s.triggers.keepaliveDue(trigNodeA, endpoint) {
 		t.Error("a POI is kept alive before this process has established what it holds")
 	}
 
 	s.reconcileOne()
-	if !s.triggers.keepaliveDue("10.0.1.5", endpoint) {
+	if !s.triggers.keepaliveDue(trigNodeA, endpoint) {
 		t.Error("a reconciled POI holding live tasking is not kept alive")
 	}
 }
@@ -1461,7 +1465,7 @@ func TestReconcileRetriesUntilThePOIAnswers(t *testing.T) {
 
 	s := triggerSubsystem(t, poi)
 	s.taskReporter = &recordingTaskReporter{}
-	endpoint := s.triggers.endpoints["10.0.1.5"]
+	endpoint := s.triggers.endpoints[trigNodeA]
 
 	attempts := 0
 	s.triggers.sleep = func(time.Duration) {
@@ -1539,7 +1543,7 @@ func TestFailSafeCannotReclaimAnOrphanBesideLiveTasking(t *testing.T) {
 	poi := newFakePOI(t)
 	s := triggerSubsystem(t, poi)
 	s.taskReporter = &recordingTaskReporter{}
-	endpoint := s.triggers.endpoints["10.0.1.5"]
+	endpoint := s.triggers.endpoints[trigNodeA]
 	endpoint.markReconciled()
 
 	// One live warrant's trigger, installed and running.
@@ -1557,14 +1561,14 @@ func TestFailSafeCannotReclaimAnOrphanBesideLiveTasking(t *testing.T) {
 	}
 	// The live trigger keeps the endpoint alive, so the POI's fail-safe never fires
 	// and the orphan keeps duplicating alongside it.
-	if !s.triggers.keepaliveDue("10.0.1.5", endpoint) {
+	if !s.triggers.keepaliveDue(trigNodeA, endpoint) {
 		t.Fatal("the endpoint is not kept alive despite holding a live trigger")
 	}
 
 	// Only once the live trigger is withdrawn and acknowledged does the endpoint
 	// fall silent — and only then can the fail-safe reclaim the orphan.
 	s.deactivate(s.triggers.takeForWarrant(warrant.XID))
-	if s.triggers.keepaliveDue("10.0.1.5", endpoint) {
+	if s.triggers.keepaliveDue(trigNodeA, endpoint) {
 		t.Error("the endpoint is still kept alive with nothing of ours left at it, so the " +
 			"orphan survives even the case this backstop does cover")
 	}
@@ -1592,7 +1596,7 @@ func TestRetargetDoesNotReapTheTriggerItInstalled(t *testing.T) {
 
 		// The old target's session, tasked before the modification.
 		s.installFor("session-old", []types.InterceptTask{task},
-			[]upfSession{{node: upfNode("10.0.1.5"), seid: 42}}, 7)
+			[]upfSession{{node: upfNode(trigNodeA), seid: 42}}, 7)
 
 		var wg sync.WaitGroup
 		wg.Add(2)
@@ -1600,7 +1604,7 @@ func TestRetargetDoesNotReapTheTriggerItInstalled(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			s.installFor("session-new", []types.InterceptTask{task},
-				[]upfSession{{node: upfNode("10.0.1.5"), seid: 43}}, 9)
+				[]upfSession{{node: upfNode(trigNodeA), seid: 43}}, 9)
 		}()
 		// The modification's own teardown, keeping the sessions the task still covers.
 		go func() {
@@ -1609,12 +1613,12 @@ func TestRetargetDoesNotReapTheTriggerItInstalled(t *testing.T) {
 		}()
 		wg.Wait()
 
-		key := triggerKey(warrant, "session-new", "10.0.1.5")
+		key := triggerKey(warrant, "session-new", trigNodeA)
 		if _, held := s.triggers.installed[key]; !held {
 			t.Fatalf("the retarget reaped the trigger it had just installed for the new target; "+
 				"installed = %v", s.triggers.installed)
 		}
-		if _, gone := s.triggers.installed[triggerKey(warrant, "session-old", "10.0.1.5")]; gone {
+		if _, gone := s.triggers.installed[triggerKey(warrant, "session-old", trigNodeA)]; gone {
 			t.Fatal("the trigger for a session the task no longer covers survived the retarget")
 		}
 		if n := s.triggers.pendingCount(); n != 0 {
@@ -1648,7 +1652,7 @@ func TestAReactivatedWarrantDoesNotDisplaceTheWithdrawalInFlight(t *testing.T) {
 	poi.refuse = false
 	poi.mu.Unlock()
 	s.installFor("session-1", []types.InterceptTask{warrant},
-		[]upfSession{{node: upfNode("10.0.1.5"), seid: 42}}, 7)
+		[]upfSession{{node: upfNode(trigNodeA), seid: 42}}, 7)
 
 	var second types.XID
 	for _, installed := range s.triggers.installed {
@@ -1924,7 +1928,7 @@ func TestAnUnbindableActivationAnswerIsReportedAsElementLevel(t *testing.T) {
 		Products: []types.ProductType{types.ProductCC},
 	}
 	s.installFor("session-1", []types.InterceptTask{warrant},
-		[]upfSession{{node: upfNode("10.0.1.5"), seid: 42}}, 7)
+		[]upfSession{{node: upfNode(trigNodeA), seid: 42}}, 7)
 
 	// The X1 exchanges happen off the signalling path, so the assertion has to wait
 	// for them rather than for installFor to return.
@@ -1984,7 +1988,7 @@ func TestTriggerCarriesDeliveryXIDNotTaskXID(t *testing.T) {
 		ProductID: productID,
 		Products:  []types.ProductType{types.ProductCC},
 	}
-	upfs := []upfSession{{node: upfNode("10.0.1.5"), seid: 0x2632898145f4d191}}
+	upfs := []upfSession{{node: upfNode(trigNodeA), seid: 0x2632898145f4d191}}
 
 	planned, unreachable, undeliverable := s.triggers.plan("session-ref-1", []types.InterceptTask{warrant}, upfs, 7)
 	if len(unreachable) != 0 || len(undeliverable) != 0 || len(planned) != 1 {
@@ -2040,7 +2044,7 @@ func TestTriggerWithoutProductIDCarriesTheTaskXID(t *testing.T) {
 		XID:      taskXID,
 		Products: []types.ProductType{types.ProductCC},
 	}
-	upfs := []upfSession{{node: upfNode("10.0.1.5"), seid: 0x2632898145f4d191}}
+	upfs := []upfSession{{node: upfNode(trigNodeA), seid: 0x2632898145f4d191}}
 
 	planned, unreachable, undeliverable := s.triggers.plan("session-ref-1", []types.InterceptTask{warrant}, upfs, 7)
 	if len(unreachable) != 0 || len(undeliverable) != 0 || len(planned) != 1 {
@@ -2067,7 +2071,7 @@ func withdrawOne(t *testing.T, s *subsystem) []withdrawal {
 		XID:      "11111111-1111-4111-8111-111111111111",
 		Products: []types.ProductType{types.ProductCC},
 	}
-	upfs := []upfSession{{node: upfNode("10.0.1.5"), seid: 0x2632898145f4d191}}
+	upfs := []upfSession{{node: upfNode(trigNodeA), seid: 0x2632898145f4d191}}
 
 	planned, unreachable, undeliverable := s.triggers.plan("session-ref-1", []types.InterceptTask{warrant}, upfs, 7)
 	if len(unreachable) != 0 || len(undeliverable) != 0 || len(planned) != 1 {
@@ -2162,9 +2166,9 @@ func TestKeepaliveLapsesAfterNoSuchTaskWithdrawal(t *testing.T) {
 	s := triggerSubsystem(t, poi)
 	pending := withdrawOne(t, s)
 
-	endpoint := s.triggers.endpoints["10.0.1.5"]
+	endpoint := s.triggers.endpoints[trigNodeA]
 	endpoint.markReconciled()
-	if !s.triggers.keepaliveDue("10.0.1.5", endpoint) {
+	if !s.triggers.keepaliveDue(trigNodeA, endpoint) {
 		t.Fatal("test setup: the endpoint should be kept alive while a withdrawal is pending")
 	}
 
@@ -2175,7 +2179,7 @@ func TestKeepaliveLapsesAfterNoSuchTaskWithdrawal(t *testing.T) {
 
 	s.deactivate(pending)
 
-	if s.triggers.keepaliveDue("10.0.1.5", endpoint) {
+	if s.triggers.keepaliveDue(trigNodeA, endpoint) {
 		t.Error("the endpoint is still being kept alive after a completed withdrawal — " +
 			"the keepalives a phantom pending entry earns are what disable the POI's fail-safe")
 	}
@@ -2196,9 +2200,9 @@ func TestSessionTeardownLeavesNoTaskingBehind(t *testing.T) {
 	s := triggerSubsystem(t, poi)
 	pending := withdrawOne(t, s)
 
-	endpoint := s.triggers.endpoints["10.0.1.5"]
+	endpoint := s.triggers.endpoints[trigNodeA]
 	endpoint.markReconciled()
-	if !s.triggers.keepaliveDue("10.0.1.5", endpoint) {
+	if !s.triggers.keepaliveDue(trigNodeA, endpoint) {
 		t.Fatal("test setup: a session holding a trigger should keep its POI alive")
 	}
 
@@ -2207,7 +2211,7 @@ func TestSessionTeardownLeavesNoTaskingBehind(t *testing.T) {
 	if n := len(s.triggers.installed); n != 0 {
 		t.Errorf("%d triggers still installed after the session's teardown, want 0", n)
 	}
-	if s.triggers.keepaliveDue("10.0.1.5", endpoint) {
+	if s.triggers.keepaliveDue(trigNodeA, endpoint) {
 		t.Error("the POI is still being kept alive after the session that held its " +
 			"tasking was torn down — its fail-safe cannot reclaim anything while this " +
 			"element keeps telling it that the function responsible is present")
@@ -2274,7 +2278,7 @@ func TestTriggerNamesTheTasksOwnX3Destinations(t *testing.T) {
 	s.installFor("session-ref-1", []types.InterceptTask{
 		x3Task("11111111-1111-4111-8111-111111111111", agencyA),
 		x3Task("22222222-2222-4222-8222-222222222222", agencyB),
-	}, []upfSession{{node: upfNode("10.0.1.5"), seid: 0x2632898145f4d191}}, 7)
+	}, []upfSession{{node: upfNode(trigNodeA), seid: 0x2632898145f4d191}}, 7)
 
 	// Two destinations provisioned, one per agency, and neither is the configured
 	// MDF3 — which no task named.
@@ -2367,7 +2371,7 @@ func TestTriggerFallsBackToTheConfiguredMDF3(t *testing.T) {
 		Products: []types.ProductType{types.ProductCC},
 		// Named no destination at all: the gap the provisioning function left, which the
 		// configured endpoint is there to fill.
-	}}, []upfSession{{node: upfNode("10.0.1.5"), seid: 0x2632898145f4d191}}, 7)
+	}}, []upfSession{{node: upfNode(trigNodeA), seid: 0x2632898145f4d191}}, 7)
 
 	addresses := poi.elements("CreateDestinationRequest", "IPv4Address")
 	ports := poi.elements("CreateDestinationRequest", "TCPPort")
@@ -2411,7 +2415,7 @@ func TestATaskWhoseDestinationsYieldNoX3EndpointIsNotServedFromConfiguration(t *
 		Deliveries: []types.DeliveryEndpoint{
 			{DID: "99999999-9999-4999-8999-999999999999", Type: types.DeliveryX2, Address: "10.0.60.122:42069"},
 		},
-	}}, []upfSession{{node: upfNode("10.0.1.5"), seid: 0x2632898145f4d191}}, 7)
+	}}, []upfSession{{node: upfNode(trigNodeA), seid: 0x2632898145f4d191}}, 7)
 
 	if n := poi.countMessages("CreateDestinationRequest"); n != 0 {
 		t.Errorf("provisioned %d destinations at the POI for a task whose content has nowhere to "+
@@ -2441,7 +2445,7 @@ func TestTwoWarrantsToOneEndpointShareItsDestination(t *testing.T) {
 	s.installFor("session-ref-1", []types.InterceptTask{
 		x3Task("11111111-1111-4111-8111-111111111111", shared),
 		x3Task("22222222-2222-4222-8222-222222222222", shared),
-	}, []upfSession{{node: upfNode("10.0.1.5"), seid: 0x2632898145f4d191}}, 7)
+	}, []upfSession{{node: upfNode(trigNodeA), seid: 0x2632898145f4d191}}, 7)
 
 	if n := poi.countMessages("CreateDestinationRequest"); n != 1 {
 		t.Errorf("provisioned %d destinations for one endpoint, want 1", n)
@@ -2465,7 +2469,7 @@ func TestTriggerCarriesEveryDestinationATaskNames(t *testing.T) {
 
 	s.installFor("session-ref-1", []types.InterceptTask{
 		x3Task("11111111-1111-4111-8111-111111111111", "198.51.100.10:5000", "198.51.100.11:5001"),
-	}, []upfSession{{node: upfNode("10.0.1.5"), seid: 0x2632898145f4d191}}, 7)
+	}, []upfSession{{node: upfNode(trigNodeA), seid: 0x2632898145f4d191}}, 7)
 
 	if n := poi.countMessages("CreateDestinationRequest"); n != 2 {
 		t.Errorf("provisioned %d destinations, want 2", n)
@@ -2490,7 +2494,7 @@ func TestWarrantWithNoResolvableDestinationAndNoFallbackIsReported(t *testing.T)
 	s.installFor("session-ref-1", []types.InterceptTask{{
 		XID:      "11111111-1111-4111-8111-111111111111",
 		Products: []types.ProductType{types.ProductCC},
-	}}, []upfSession{{node: upfNode("10.0.1.5"), seid: 0x2632898145f4d191}}, 7)
+	}}, []upfSession{{node: upfNode(trigNodeA), seid: 0x2632898145f4d191}}, 7)
 
 	if n := poi.countMessages("ActivateTaskRequest"); n != 0 {
 		t.Errorf("installed %d triggers for a warrant whose content has nowhere to go", n)
@@ -2547,6 +2551,9 @@ func awaitMessages(t *testing.T, p *fakePOI, msgType string, n int) {
 // The withdrawal after a failed activation runs on its own goroutine — the triggers
 // behind it in a batch must not wait for a retry loop — so a test that asserted
 // immediately would be asserting on a race.
+// have to be rewritten the first time a test waited for one.
+//
+//nolint:unparam // want is what the wait is for; a helper that only waited for zero would
 func awaitPending(t *testing.T, r *triggerRegistry, want int) {
 	t.Helper()
 
@@ -2591,7 +2598,7 @@ func TestAmbiguousActivationIsWithdrawnNotForgotten(t *testing.T) {
 		Products: []types.ProductType{types.ProductCC},
 	}
 	s.installFor("session-ref-1", []types.InterceptTask{warrant},
-		[]upfSession{{node: upfNode("10.0.1.5"), seid: 0x2632898145f4d191}}, 7)
+		[]upfSession{{node: upfNode(trigNodeA), seid: 0x2632898145f4d191}}, 7)
 
 	// The trigger must not have been silently dropped: the registry keeps it and
 	// withdraws it. Asserted on the withdrawal arriving at the POI, because that is
@@ -2623,7 +2630,7 @@ func TestRefusedActivationIsReleasedNotWithdrawn(t *testing.T) {
 	s.installFor("session-ref-1", []types.InterceptTask{{
 		XID:      "11111111-1111-4111-8111-111111111111",
 		Products: []types.ProductType{types.ProductCC},
-	}}, []upfSession{{node: upfNode("10.0.1.5"), seid: 0x2632898145f4d191}}, 7)
+	}}, []upfSession{{node: upfNode(trigNodeA), seid: 0x2632898145f4d191}}, 7)
 
 	if n := poi.countMessages("DeactivateTaskRequest"); n != 0 {
 		t.Errorf("sent %d withdrawals for a trigger the POI stated it refused", n)
@@ -2665,7 +2672,7 @@ func TestWithdrawalOfATriggerThePOINeverReceivedCompletesAtOnce(t *testing.T) {
 	s.installFor("session-ref-1", []types.InterceptTask{{
 		XID:      "11111111-1111-4111-8111-111111111111",
 		Products: []types.ProductType{types.ProductCC},
-	}}, []upfSession{{node: upfNode("10.0.1.5"), seid: 0x2632898145f4d191}}, 7)
+	}}, []upfSession{{node: upfNode(trigNodeA), seid: 0x2632898145f4d191}}, 7)
 
 	awaitPending(t, s.triggers, 0)
 
@@ -2692,7 +2699,7 @@ func TestWarrantWithdrawnAfterAnAmbiguousActivationStillReachesThePOI(t *testing
 	s.installFor("session-ref-1", []types.InterceptTask{{
 		XID:      warrantXID,
 		Products: []types.ProductType{types.ProductCC},
-	}}, []upfSession{{node: upfNode("10.0.1.5"), seid: 0x2632898145f4d191}}, 7)
+	}}, []upfSession{{node: upfNode(trigNodeA), seid: 0x2632898145f4d191}}, 7)
 
 	awaitMessages(t, poi, "DeactivateTaskRequest", 1)
 	awaitPending(t, s.triggers, 0)
@@ -2737,7 +2744,7 @@ func TestMatchEndpointPerformsNoResolution(t *testing.T) {
 	// loop running, a lookup it makes on its own goroutine is indistinguishable from
 	// one made here, and the assertion would be about timing rather than about the
 	// function under test.
-	reg := staticRegistry(map[string]string{name: "10.0.1.5", "10.0.4.4": "10.0.4.4"})
+	reg := staticRegistry(map[string]string{name: trigNodeA, "10.0.4.4": "10.0.4.4"})
 	reg.lookup = func(_ context.Context, host string) (string, error) {
 		t.Errorf("matchEndpoint resolved %q; on this path a name lookup runs under the "+
 			"session lock of the subscriber being intercepted", host)
@@ -2749,8 +2756,8 @@ func TestMatchEndpointPerformsNoResolution(t *testing.T) {
 	// match at all — the last being the one that used to resolve the most, since it
 	// exhausted the identity pass and then resolved every configured node in turn.
 	for _, session := range []upfSession{
-		{node: upfNode(name), addr: "10.0.1.5"},
-		{node: upfNode("10.0.1.5"), addr: "10.0.1.5"},
+		{node: upfNode(name), addr: trigNodeA},
+		{node: upfNode(trigNodeA), addr: trigNodeA},
 		{node: upfNode("10.0.4.4"), addr: "10.0.4.4"},
 		{node: upfNode("10.0.9.9"), addr: "10.0.9.9"},
 	} {
@@ -2780,9 +2787,9 @@ func TestResolvingATriggeringEndpointIsSilent(t *testing.T) {
 		NEID: "smf-1", MDF3: "192.0.2.1:42069",
 		UPFTriggers: []UPFTrigger{{NodeID: name, X1URL: "https://upf-1:8443/X1/NE", NEID: "upf-1"}},
 	})
-	resolvingTo(reg, map[string]string{name: "10.0.1.5"})
+	resolvingTo(reg, map[string]string{name: trigNodeA})
 
-	_, _, ok := matchOn(reg, sessionOn("10.0.1.5"))
+	_, ok := matchOn(reg, sessionOn(trigNodeA))
 
 	if !ok {
 		t.Fatal("the endpoint did not match, so this test proves nothing about what it logged")
@@ -2803,19 +2810,19 @@ func TestSessionUPFsCarriesTheAddressItAlreadyResolved(t *testing.T) {
 	sc := &smfctx.SMContext{}
 
 	node := smfctx.NewDataPathNode()
-	node.UPF = &smfctx.UPF{NodeID: upfNode("10.0.1.5")}
+	node.UPF = &smfctx.UPF{NodeID: upfNode(trigNodeA)}
 	sc.Tunnel = &smfctx.UPTunnel{DataPathPool: smfctx.DataPathPool{
 		1: &smfctx.DataPath{FirstDPNode: node, IsDefaultPath: true},
 	}}
 	sc.PFCPContext = map[string]*smfctx.PFCPSessionContext{
-		"10.0.1.5": {RemoteSEID: 0x2632898145f4d191},
+		trigNodeA: {RemoteSEID: 0x2632898145f4d191},
 	}
 
 	upfs := sessionUPFs(sc)
 	if len(upfs) != 1 {
 		t.Fatalf("sessionUPFs returned %d entries, want 1", len(upfs))
 	}
-	if upfs[0].addr != "10.0.1.5" {
+	if upfs[0].addr != trigNodeA {
 		t.Errorf("upfSession.addr = %q, want the resolved address the PFCP context is keyed by", upfs[0].addr)
 	}
 }
@@ -2847,7 +2854,7 @@ func TestProductIDChangeReachesTheInstalledTrigger(t *testing.T) {
 		Products: []types.ProductType{types.ProductCC},
 	}
 	s.installFor("session-ref-1", []types.InterceptTask{prev},
-		[]upfSession{{node: upfNode("10.0.1.5"), addr: "10.0.1.5", seid: 0x2632898145f4d191}}, 7)
+		[]upfSession{{node: upfNode(trigNodeA), addr: trigNodeA, seid: 0x2632898145f4d191}}, 7)
 
 	if got := poi.elements("ActivateTaskRequest", "productID"); len(got) != 1 || got[0] != oldLabel {
 		t.Fatalf("activation carried productID %v, want [%s]", got, oldLabel)
@@ -2906,7 +2913,7 @@ func TestAModificationThatChangesNoLabelSendsNothing(t *testing.T) {
 		Products: []types.ProductType{types.ProductCC},
 	}
 	s.installFor("session-ref-1", []types.InterceptTask{prev},
-		[]upfSession{{node: upfNode("10.0.1.5"), addr: "10.0.1.5", seid: 0x2632898145f4d191}}, 7)
+		[]upfSession{{node: upfNode(trigNodeA), addr: trigNodeA, seid: 0x2632898145f4d191}}, 7)
 
 	s.modifyInterception(prev, prev)
 
@@ -2988,7 +2995,7 @@ func TestAModificationDoesNotWalkTheSessionPool(t *testing.T) {
 		Products: []types.ProductType{types.ProductCC},
 	}
 	s.installFor(triggered.Ref, []types.InterceptTask{task},
-		[]upfSession{{node: upfNode("10.0.1.5"), addr: "10.0.1.5", seid: 0x2632898145f4d191}}, 7)
+		[]upfSession{{node: upfNode(trigNodeA), addr: trigNodeA, seid: 0x2632898145f4d191}}, 7)
 
 	// A second session the same warrant targets, with no trigger of its own — the kind
 	// the pool walk used to visit and the bounded read never does.
@@ -3041,7 +3048,7 @@ func TestSessionsWithTriggersNamesOnlyThisWarrantsSessions(t *testing.T) {
 		mine   = "11111111-1111-4111-8111-111111111111"
 		theirs = "22222222-2222-4222-8222-222222222222"
 	)
-	upfs := []upfSession{{node: upfNode("10.0.1.5"), addr: "10.0.1.5", seid: 0x2632898145f4d191}}
+	upfs := []upfSession{{node: upfNode(trigNodeA), addr: trigNodeA, seid: 0x2632898145f4d191}}
 	cc := func(xid string) types.InterceptTask {
 		return types.InterceptTask{XID: types.XID(xid), Products: []types.ProductType{types.ProductCC}}
 	}
@@ -3103,7 +3110,7 @@ func TestAnActivationThatTimesOutIsWithdrawnNotForgotten(t *testing.T) {
 
 	started := time.Now()
 	s.installFor("session-ref-1", []types.InterceptTask{warrant},
-		[]upfSession{{node: upfNode("10.0.1.5"), seid: 0x2632898145f4d191}}, 7)
+		[]upfSession{{node: upfNode(trigNodeA), seid: 0x2632898145f4d191}}, 7)
 	elapsed := time.Since(started)
 
 	// It really was the requester's clock that ended the activation. Everything else in
@@ -3163,7 +3170,7 @@ func TestALabelChangeArrivingWithATargetChangeStillReachesTheTrigger(t *testing.
 		Products: []types.ProductType{types.ProductCC},
 	}
 	s.installFor(session.Ref, []types.InterceptTask{prev},
-		[]upfSession{{node: upfNode("10.0.1.5"), addr: "10.0.1.5", seid: 0x2632898145f4d191}}, 7)
+		[]upfSession{{node: upfNode(trigNodeA), addr: trigNodeA, seid: 0x2632898145f4d191}}, 7)
 
 	if got := poi.elements("ActivateTaskRequest", "productID"); len(got) != 1 || got[0] != oldLabel {
 		t.Fatalf("activation carried productID %v, want [%s]", got, oldLabel)
@@ -3213,7 +3220,7 @@ func TestTwoTriggeringEndpointsMayNotShareAnElementIdentifier(t *testing.T) {
 	shared := Config{
 		NEID: "smf-1", MDF3: "192.0.2.1:42069",
 		UPFTriggers: []UPFTrigger{
-			{NodeID: "10.0.1.5", X1URL: "https://upf-a:8443/X1/NE", NEID: "upf-1"},
+			{NodeID: trigNodeA, X1URL: "https://upf-a:8443/X1/NE", NEID: "upf-1"},
 			{NodeID: "10.0.1.6", X1URL: "https://upf-b:8443/X1/NE", NEID: "upf-1"},
 		},
 	}
@@ -3227,7 +3234,7 @@ func TestTwoTriggeringEndpointsMayNotShareAnElementIdentifier(t *testing.T) {
 	// Distinct identifiers are the ordinary multi-UPF case and must still build.
 	distinct := shared
 	distinct.UPFTriggers = []UPFTrigger{
-		{NodeID: "10.0.1.5", X1URL: "https://upf-a:8443/X1/NE", NEID: "upf-1"},
+		{NodeID: trigNodeA, X1URL: "https://upf-a:8443/X1/NE", NEID: "upf-1"},
 		{NodeID: "10.0.1.6", X1URL: "https://upf-b:8443/X1/NE", NEID: "upf-2"},
 	}
 	if _, err := newTriggerRegistry(distinct, nil, nil, nil); err != nil {
@@ -3260,7 +3267,7 @@ func TestTwoPointsOfInterceptionServingOneSessionShareTheWarrantAndNotTheirIdent
 		triggers: mustRegistry(Config{
 			NEID: "smf-1", MDF3: "192.0.2.1:42069",
 			UPFTriggers: []UPFTrigger{
-				{NodeID: "10.0.1.5", X1URL: anchor.srv.URL, NEID: "upf-anchor"},
+				{NodeID: trigNodeA, X1URL: anchor.srv.URL, NEID: "upf-anchor"},
 				{NodeID: "10.0.1.6", X1URL: branch.srv.URL, NEID: "upf-branch"},
 			},
 		}),
@@ -3281,7 +3288,7 @@ func TestTwoPointsOfInterceptionServingOneSessionShareTheWarrantAndNotTheirIdent
 	// One session, two serving UPFs, one correlation — the session's.
 	const correlation = 7
 	upfs := []upfSession{
-		{node: upfNode("10.0.1.5"), addr: "10.0.1.5", seid: 0x2632898145f4d191},
+		{node: upfNode(trigNodeA), addr: trigNodeA, seid: 0x2632898145f4d191},
 		{node: upfNode("10.0.1.6"), addr: "10.0.1.6", seid: 0x51f4d1912632898a},
 	}
 	s.installFor("session-ref-1", []types.InterceptTask{warrant}, upfs, correlation)

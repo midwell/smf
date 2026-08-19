@@ -52,6 +52,9 @@ func duplicatingSession(t *testing.T) *smfctx.SMContext {
 
 // outcomeFixture is a subsystem whose PFCP modifications are counted rather than sent, with
 // a real reporter pointed at a stub ADMF.
+// be shaped by which assertions happen to need it today.
+//
+//nolint:unparam // the subsystem is the thing under test; a fixture that withheld it would
 func outcomeFixture(t *testing.T) (*subsystem, *admfStub, func() int) {
 	t.Helper()
 
