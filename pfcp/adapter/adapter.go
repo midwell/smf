@@ -31,6 +31,19 @@ func init() {
 // that already builds the LI subsystem.
 var POIRestarted func(node context.NodeID, addr string)
 
+// LIModificationAnswered is the Lawful Interception hook this package calls with the
+// outcome of a modification the interception subsystem sent. Nil unless LI is wired, and
+// assigned by the same service wiring that assigns POIRestarted, for the same reason: this
+// package may not import lawfulintercept.
+var LIModificationAnswered func(req lisequence.Request, cause uint8, answered bool)
+
+// notifyLIModificationAnswered calls the hook if one is wired.
+func notifyLIModificationAnswered(req lisequence.Request, cause uint8, answered bool) {
+	if LIModificationAnswered != nil {
+		LIModificationAnswered(req, cause, answered)
+	}
+}
+
 // notifyPOIRestarted calls the hook if one is wired. Written once so a new call site cannot
 // forget the nil check — a nil function value panics, and these are PFCP message handlers.
 func notifyPOIRestarted(node context.NodeID, addr string) {
@@ -416,9 +429,19 @@ func HandlePfcpSessionModificationResponse(msg *udp.Message) {
 	// serving UPF, procedure state — cannot tell the two apart, which is why the
 	// sequence number is what answers it.
 	//
-	// Note that Is *consumes* the record. Before this, nothing in adapter mode consumed
-	// it, so every LI-originated sequence number lingered until the two-minute age-out.
-	if lisequence.Is(pfcpRsp.Sequence()) {
+	// Note that Take *consumes* the record. Before this, nothing in adapter mode consumed
+	// it, so every LI-originated sequence number lingered until the age-out.
+	//
+	// **And the answer is read.** Keeping it out of the subscriber's procedure is one
+	// obligation and discarding it was a second mistake: the Cause says whether the
+	// datapath applied the duplication this element had already recorded as applied, and
+	// with it discarded a refused activation was never retried — the element holding a
+	// task it reports as intercepting and a datapath that declined it, with nothing left
+	// to re-send and nothing reported. A refused withdrawal left duplication running while
+	// the element believed it was off.
+	if req, ok := lisequence.Take(pfcpRsp.Sequence()); ok {
+		notifyLIModificationAnswered(req, causeValue, true)
+
 		return
 	}
 

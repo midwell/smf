@@ -341,6 +341,23 @@ func SendPfcpSessionModificationRequestForLI(
 		nil, nil, nil, upfPort, true)
 }
 
+// anyDuplicating reports whether this modification asks the datapath to duplicate.
+//
+// Any rather than all: an LI modification carries the session's forwarding FARs, and the
+// tasking either applies to the session or does not — the FARs move together. What the
+// answer's consumer needs from it is which of the two failures a refusal is, since a
+// refused activation is an interception that is not running and a refused withdrawal is
+// one that has not stopped.
+func anyDuplicating(farList []*smf_context.FAR) bool {
+	for _, far := range farList {
+		if far != nil && far.ApplyAction.Dupl {
+			return true
+		}
+	}
+
+	return false
+}
+
 func sendSessionModification(
 	upNodeID smf_context.NodeID,
 	ctx *smf_context.SMContext,
@@ -354,13 +371,26 @@ func sendSessionModification(
 	forLI bool,
 ) error {
 	seqNum := getSeqNumber()
-	if forLI {
-		lisequence.Mark(seqNum)
-	}
 	upNodeIDStr := upNodeID.ResolveNodeIdToIp().String()
 	pfcpContext, ok := ctx.PFCPContext[upNodeIDStr]
 	if !ok {
 		return fmt.Errorf("PFCP Context not found for NodeID[%s]", upNodeIDStr)
+	}
+	if forLI {
+		// **What was asked travels with the sequence number.** The builder below sets
+		// far.State = RULE_CREATE for every FAR it encodes, so the RULE_UPDATE marker
+		// that selected these FARs is cleared by this send — and the SMF-side Dupl bit
+		// already equals what the tasking implies, so nothing re-derives it. A response
+		// handler that went back to the session to work out what had been requested
+		// would find nothing to do, which is why a refused activation was never retried.
+		//
+		// Recorded after the PFCP context lookup, so a modification that is not sent
+		// leaves no record awaiting an answer that cannot come.
+		lisequence.Mark(seqNum, lisequence.Request{
+			SEID:        pfcpContext.LocalSEID,
+			NodeID:      upNodeIDStr,
+			Duplicating: anyDuplicating(farList),
+		})
 	}
 	pfcpMsg, err := BuildPfcpSessionModificationRequest(seqNum, pfcpContext.LocalSEID, pfcpContext.RemoteSEID, smf_context.SMF_Self().CPNodeID.ResolveNodeIdToIp(), pdrList, farList, qerList, removePDR, removeFAR, removeQER)
 	if err != nil {

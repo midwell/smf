@@ -177,6 +177,8 @@ func (smf *SMF) Start() {
 		// and adapter handlers is active in a deployment, and a remedy present in one of them
 		// is a remedy whose presence depends on enableUPFAdapter.
 		adapter.POIRestarted = lawfulintercept.POIRestarted
+		// And the answer to this element's own PFCP modifications, for the same reason.
+		adapter.LIModificationAnswered = lawfulintercept.ModificationAnswered
 		triggers := make([]lawfulintercept.UPFTrigger, 0, len(li.UPFTriggers))
 		for _, t := range li.UPFTriggers {
 			triggers = append(triggers, lawfulintercept.UPFTrigger{

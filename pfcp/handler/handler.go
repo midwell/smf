@@ -62,6 +62,30 @@ func FindFTEID(createdPDRIEs []*ie.IE) (*ie.FTEIDFields, error) {
 // Production behaviour is unchanged: it is the same function.
 var POIRestarted = lawfulintercept.POIRestarted
 
+// LIModificationAnswered is the Lawful Interception hook carrying the outcome of a
+// modification the interception subsystem sent. Reached through a package variable for the
+// reason POIRestarted is: so a test can observe that this path raises it.
+var LIModificationAnswered = lawfulintercept.ModificationAnswered
+
+// liResponseCause reads the Cause of a session modification response, reporting whether one
+// could be read at all.
+//
+// An answer with no readable Cause is not an acceptance. It says the element does not know
+// what the datapath did, which is the same state as silence — and the element must treat
+// "do not know" as "not applied", because over-applying duplication is visible to the CC-POI
+// as content it can attribute while under-applying it is silent.
+func liResponseCause(rsp *message.SessionModificationResponse) (uint8, bool) {
+	if rsp.Cause == nil {
+		return 0, false
+	}
+	cause, err := rsp.Cause.Cause()
+	if err != nil {
+		return 0, false
+	}
+
+	return cause, true
+}
+
 func HandlePfcpHeartbeatRequest(msg *udp.Message) {
 	_, ok := msg.PfcpMessage.(*message.HeartbeatRequest)
 	if !ok {
@@ -665,10 +689,19 @@ func HandlePfcpSessionModificationResponse(msg *udp.Message) {
 	// session's own procedures sent. The correlation below — SEID, serving UPF,
 	// procedure state — cannot tell the two apart, so without this the LI answer
 	// clears the pending entry a concurrent subscriber modification is waiting on
-	// and completes that procedure on an answer never sent to it. Nothing about the
-	// LI modification needs handling here: it carries no session-state transition
-	// and nothing waits on it.
-	if lisequence.Is(rsp.Sequence()) {
+	// and completes that procedure on an answer never sent to it.
+	//
+	// **Keeping it out of that procedure is one obligation; discarding it was a second
+	// mistake.** The guard returned without reading the Cause, so the answer to this
+	// element's own modification was thrown away — and with it, a refused activation was
+	// never retried: the element held a task it reported as intercepting and a datapath
+	// that had declined it, with nothing left to re-send (the send itself cleared the
+	// RULE_UPDATE marker) and nothing reported. A refused withdrawal left duplication
+	// running while the element believed it was off.
+	if req, ok := lisequence.Take(rsp.Sequence()); ok {
+		cause, answered := liResponseCause(rsp)
+		LIModificationAnswered(req, cause, answered)
+
 		return
 	}
 

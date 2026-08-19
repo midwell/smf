@@ -118,6 +118,13 @@ type taskIssueReporter interface {
 }
 
 type subsystem struct {
+	// modMu guards modAttempts, which counts how many times an LI-initiated PFCP
+	// modification has been sent for one (session, UPF) without the datapath applying it.
+	// It lives here rather than travelling with the request because the send site does not
+	// know how many attempts preceded it — the sequence number is allocated per send.
+	modMu       sync.Mutex
+	modAttempts map[modKey]int
+
 	// scans counts the activation and deactivation scan goroutines this subsystem has
 	// dispatched. Nothing in production waits on it — the whole point of the scan is
 	// that a provisioning answer does not — but a scan is this subsystem's work, and
@@ -493,6 +500,12 @@ func Init(cfg Config) error {
 		sub.triggers.Start()
 		go sub.reconcileTriggers()
 	}
+	// The modifications no answer arrived for. Silence is not a lesser case than a refusal:
+	// this element records duplication as applied when it sends, so an answer that never
+	// comes leaves a task reported as intercepting against a datapath that may have
+	// declined. A nil stop channel — the condition can arise for as long as this element
+	// can send a modification.
+	go sub.watchModifications(nil)
 	// Tasking lives in memory, so this element has just discarded every warrant it
 	// held. Nothing else tells the ADMF that — it goes on believing the
 	// interceptions it provisioned are running — and the standard's audit path is a
@@ -1090,9 +1103,26 @@ func (s *subsystem) applyCC(sc *smfctx.SMContext) bool {
 // failure surfaces through normal PFCP handling, never a target-revealing log).
 // Caller holds sc.SMLock.
 func (s *subsystem) modifySession(sc *smfctx.SMContext) {
-	if sessionModifier != nil {
-		//nolint:errcheck // failure surfaces through normal PFCP handling, never a target-revealing log
-		_ = sessionModifier(sc)
+	if sessionModifier == nil {
+		return
+	}
+	if err := sessionModifier(sc); err != nil {
+		// **A send that failed is an outcome, and it used to be discarded here.** The
+		// comment said the failure surfaces through normal PFCP handling, which is true of
+		// a modification the datapath *answers* and false of one that never left: no
+		// sequence number was recorded, so no response can arrive, and nothing sweeps for
+		// a modification that was never sent. The element had already recorded the
+		// duplication as applied.
+		//
+		// Reported rather than retried, and the asymmetry with the answer path is
+		// deliberate: this runs with sc.SMLock held, from the paths that derive
+		// duplication, so re-sending from here would re-enter the same lock — and what
+		// failed is the send itself, which a retry in the same instant would fail again.
+		// The condition an operator needs is that this element is not carrying out an
+		// interception it has acknowledged.
+		s.reporter.NotifyAsync(x1.NEIssueDuplicationRefused,
+			"a duplication change could not be sent to the user plane; content interception "+
+				"may not match the tasking this element holds")
 	}
 }
 

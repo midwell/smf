@@ -329,7 +329,10 @@ func TestLIModificationResponseDoesNotCompleteTheSessionsOwnProcedure(t *testing
 	// An LI modification goes out while it is: a warrant changed, which happens on
 	// the provisioning plane's schedule and not the session's.
 	const liSeq = uint32(4242)
-	lisequence.Mark(liSeq)
+	// The request the modification carried, as the send site records it: the answer is
+	// correlated with what was asked, because the send clears the FAR state that would
+	// otherwise say.
+	lisequence.Mark(liSeq, lisequence.Request{SEID: seid, NodeID: "1.1.1.1", Duplicating: true})
 
 	handler.HandlePfcpSessionModificationResponse(modificationResponse(liSeq, seid))
 
