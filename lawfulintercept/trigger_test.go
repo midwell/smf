@@ -1694,15 +1694,6 @@ func TestAReactivatedWarrantDoesNotDisplaceTheWithdrawalInFlight(t *testing.T) {
 	}
 }
 
-// TestAnUnattributableAnswerKeepsTheWithdrawalPending is task 3.8 of
-// `fix-li-x1-response-binding`, asserted rather than assumed.
-//
-// Validating responses turns silent successes on the withdrawal path into visible
-// failures, and this change was sequenced behind `fix-li-withdrawal-durability`
-// precisely because a visible failure used to be discarded as silently as the
-// success was. So: a POI that acknowledges under the wrong NE identifier is
-// refused, and the withdrawal it refused must stay pending and keep being retried
-// rather than being forgotten.
 // TestAKeepaliveAnsweredByTheWrongElementIsReported is the gap verification found
 // after the rest of this change was written: every tasking path reported an
 // unattributable answer and the keepalive discarded one.
@@ -1759,6 +1750,15 @@ func TestAKeepaliveAnsweredByTheWrongElementIsReported(t *testing.T) {
 	}
 }
 
+// TestAnUnattributableAnswerKeepsTheWithdrawalPending is task 3.8 of
+// `fix-li-x1-response-binding`, asserted rather than assumed.
+//
+// Validating responses turns silent successes on the withdrawal path into visible
+// failures, and this change was sequenced behind `fix-li-withdrawal-durability`
+// precisely because a visible failure used to be discarded as silently as the
+// success was. So: a POI that acknowledges under the wrong NE identifier is
+// refused, and the withdrawal it refused must stay pending and keep being retried
+// rather than being forgotten.
 func TestAnUnattributableAnswerKeepsTheWithdrawalPending(t *testing.T) {
 	poi := newFakePOI(t)
 	s := triggerSubsystem(t, poi)

@@ -1726,6 +1726,31 @@ func (r *triggerRegistry) takeForWarrantExcept(warrant types.XID, keep map[strin
 	})
 }
 
+// forgetRestartedPOI discards the claims held for the POI serving one node, matched the way
+// every other trigger path matches it.
+//
+// It exists because the caller knows a node and its address and the registry is keyed by a
+// configured string, and only the registry can turn one into the other. Doing it here rather
+// than at the call site is also what keeps the *one* matching rule in one place: an
+// unresolvable node never matches, which is right — a claim discarded for the wrong POI would
+// re-install one element's tasking at another's, which is the defect matchEndpoint's own
+// documentation exists to prevent.
+//
+// The lock is taken twice deliberately. matchEndpoint documents needing r.mu and ForgetPOI
+// takes it itself; nothing between the two can invalidate the key, because endpoints and
+// order are written once at construction.
+func (r *triggerRegistry) forgetRestartedPOI(session upfSession) int {
+	r.mu.Lock()
+	key, _, ok := r.matchEndpoint(session)
+	r.mu.Unlock()
+
+	if !ok {
+		return 0
+	}
+
+	return r.ForgetPOI(key)
+}
+
 // ForgetPOI discards this element's record of what a triggered point of interception
 // holds, because that point of interception has restarted and holds none of it.
 //
@@ -1754,31 +1779,6 @@ func (r *triggerRegistry) takeForWarrantExcept(warrant types.XID, keep map[strin
 // bookkeeping stops being the reason re-tasking cannot happen once that TODO is
 // addressed: after this, an establishment or a scan at the restarted POI installs the
 // trigger instead of skipping it as already claimed.
-// forgetRestartedPOI discards the claims held for the POI serving one node, matched the way
-// every other trigger path matches it.
-//
-// It exists because the caller knows a node and its address and the registry is keyed by a
-// configured string, and only the registry can turn one into the other. Doing it here rather
-// than at the call site is also what keeps the *one* matching rule in one place: an
-// unresolvable node never matches, which is right — a claim discarded for the wrong POI would
-// re-install one element's tasking at another's, which is the defect matchEndpoint's own
-// documentation exists to prevent.
-//
-// The lock is taken twice deliberately. matchEndpoint documents needing r.mu and ForgetPOI
-// takes it itself; nothing between the two can invalidate the key, because endpoints and
-// order are written once at construction.
-func (r *triggerRegistry) forgetRestartedPOI(session upfSession) int {
-	r.mu.Lock()
-	key, _, ok := r.matchEndpoint(session)
-	r.mu.Unlock()
-
-	if !ok {
-		return 0
-	}
-
-	return r.ForgetPOI(key)
-}
-
 func (r *triggerRegistry) ForgetPOI(nodeID string) int {
 	r.mu.Lock()
 	defer r.mu.Unlock()

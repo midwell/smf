@@ -10,6 +10,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"io"
 	"math/big"
 	"net/http"
@@ -204,5 +205,50 @@ func TestASubFloorKeepaliveWindowStopsInterceptionRatherThanTheProcess(t *testin
 	}
 	if joined := strings.Join(admf.received(), "\n"); !strings.Contains(joined, "invalidConfig") {
 		t.Errorf("the refusal was not reported to the ADMF:\n%s", joined)
+	}
+}
+
+// TestNoX1ListenAddressStopsInterceptionAndTellsTheADMF covers the configuration mistake that
+// produced a *working* element nobody could provision.
+//
+// `Listen(ctx, "tcp", "")` does not fail. It binds every interface at an OS-selected ephemeral
+// port, so with `x1Listen` absent — misspelled, or templated from a value that rendered
+// empty — interception started, `active` was set, and the element waited for tasking on a port
+// the ADMF has no way to learn. Every X1 request it should have received went to a closed port
+// on the configured one instead, and from outside, an element holding no tasking is
+// indistinguishable from one nobody has tasked: it answers interrogation successfully and reports
+// nothing wrong. The mistake only surfaces when a warrant that was supposed to be running turns
+// out never to have arrived.
+//
+// The policy is the one the other configuration refusals take: interception does not start, the
+// ADMF is told over the channel that exists for exactly this, and the network function serves
+// traffic — an element that terminates over its LI configuration is distinguishable from one that
+// has none.
+func TestNoX1ListenAddressStopsInterceptionAndTellsTheADMF(t *testing.T) {
+	cert, key, ca := liPKI(t)
+	admf := newADMFStub(t)
+	t.Cleanup(func() { active.Store(nil) })
+
+	err := Init(Config{
+		NEID: "smf-1",
+		// x1Listen absent. This is the whole fixture.
+		MDF2: "10.0.60.122:42069",
+		Cert: cert, Key: key, CACert: ca,
+		AdmfURL: admf.srv.URL, AdmfID: "admf-1",
+	})
+	if !errors.Is(err, errNoX1Listen) {
+		t.Fatalf("Init returned %v, want errNoX1Listen — an empty address binds successfully on "+
+			"an unpredictable port, so nothing further down will ever report it", err)
+	}
+
+	if active.Load() != nil {
+		t.Error("interception was started, which is what makes an unprovisionable element look " +
+			"healthy")
+	}
+
+	joined := strings.Join(admf.received(), "\n")
+	if !strings.Contains(joined, "invalidConfig") {
+		t.Errorf("the refusal was not reported to the ADMF, which is the one party that needs to "+
+			"know this element cannot be provisioned:\n%s", joined)
 	}
 }
