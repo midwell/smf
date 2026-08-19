@@ -717,10 +717,18 @@ func HandlePDUSessionSMContextRelease(eventData interface{}) error {
 		smContext.ChangeState(smf_context.SmStateActive)
 		// Lawful Interception: the release was reported and the session's triggers
 		// withdrawn before the deletion was attempted, and the deletion did not happen.
-		// The session is back in service, so its interception state goes back with it —
-		// otherwise the release that eventually occurs is suppressed as a duplicate of
-		// the one reported for this attempt, and the session goes on duplicating into a
-		// POI that discards every copy as untasked.
+		// What goes back is the *release report* state, so the release that eventually
+		// occurs is reported rather than suppressed as a duplicate of the one reported
+		// for this attempt — otherwise the agency's record of this session ends at a
+		// failed attempt, permanently.
+		//
+		// The triggers do NOT go back, and cannot from here: releaseTunnel has already
+		// nilled smContext.Tunnel, so this session has no serving UPFs to task, and a
+		// trigger keyed to a PFCP session that has been deleted would match no packet
+		// while this element believed interception was running. Restoring the session's
+		// user-plane state is the pre-existing upstream `// TODO: Session cleanup
+		// required` (pfcp/handler/handler.go), which is larger than this and held out.
+		// See lawfulintercept.RestoreInterception — the absence is deliberate.
 		restoreInterception(smContext)
 		// And the unsuccessful-procedure record the other two failure branches already
 		// emit. A timeout and a stated refusal are both the procedure not completing,
@@ -741,8 +749,8 @@ func HandlePDUSessionSMContextRelease(eventData interface{}) error {
 		}
 		smContext.ChangeState(smf_context.SmStateActive)
 		smContext.SubCtxLog.Debugln("PDUSessionSMContextRelease, SMContextState Change State:", smContext.SMContextState.String())
-		// The session is restored to service, so its interception state is restored
-		// with it — see the timeout branch above.
+		// The session is back in service, so its release becomes reportable again —
+		// see the timeout branch above, including why the triggers do not come back.
 		restoreInterception(smContext)
 		jsonData := models.NewSmContextUpdateError(problemDetail)
 		errResponse := models.NewUpdateSmContext400Response()
@@ -777,8 +785,8 @@ func HandlePDUSessionSMContextRelease(eventData interface{}) error {
 		}
 		smContext.ChangeState(smf_context.SmStateActive)
 		smContext.SubCtxLog.Debugln("PDUSessionSMContextRelease, SMContextState Change State:", smContext.SMContextState.String())
-		// The session is restored to service, so its interception state is restored
-		// with it — see the timeout branch above.
+		// The session is back in service, so its release becomes reportable again —
+		// see the timeout branch above, including why the triggers do not come back.
 		restoreInterception(smContext)
 		jsonData := models.NewSmContextUpdateError(problemDetail)
 		errResponse := models.NewUpdateSmContext400Response()

@@ -999,38 +999,47 @@ func UntriggerCC(sc *smfctx.SMContext) {
 	}
 }
 
-// RestoreInterception undoes a release-time teardown for a session whose release did
-// not happen. Caller holds sc.SMLock.
+// RestoreInterception makes a session's release reportable again, for a release that
+// did not happen. Caller holds sc.SMLock.
 //
 // The SMF reports the release and withdraws the session's triggers *before* PFCP
-// deletion, and that order is right rather than wrong: releaseTunnel may nil sc.Tunnel,
-// withdrawal needs the serving-UPF list that hangs off it, and stopping interception
-// before or as the session goes is the fail-closed direction. What was missing is that
-// nothing put the state back on the branches where the deletion times out or fails and
-// the session is restored to service.
+// deletion, and that order is right rather than wrong: stopping interception before or
+// as the session goes is the fail-closed direction, and withdrawal needs the
+// serving-UPF list that hangs off sc.Tunnel. What was missing is that nothing put the
+// *report* state back on the branches where the deletion times out or fails and the
+// session is restored to service — so the release that eventually happened was
+// suppressed as a duplicate of one that never occurred, and the agency's record of the
+// session ended at a failed attempt, permanently. That is what this restores, and it is
+// the half the spec obliges: `A record reports the transition it names` requires the
+// eventual release to stay reportable.
 //
-// Two things are restored, and they fix two different silences. The release record is
-// made reportable again, so the release that eventually happens is reported rather than
-// suppressed as a duplicate of one that never occurred — otherwise the agency's record
-// of the session ends at a failed attempt, permanently. And the triggers are
-// re-installed, so a session this element still holds is not left duplicating into a
-// POI that discards every copy as untasked.
+// **It does not re-install the triggers, and it cannot.** An earlier version called
+// triggerCC from here and its comment said the interception was restored. Every
+// reachable caller runs after releaseTunnel has set sc.Tunnel = nil
+// (producer/pdu_session.go), and a session with no tunnel has no serving UPFs, so
+// sessionUPFs returns nothing and triggerCC returns before planning anything. The call
+// was unreachable on every branch while the comment asserted it had run.
 //
-// Re-installing cannot collide with a withdrawal that is still retrying, and that falls
-// out of the registry's existing claim-and-withdraw state machine rather than needing a
-// second mechanism beside it: take() deletes the installed entry and files the
-// withdrawal under pendingKey(key, xid) with the trigger's *own* XID, while a fresh
-// claim allocates a new one. The two entries are therefore distinct, the old
-// acknowledgement clears only the old one, and stillHolds keeps counting the key as
-// held throughout. That is the same property the registry already documents for a
-// warrant deactivated and re-activated while its POI is unreachable.
+// Snapshotting the UPF list before releaseTunnel and re-triggering afterwards is not
+// the fix. It would install a trigger keyed to a PFCP session that has been deleted,
+// into a session that cannot forward — a trigger matching no packet, held by a
+// triggering function that believes interception is running. That is the state this
+// whole capability exists to prevent, arrived at by trying to prevent it.
+//
+// So the durable withdrawal stands: this element has withdrawn the triggers, the POI
+// has acknowledged, and content interception for this session is over until something
+// re-establishes it. What would re-establish it is the session's own user-plane state
+// coming back, which is the pre-existing upstream `// TODO: Session cleanup required`
+// (pfcp/handler/handler.go, pfcp/adapter/adapter.go) and a larger problem than this
+// one — the same entanglement ForgetPOI records. **Do not re-raise the re-install
+// here**: it is absent because it cannot work from a session with no tunnel, not
+// because it was overlooked.
 func RestoreInterception(sc *smfctx.SMContext) {
 	sub := active.Load()
 	if sub == nil || sc == nil {
 		return
 	}
 	sc.LiReleaseReported = false
-	sub.triggerCC(sc)
 }
 
 // triggerCC tasks each serving UPF's CC-POI for each CC warrant covering sc.

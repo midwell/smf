@@ -47,8 +47,15 @@ func reportAndUntask(smContext *smf_context.SMContext) {
 	liUntriggerCC(smContext)
 }
 
-// restoreInterception puts back what reportAndUntask took down, for a release that did
-// not happen: the session is live again, so it is reportable and intercepted again.
+// restoreInterception puts back the half of what reportAndUntask took down that can be
+// put back, for a release that did not happen: the session is live again, so its
+// eventual release is reportable again.
+//
+// Not the triggers. By the time any caller runs, releaseTunnel has nilled the tunnel, so
+// there are no serving UPFs to re-task and the withdrawal already acknowledged by the
+// POI stands. See lawfulintercept.RestoreInterception for why re-installing from here
+// would produce a trigger that matches nothing while the element believed interception
+// was running.
 //
 // It is the counterpart of reportAndUntask and is named beside it for the same reason —
 // a branch that restores the session's state and not its interception state is then

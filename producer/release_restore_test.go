@@ -92,18 +92,27 @@ func releasableSession(t *testing.T) *smf_context.SMContext {
 }
 
 // TestAReleaseThatTimesOutRestoresTheSessionsInterceptionState is the release-path half
-// of "a record reports the transition it names".
+// of "a record reports the transition it names", asserted at the level this package can:
+// **which of its branches call the hook.**
+//
+// That is the whole of its subject, and the distinction is worth stating because the
+// previous round's version of this test read as more than it was. The hooks are
+// stubbed here — they have to be, since `active` is private to lawfulintercept and Init
+// needs mTLS material and a TCP bind this package has no business standing up — so a
+// count establishes that this branch reaches the hook and nothing about what the hook
+// then does. What it does is asserted in lawfulintercept's own
+// TestARestoredReleaseIsReportableAgainAndRetasksNothing, and the two halves of that
+// answer were not the same: the release-report restore is real, and the trigger
+// re-install the previous comment claimed was unreachable code.
 //
 // The SMF reports the release and withdraws the session's triggers before PFCP deletion
 // — which is the right order: releaseTunnel may nil sc.Tunnel, withdrawal needs the
 // serving-UPF list that hangs off it, and stopping interception before or as the session
 // goes is the fail-closed direction. What was wrong is that on the branches where the
 // deletion times out or fails, the session is restored to service and nothing put the
-// interception state back. Two silences followed. LiReleaseReported stayed set, so the
-// release that eventually happened was suppressed as a duplicate of one that never
-// occurred, and the agency's record of the session ended at the failed attempt. And the
-// triggers stayed withdrawn while the session went on duplicating, so its content was
-// discarded by the POI as untasked.
+// release-report state back: LiReleaseReported stayed set, so the release that eventually
+// happened was suppressed as a duplicate of one that never occurred, and the agency's
+// record of the session ended at the failed attempt.
 //
 // The timeout branch also emitted no unsuccessful-procedure record, where its two
 // siblings did: the mediation function saw a release record and then silence, and which
@@ -142,8 +151,8 @@ func TestAReleaseThatTimesOutRestoresTheSessionsInterceptionState(t *testing.T) 
 	}
 	if calls.restored != 1 {
 		t.Errorf("the session was restored to service %d times and its interception state %d: "+
-			"the release that eventually happens is suppressed as a duplicate, and a live "+
-			"session keeps duplicating into a POI that discards every copy as untasked",
+			"the release that eventually happens is then suppressed as a duplicate of one that "+
+			"never occurred, and the agency's record of this session ends at a failed attempt",
 			1, calls.restored)
 	}
 	if calls.rejected != 1 {
