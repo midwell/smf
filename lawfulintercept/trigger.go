@@ -1490,16 +1490,26 @@ type plannedTrigger struct {
 // The task's own destinations first, which is what TS 33.128 requires and what the
 // IRI path already does (see x2Destinations, which this mirrors deliberately —
 // the two answer the same question for the two interfaces and had no business
-// answering it differently). The configured MDF3 serves only a task that named
-// nothing this element could resolve, which is the case every deployment predating
-// that requirement is in.
+// answering it differently).
 //
-// Until this existed the configured endpoint served *every* task, so two agencies'
-// content arrived at whichever address configuration happened to name. That is the
-// defect this fixes, and it is the same one the IRI path had.
+// **The configured MDF3 serves a task that named no destination, not one whose
+// destinations produced no X3 endpoint.** The two were the same test — an empty resolved
+// list — and they are different facts: a task that named nothing is a gap the
+// provisioning function left, and one that named an X2-only destination is an assertion
+// this element cannot honour by substituting an endpoint of its own. On an element
+// serving several agencies the substitution sends a warrant's content to whichever
+// address local configuration happens to name.
+//
+// Until the task's own destinations were consulted at all, the configured endpoint served
+// *every* task, so two agencies' content arrived at whichever address configuration
+// happened to name. This is the last of that defect, and it is the same one the IRI path
+// had.
 func (r *triggerRegistry) x3Destinations(t types.InterceptTask) []string {
 	if addrs := t.DeliveryAddresses(types.DeliveryX3); len(addrs) > 0 {
 		return addrs
+	}
+	if len(t.DIDs) > 0 {
+		return nil
 	}
 	if r.mdf3 == "" {
 		return nil

@@ -2345,12 +2345,17 @@ func TestTriggerNamesTheTasksOwnX3Destinations(t *testing.T) {
 	}
 }
 
-// TestTriggerFallsBackToTheConfiguredMDF3 keeps the fix a conformance fix rather
-// than an outage. An ADMF is entitled to task an element with DIDs it never
-// provisioned here, which is what every deployment predating the destination
-// requirement does, and such a task resolves to no X3 address at all. The
-// configured endpoint serves it, exactly as the configured MDF2 serves the
-// equivalent IRI task — and the task is not refused.
+// TestTriggerFallsBackToTheConfiguredMDF3 keeps the fix a conformance fix rather than an
+// outage. An ADMF is entitled to task an element that names **no** destination, which is
+// what every deployment predating the destination requirement does, and the configured
+// endpoint serves it — exactly as the configured MDF2 serves the equivalent IRI task, and
+// without the task being refused.
+//
+// This used to be asserted with a task that named a destination and resolved none of it,
+// which is a different fact and the wrong one to serve from configuration: naming an
+// endpoint the warrant did not is the element deciding where a warrant's content goes,
+// and on an element serving several agencies it goes to whichever address configuration
+// happens to name. See x3Destinations.
 func TestTriggerFallsBackToTheConfiguredMDF3(t *testing.T) {
 	poi := newFakePOI(t)
 	s := triggerSubsystem(t, poi)
@@ -2360,8 +2365,8 @@ func TestTriggerFallsBackToTheConfiguredMDF3(t *testing.T) {
 	s.installFor("session-ref-1", []types.InterceptTask{{
 		XID:      "11111111-1111-4111-8111-111111111111",
 		Products: []types.ProductType{types.ProductCC},
-		// Named a destination, and this element resolved none of it.
-		DIDs: []string{"99999999-9999-4999-8999-999999999999"},
+		// Named no destination at all: the gap the provisioning function left, which the
+		// configured endpoint is there to fill.
 	}}, []upfSession{{node: upfNode("10.0.1.5"), seid: 0x2632898145f4d191}}, 7)
 
 	addresses := poi.elements("CreateDestinationRequest", "IPv4Address")
@@ -2377,6 +2382,48 @@ func TestTriggerFallsBackToTheConfiguredMDF3(t *testing.T) {
 	}
 	for _, r := range reporter.reports {
 		t.Errorf("reported a task issue for a task the fallback serves: %+v", r)
+	}
+}
+
+// TestATaskWhoseDestinationsYieldNoX3EndpointIsNotServedFromConfiguration is the other
+// half, and the reason the two had to be told apart.
+//
+// A task that named where its content goes and yielded no X3 endpoint — a warrant naming
+// an X2-only destination is the live shape — is an assertion this element cannot honour.
+// Substituting the configured MDF3 sends an agency's content to an endpoint the warrant
+// never named, and on an element serving several agencies it goes to whichever address
+// local configuration happens to name. So nothing is provisioned, no trigger is installed,
+// and the LIPF is told the content has nowhere to go — which is the one channel that can
+// say so.
+func TestATaskWhoseDestinationsYieldNoX3EndpointIsNotServedFromConfiguration(t *testing.T) {
+	poi := newFakePOI(t)
+	s := triggerSubsystem(t, poi)
+	reporter := &recordingTaskReporter{}
+	s.taskReporter = reporter
+
+	s.installFor("session-ref-1", []types.InterceptTask{{
+		XID:      "11111111-1111-4111-8111-111111111111",
+		Products: []types.ProductType{types.ProductCC},
+		// Named a destination, and it resolved — to an X2 endpoint, which carries no
+		// content. x1 accepts such a task: the identifier is resolvable, and the IRI-POI
+		// half of the same warrant delivers to it.
+		DIDs: []string{"99999999-9999-4999-8999-999999999999"},
+		Deliveries: []types.DeliveryEndpoint{
+			{DID: "99999999-9999-4999-8999-999999999999", Type: types.DeliveryX2, Address: "10.0.60.122:42069"},
+		},
+	}}, []upfSession{{node: upfNode("10.0.1.5"), seid: 0x2632898145f4d191}}, 7)
+
+	if n := poi.countMessages("CreateDestinationRequest"); n != 0 {
+		t.Errorf("provisioned %d destinations at the POI for a task whose content has nowhere to "+
+			"go:\n%s", n, strings.Join(poi.sent(), "\n"))
+	}
+	if n := poi.countMessages("ActivateTaskRequest"); n != 0 {
+		t.Errorf("installed %d triggers, want 0 — the POI would duplicate a subject's traffic and "+
+			"deliver it to an endpoint the warrant did not name", n)
+	}
+	if len(reporter.reports) == 0 {
+		t.Error("nothing was reported to the LIPF: an interception this element cannot deliver is " +
+			"exactly the condition only the provisioning function can resolve")
 	}
 }
 

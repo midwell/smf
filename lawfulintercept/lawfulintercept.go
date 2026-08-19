@@ -1149,12 +1149,30 @@ func (s *subsystem) deliverIRI(tasks []types.InterceptTask, corr [8]byte, subjec
 // The task's own destinations first, which is what TS 33.128 requires — table 6.2.3-0A,
 // "ActivateTask message for SMF IRI-POI, CC-TF and IRI-TF", marks ListOfDIDs mandatory
 // and says the endpoints "shall be configured using the CreateDestination message …
-// prior to first use". The configured MDF2 serves only a task that named nothing this
-// element could resolve, which is the case every deployment predating that requirement
-// is in.
+// prior to first use".
+//
+// **The configured MDF2 serves a task that named no destination, not one whose
+// destinations produced no X2 endpoint.** The two were the same test — an empty resolved
+// list — and they are different facts. A task that named nothing is a gap the
+// provisioning function left, and the configured endpoint fills it, which is the case
+// every deployment predating that requirement is in. A task that named destinations and
+// yielded no X2 endpoint is an assertion this element cannot honour as stated: the live
+// shape is a warrant naming an X3-only destination, where substituting the configured
+// MDF2 sends an agency's signalling to an endpoint the warrant never named. On an element
+// serving several agencies it is worse than a gap — the product goes to whichever
+// endpoint local configuration happens to name, and li-security-isolation admits no
+// exception for it.
+//
+// So the fallback keys on len(t.DIDs). A task naming an identifier this element cannot
+// resolve at all no longer reaches here: x1 refuses it at activation.
 func (s *subsystem) x2Destinations(t types.InterceptTask) []string {
 	if addrs := t.DeliveryAddresses(types.DeliveryX2); len(addrs) > 0 {
 		return addrs
+	}
+	if len(t.DIDs) > 0 {
+		// The task named where its product goes and none of it is an X2 endpoint. This
+		// element has nothing to say about where the xIRI should go instead.
+		return nil
 	}
 	if s.mdf2 == "" {
 		return nil
