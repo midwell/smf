@@ -1549,12 +1549,12 @@ func servingUPFTEID(sc *smfctx.SMContext) iri.FTEID {
 	if node == nil || node.UpLinkTunnel == nil || node.UPF == nil {
 		return f
 	}
-	f.TEID = int64(node.UpLinkTunnel.TEID)
+	f.TEID = iri.TEID(node.UpLinkTunnel.TEID)
 	if ip := net.ParseIP(node.UPF.GetUPFIP()); ip != nil {
 		if v4 := ip.To4(); v4 != nil {
-			f.IPv4Address = v4
+			f.IPv4Address = iri.IPv4Address(v4)
 		} else if v16 := ip.To16(); v16 != nil {
-			f.IPv6Address = v16
+			f.IPv6Address = iri.IPv6Address(v16)
 		}
 	}
 	return f
@@ -1595,10 +1595,10 @@ func snssai(sc *smfctx.SMContext) iri.SNSSAI {
 	if sc.Snssai == nil {
 		return iri.SNSSAI{}
 	}
-	s := iri.SNSSAI{SliceServiceType: int(sc.Snssai.Sst)}
+	s := iri.SNSSAI{SliceServiceType: iri.SliceServiceType(sc.Snssai.Sst)}
 	if sc.Snssai.Sd != nil {
 		if sd, err := hex.DecodeString(*sc.Snssai.Sd); err == nil && len(sd) == 3 {
-			s.SliceDifferentiator = sd
+			s.SliceDifferentiator = iri.SliceDifferentiator(sd)
 		}
 	}
 	return s
