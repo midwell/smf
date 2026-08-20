@@ -902,8 +902,9 @@ func (s *subsystem) reconcileEndpoint(nodeID string, endpoint *upfEndpoint) {
 				// Describe() renders the POI's own account and is documented never to include
 				// a target identifier, which is the property that lets it be forwarded.
 				s.reportTaskIssueAs(warrant, x1.TaskReportNonTerminatingFault,
-					"a UPF reports the content trigger this element installed for this warrant "+
-						"as not running: "+task.TaskStatus.Describe())
+					x1.TaskIssueTriggerNotRunning+": a UPF reports the content trigger this "+
+						"element installed for this warrant as not running: "+
+						task.TaskStatus.Describe())
 			}
 
 			continue
