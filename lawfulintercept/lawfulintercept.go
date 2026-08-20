@@ -277,6 +277,32 @@ func newX1Server(st *store.Store, cfg Config, sub *subsystem) *x1.Server {
 		// as unreachable over ReportDestinationIssue — two statements about one fact, and
 		// the ADMF trusts the one it asked for.
 		x1.WithDestinationReachability(sub.destinationUnreachable),
+		// **No x1.WithTaskFaults here, and that is a decision rather than an omission.**
+		//
+		// A task-scoped fault has to be a condition that stops *this* warrant's interception
+		// and that this element can re-observe when asked. This POI produces records from
+		// signalling events for a subject it resolves by subscriber identity, and the states it
+		// can see are the wrong shape for that:
+		//
+		//   - A subject who is not attached, or is attached and doing nothing, produces no
+		//     records — and is indistinguishable from one this element has stopped watching. A
+		//     fault reported for that would fire for every warrant on a quiet subscriber, and a
+		//     fault channel that fires when nothing is wrong is one an ADMF learns to ignore.
+		//   - Delivery failing is real and is already reported, at the two scopes that can say
+		//     something true about it: the element's own status, and the destination's. A task
+		//     names destinations rather than owning them, so attributing an endpoint's failure
+		//     to one of the warrants pointing at it would report the same fault once per
+		//     warrant and imply each was separately broken.
+		//
+		// The triggered CC-POI is the element where this is different, and it is where the
+		// supplier is registered: it holds per-task datapath state — whether a duplication rule
+		// this task requires is programmed — and its triggering function has no other account of
+		// that interception at all.
+		//
+		// So this element answers `provisioningStatus: complete` with an empty fault list for
+		// every task it holds, which is a true statement about a POI whose observable faults are
+		// not task-scoped. Recorded here so the next reader finds the reasoning rather than the
+		// absence.
 		x1.OnTaskChange(sub.applyTaskChange),
 		// Refuse a warrant this element could never act on. It resolves subjects by
 		// subscriber identity alone (see targetsOf), so a warrant naming only a UE

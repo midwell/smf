@@ -223,6 +223,16 @@ type triggerRegistry struct {
 // installed" is the right place to know what it installed.
 type installedTrigger struct {
 	xid types.XID
+	// warrant is the XID of the warrant this trigger serves, which is *not* xid: the
+	// trigger's XID is this CC-TF's own, and the warrant's travels in ProductID.
+	//
+	// Held because it is the only thing that can turn a POI's answer into a report the LIPF
+	// can act on. A POI reports a task under the XID this element gave it, and the LIPF never
+	// issued that identifier — so a fault report naming it would name a warrant the LIPF
+	// cannot look up, which is worse than naming none. The composite key carries the warrant
+	// too, but recovering it by splitting a key on a separator is a decoding step that would
+	// silently produce the wrong answer the day a key gains a component.
+	warrant types.XID
 	// seid is the PFCP session the trigger detects on, and correlation the value the
 	// POI stamps on the content it produces. Both are the session's rather than the
 	// warrant's, which is why they are held per trigger and not per task.
@@ -868,7 +878,7 @@ func (s *subsystem) reconcileEndpoint(nodeID string, endpoint *upfEndpoint) {
 		// now would otherwise have its brand-new trigger withdrawn by the cleanup —
 		// and one being withdrawn right now would be withdrawn twice, by two
 		// parties neither of which can read the other's answer.
-		if held, withdrawing := s.triggers.holds(xid); held {
+		if held, withdrawing, warrant := s.triggers.holdsFor(xid); held {
 			// It is ours, so it is not stale — but the POI's account of it is the
 			// only way this function learns that a trigger it installed is not
 			// actually running. A failed provisioning or an unresolved fault means
@@ -876,10 +886,24 @@ func (s *subsystem) reconcileEndpoint(nodeID string, endpoint *upfEndpoint) {
 			// precisely what a CC triggering function exists to notice. The reply
 			// was previously read for XIDs and nothing else. A trigger already on
 			// its way out is exempt: it is meant to stop.
-			if !withdrawing && !task.TaskStatus.Healthy() && s.reporter != nil {
-				s.reporter.Notify(x1.NEIssueTriggerFaulty,
-					"a UPF reports a content trigger this SMF installed as not running: "+
-						task.TaskStatus.Describe())
+			if !withdrawing && !task.TaskStatus.Healthy() {
+				// **Against the warrant, which is what makes this actionable.** Reported at
+				// element scope, this said that something among the content interceptions
+				// this element triggers had stopped, and a LIPF holding several warrants
+				// could not tell which — so the report named a condition nobody could act
+				// on. `triggerFaulty` exists for exactly this attribution, and until the POI
+				// could answer per task there was nothing to attribute.
+				//
+				// Non-terminating: the POI holds the task and this element holds the trigger,
+				// so what has stopped is the product rather than the tasking, and a
+				// terminating report would tell the LIPF to re-provision an element whose
+				// provisioning is intact.
+				//
+				// Describe() renders the POI's own account and is documented never to include
+				// a target identifier, which is the property that lets it be forwarded.
+				s.reportTaskIssueAs(warrant, x1.TaskReportNonTerminatingFault,
+					"a UPF reports the content trigger this element installed for this warrant "+
+						"as not running: "+task.TaskStatus.Describe())
 			}
 
 			continue
@@ -1476,9 +1500,24 @@ func (s *subsystem) reportUnattributable(cause error) {
 // the content it authorises (TS 33.128 clause 5.2.6). It names the warrant, never
 // the target, and never reaches a general log.
 func (s *subsystem) reportTaskIssue(warrant types.XID, details string) {
-	if s.taskReporter != nil {
-		s.taskReporter.NotifyTask(string(warrant), x1.TaskReportTerminatingFault, details)
+	s.reportTaskIssueAs(warrant, x1.TaskReportTerminatingFault, details)
+}
+
+// reportTaskIssueAs is reportTaskIssue with the severity stated by the caller.
+//
+// The two exist separately because the distinction is the LIPF's to act on: a trigger that
+// could not be installed has stopped the interception outright, and one a POI reports as not
+// running has stopped its product while the tasking on both sides remains in place. Sending the
+// second as a terminating fault would ask a LIPF to re-provision an element with nothing wrong
+// with its provisioning.
+//
+// An empty warrant reports nothing rather than reporting under an empty XID, which the schema
+// would refuse and which would in any case name no warrant.
+func (s *subsystem) reportTaskIssueAs(warrant types.XID, reportType, details string) {
+	if s.taskReporter == nil || warrant == "" {
+		return
 	}
+	s.taskReporter.NotifyTask(string(warrant), reportType, details)
 }
 
 // triggerKey identifies one installed trigger: a warrant, a session, and the UPF
@@ -1616,7 +1655,9 @@ func (r *triggerRegistry) plan(
 			}
 
 			xid := types.XID(x1.NewUUID())
-			r.installed[key] = installedTrigger{xid: xid, seid: u.seid, correlation: correlation}
+			r.installed[key] = installedTrigger{
+				xid: xid, warrant: t.XID, seid: u.seid, correlation: correlation,
+			}
 			planned = append(planned, plannedTrigger{
 				endpoint:  endpoint,
 				key:       key,
@@ -1678,21 +1719,32 @@ func (r *triggerRegistry) stillHolds(key string, xid types.XID) bool {
 // reconciliation must leave both alone, but only the first is a trigger whose
 // health at the POI is worth reporting.
 func (r *triggerRegistry) holds(xid types.XID) (held, withdrawing bool) {
+	held, withdrawing, _ = r.holdsFor(xid)
+
+	return held, withdrawing
+}
+
+// holdsFor is holds, and also which warrant the trigger serves.
+//
+// The warrant is empty for a trigger on its way out: a pending withdrawal is keyed by the
+// trigger's XID and the entry does not carry the warrant, and it does not need to — a trigger
+// that is meant to stop is exempt from being reported as faulty for having stopped.
+func (r *triggerRegistry) holdsFor(xid types.XID) (held, withdrawing bool, warrant types.XID) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	for _, installed := range r.installed {
 		if installed.xid == xid {
-			return true, false
+			return true, false, installed.warrant
 		}
 	}
 	for _, p := range r.pending {
 		if p.xid == xid {
-			return true, true
+			return true, true, ""
 		}
 	}
 
-	return false, false
+	return false, false, ""
 }
 
 // release forgets a trigger that could not be installed, so a later attempt

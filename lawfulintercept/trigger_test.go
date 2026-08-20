@@ -1076,14 +1076,16 @@ func TestMatchEndpointIsDeterministic(t *testing.T) {
 // this SMF used to read the POI's reply for XIDs and discard everything else,
 // including the task's provisioning status and its unresolved faults. The
 // interception was stopped and every party believed it was running.
+//
+// **The report is against the warrant, and that is the half this test used to have
+// backwards.** It asserted an element-scoped report and treated the presence of a task XID in
+// it as a defect — correctly, for a report at that scope. But an element-scoped report says
+// only that something among the interceptions this element triggers has stopped, and a LIPF
+// holding several warrants cannot act on it. `triggerFaulty` is defined for the attribution,
+// and the reason this element could not make it was that a POI's answer carried no per-task
+// fault to attribute; now it can.
 func TestReconcileReportsATriggerThePOISaysIsNotRunning(t *testing.T) {
-	var mu sync.Mutex
-	var reports []string
 	admf := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, _ := io.ReadAll(r.Body) //nolint:errcheck // test
-		mu.Lock()
-		reports = append(reports, string(body))
-		mu.Unlock()
 		//nolint:errcheck // test handler write
 		_, _ = w.Write([]byte(`<?xml version="1.0"?><X1Response xmlns="http://uri.etsi.org/03221/X1/2017/10">` +
 			`<x1ResponseMessage><oK>AcknowledgedAndCompleted</oK></x1ResponseMessage></X1Response>`))
@@ -1092,7 +1094,8 @@ func TestReconcileReportsATriggerThePOISaysIsNotRunning(t *testing.T) {
 
 	poi := newFakePOI(t)
 	s := triggerSubsystem(t, poi)
-	s.taskReporter = &recordingTaskReporter{}
+	taskReports := &recordingTaskReporter{}
+	s.taskReporter = taskReports
 	s.reporter = x1.NewReporter(admf.URL, "admf", "smf", nil)
 
 	warrant := types.InterceptTask{
@@ -1125,24 +1128,29 @@ func TestReconcileReportsATriggerThePOISaysIsNotRunning(t *testing.T) {
 		t.Errorf("sent %d deactivations for a faulty trigger; the warrant is live", n)
 	}
 
-	mu.Lock()
-	defer mu.Unlock()
-	var found bool
-	for _, body := range reports {
-		if strings.Contains(body, "triggerFaulty") {
-			found = true
-			if !strings.Contains(body, "failed") {
-				t.Errorf("report does not say what the POI reported:\n%s", body)
-			}
-			// The ADMF is told how much is wrong, never whose: an NE-level issue
-			// carries no target identity.
-			if strings.Contains(body, mine[0]) {
-				t.Errorf("NE-level report names a task XID:\n%s", body)
-			}
-		}
+	if len(taskReports.reports) == 0 {
+		t.Fatal("the POI reported a trigger this element installed as not provisioned, and this " +
+			"element told the LIPF nothing: the warrant is live, no content is being produced, " +
+			"and the only party that can see it said so to nobody")
 	}
-	if !found {
-		t.Errorf("no triggerFaulty report reached the ADMF; got %d report(s): %v", len(reports), reports)
+	for _, r := range taskReports.reports {
+		// The warrant, not the trigger. The LIPF issued the warrant's XID and never saw the
+		// trigger's, so a report naming the trigger names an identifier the LIPF cannot look
+		// up — which is less useful than naming none, because it looks like an answer.
+		if r.xid != string(warrant.XID) {
+			t.Errorf("the report names %q; the warrant is %q and the trigger XIDs are %v — the "+
+				"LIPF never issued a trigger XID and cannot resolve one", r.xid, warrant.XID, mine)
+		}
+		if !strings.Contains(r.details, "failed") {
+			t.Errorf("the report does not say what the POI reported: %q", r.details)
+		}
+		// Non-terminating: the tasking is in place at both ends and the product has stopped.
+		// A terminating fault would ask the LIPF to re-provision an element whose provisioning
+		// is intact.
+		if r.reportType != x1.TaskReportNonTerminatingFault {
+			t.Errorf("the report is a %q; a trigger the POI holds and is not running has not "+
+				"stopped this element from being able to carry the warrant out", r.reportType)
+		}
 	}
 }
 
@@ -3331,5 +3339,68 @@ func TestTwoPointsOfInterceptionServingOneSessionShareTheWarrantAndNotTheirIdent
 	if anchorSEID[0] == branchSEID[0] {
 		t.Errorf("both were given the same detection criterion (%s); one of them cannot match it",
 			anchorSEID[0])
+	}
+}
+
+// TestAFaultyTriggerNamesOnlyItsOwnWarrant is the attribution property, which is the whole
+// reason `triggerFaulty` is task-scoped rather than element-scoped.
+//
+// A LIPF holding several warrants at one point of interception has to know which one has
+// stopped producing: the responses differ — re-provision this warrant, tell this agency, ask
+// this operator — and an answer naming the wrong warrant is worse than one naming none, because
+// it would have somebody act on an interception that is running.
+//
+// The POI answers unhealthy for one of two triggers, so a report about both would satisfy any
+// presence check and fail this one.
+func TestAFaultyTriggerNamesOnlyItsOwnWarrant(t *testing.T) {
+	poi := newFakePOI(t)
+	s := triggerSubsystem(t, poi)
+	taskReports := &recordingTaskReporter{}
+	s.taskReporter = taskReports
+
+	faulty := types.InterceptTask{
+		XID:      "11111111-1111-4111-8111-111111111111",
+		Products: []types.ProductType{types.ProductCC},
+	}
+	working := types.InterceptTask{
+		XID:      "22222222-2222-4222-8222-222222222222",
+		Products: []types.ProductType{types.ProductCC},
+	}
+	s.installFor("session-1", []types.InterceptTask{faulty, working},
+		[]upfSession{{node: upfNode(trigNodeA), seid: 42}}, 7)
+
+	// Which trigger XID serves which warrant is the registry's knowledge, and is exactly what
+	// this test is about — so it is read from the registry rather than assumed from order.
+	triggerFor := map[types.XID]types.XID{}
+	var held []string
+	for _, installed := range s.triggers.installed {
+		triggerFor[installed.warrant] = installed.xid
+		held = append(held, string(installed.xid))
+	}
+	if len(triggerFor) != 2 {
+		t.Fatalf("expected a trigger per warrant, got %d: %v", len(triggerFor), triggerFor)
+	}
+
+	poi.mu.Lock()
+	poi.holds = held
+	poi.unhealthy = map[string]string{string(triggerFor[faulty.XID]): "failed"}
+	poi.mu.Unlock()
+
+	s.reconcileOne()
+
+	if n := poi.countMessages("DeactivateTaskRequest"); n != 0 {
+		t.Errorf("sent %d deactivations; both warrants are live and a fault is reported, not acted "+
+			"on by tearing an interception down", n)
+	}
+
+	var named []string
+	for _, r := range taskReports.reports {
+		named = append(named, r.xid)
+	}
+	if len(named) != 1 || named[0] != string(faulty.XID) {
+		t.Errorf("reports named %v; want exactly the faulty warrant %q. The working warrant is %q "+
+			"and the trigger XIDs are %v — naming the working warrant would have somebody act on "+
+			"an interception that is running, and naming a trigger XID names something the LIPF "+
+			"never issued", named, faulty.XID, working.XID, held)
 	}
 }
