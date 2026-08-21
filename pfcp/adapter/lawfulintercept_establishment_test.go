@@ -16,9 +16,9 @@ import (
 )
 
 // establishingSession builds an SM context whose default path anchors at one UPF, with a PFCP
-// establishment outstanding to it, and returns the context and the local SEID the response must
-// carry.
-func establishingSession(t *testing.T) (*context.SMContext, uint64, *context.NodeID) {
+// establishment outstanding to it, and returns the local SEID the response must carry and the
+// node it came from.
+func establishingSession(t *testing.T) (uint64, *context.NodeID) {
 	t.Helper()
 
 	if factory.SmfConfig.Configuration == nil {
@@ -43,7 +43,7 @@ func establishingSession(t *testing.T) (*context.SMContext, uint64, *context.Nod
 	smContext.Tunnel = &context.UPTunnel{DataPathPool: context.DataPathPool{1: datapath}}
 	smContext.AllocateLocalSEIDForDataPath(datapath)
 
-	return smContext, smContext.PFCPContext[upfIP].LocalSEID, nodeID
+	return smContext.PFCPContext[upfIP].LocalSEID, nodeID
 }
 
 // TestTheAdapterEstablishmentPathReportsAndTasks is the behavioural half of the parity guard.
@@ -58,7 +58,7 @@ func establishingSession(t *testing.T) (*context.SMContext, uint64, *context.Nod
 // Mutation-verify by removing the notify calls from the handler: this test must fail, and it must
 // fail naming the product the agency does not get.
 func TestTheAdapterEstablishmentPathReportsAndTasks(t *testing.T) {
-	_, seid, nodeID := establishingSession(t)
+	seid, nodeID := establishingSession(t)
 
 	var reported, applied, triggered bool
 
@@ -105,13 +105,12 @@ func TestTheAdapterEstablishmentPathReportsAndTasks(t *testing.T) {
 			"holding no task for it and drops every copy as unattributable — interception that " +
 			"is running and delivering nothing, with nothing raising a fault")
 	}
-
 }
 
 // TestTheAdapterEstablishmentPathIsSilentWhenRejected pins the other direction: a refused
 // establishment must not report or task, or the agency is told a session began that did not.
 func TestTheAdapterEstablishmentPathIsSilentWhenRejected(t *testing.T) {
-	_, seid, nodeID := establishingSession(t)
+	seid, nodeID := establishingSession(t)
 
 	var reported, triggered bool
 
