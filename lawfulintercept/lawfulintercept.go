@@ -287,12 +287,11 @@ func newX1Server(st *store.Store, cfg Config, sub *subsystem) *x1.Server {
 		// as unreachable over ReportDestinationIssue — two statements about one fact, and
 		// the ADMF trusts the one it asked for.
 		x1.WithDestinationReachability(sub.destinationUnreachable),
-		// **No x1.WithTaskFaults here, and that is a decision rather than an omission.**
+		// **What this element answers about one task, and what it deliberately does not.**
 		//
-		// A task-scoped fault has to be a condition that stops *this* warrant's interception
-		// and that this element can re-observe when asked. This POI produces records from
-		// signalling events for a subject it resolves by subscriber identity, and the states it
-		// can see are the wrong shape for that:
+		// A task-scoped fault has to be a condition that stops *this* warrant's interception and
+		// that this element can re-observe when asked. Two of the states this element can see
+		// are the wrong shape for that, and they stay unreported per task:
 		//
 		//   - A subject who is not attached, or is attached and doing nothing, produces no
 		//     records — and is indistinguishable from one this element has stopped watching. A
@@ -304,15 +303,14 @@ func newX1Server(st *store.Store, cfg Config, sub *subsystem) *x1.Server {
 		//     to one of the warrants pointing at it would report the same fault once per
 		//     warrant and imply each was separately broken.
 		//
-		// The triggered CC-POI is the element where this is different, and it is where the
-		// supplier is registered: it holds per-task datapath state — whether a duplication rule
-		// this task requires is programmed — and its triggering function has no other account of
-		// that interception at all.
-		//
-		// So this element answers `provisioningStatus: complete` with an empty fault list for
-		// every task it holds, which is a true statement about a POI whose observable faults are
-		// not task-scoped. Recorded here so the next reader finds the reasoning rather than the
-		// absence.
+		// **The CC triggering role is different, and this element used to answer "nothing" for
+		// it too.** A point of interception reporting that the trigger this element installed is
+		// not running is task-scoped, re-observable, and means this warrant's content
+		// interception has stopped while the warrant is live. It was unanswerable only because
+		// this element asked its POIs once per process, at start-up, before it had installed
+		// anything — so the condition existed and nothing could ever see it. Asking on the
+		// keepalive round is what turned it into a state, and taskFaults is what answers it.
+		x1.WithTaskFaults(sub.taskFaults),
 		x1.OnTaskChange(sub.applyTaskChange),
 		// Refuse a warrant this element could never act on. It resolves subjects by
 		// subscriber identity alone (see targetsOf), so a warrant naming only a UE
@@ -542,6 +540,11 @@ func Init(cfg Config) error {
 			return err
 		}
 		sub.triggers = triggers
+		// The registry keeps the endpoints and the cadence; what a task's health means, and
+		// what reconciliation means, belong to the subsystem. Assigned before Start, which is
+		// what starts the loops that read them.
+		triggers.reportTaskHealth = sub.noteTaskHealth
+		triggers.reconcile = sub.reconcileEndpoint
 		// Reconciliation is NOT started here, and neither are the registry's own
 		// loops. See below, after the bind.
 	}

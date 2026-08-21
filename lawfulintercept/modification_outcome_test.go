@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/omec-project/li/store"
+	"github.com/omec-project/li/types"
 	"github.com/omec-project/li/x1"
 	"github.com/omec-project/li/x2x3"
 	smfctx "github.com/omec-project/smf/context"
@@ -265,4 +266,62 @@ func TestAnAcceptedModificationIsLeftAlone(t *testing.T) {
 	if joined := strings.Join(admf.received(), "\n"); strings.Contains(joined, "duplicationRefused") {
 		t.Errorf("an accepted modification was reported as refused:\n%s", joined)
 	}
+}
+
+// TestARefusedDuplicationIsAttributedToItsWarrant is the half the element-scoped report cannot
+// carry.
+//
+// An NE-level report may name no target and no warrant, which is the channel's rule and is
+// correct. That limit used to be read as meaning the condition could not be attributed at all —
+// so a LIPF holding several warrants was told only that *some* content interception this element
+// triggers was not running, which is a condition nobody can act on. It is the same defect
+// `triggerFaulty` was corrected for, on a different path.
+//
+// It can be attributed: a task report is scoped to a warrant by construction, and the SEID the
+// answer carries names the session, which names the warrants covering it.
+func TestARefusedDuplicationIsAttributedToItsWarrant(t *testing.T) {
+	sub, admf, _ := outcomeFixture(t)
+	sc := duplicatingSession(t)
+
+	reports := &recordingTaskReporter{}
+	sub.taskReporter = reports
+
+	warrant := types.InterceptTask{
+		XID:      "44444444-4444-4444-8444-444444444444",
+		Products: []types.ProductType{types.ProductCC},
+		Targets:  []types.TargetIdentifier{{Type: types.TargetSUPI, Value: "262019876543210"}},
+	}
+
+	if !sub.store.Activate(warrant) {
+		t.Fatal("Activate failed")
+	}
+
+	req := lisequence.Request{
+		SEID:        sc.PFCPContext["10.0.1.5"].LocalSEID,
+		NodeID:      "10.0.1.5",
+		Duplicating: true,
+	}
+
+	// The datapath refuses until the element gives up.
+	for range maxModificationAttempts + 1 {
+		sc.SMLock.Lock()
+		forEachForwardingFAR(sc, func(far *smfctx.FAR) { far.State = smfctx.RULE_CREATE })
+		sc.SMLock.Unlock()
+		ModificationAnswered(req, ie.CauseRequestRejected, true)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, r := range reports.reports {
+			if r.xid == string(warrant.XID) {
+				return
+			}
+		}
+
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	t.Fatalf("a datapath that refused an acknowledged interception was reported at element scope "+
+		"only, so a LIPF holding several warrants cannot tell which one stopped. Task reports: "+
+		"%+v; element reports:\n%s", reports.reports, strings.Join(admf.received(), "\n"))
 }

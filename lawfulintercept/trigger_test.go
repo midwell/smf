@@ -410,6 +410,11 @@ func triggerSubsystem(t *testing.T, poi *fakePOI) *subsystem {
 		triggers: mustRegistry(cfg),
 		store:    store.New(),
 	}
+	// Wired as Init wires it. Without these the keepalive round asks the POI nothing about the
+	// tasks it holds and never reconciles an endpoint whose account was lost — so a test would
+	// exercise a registry that production does not build.
+	s.triggers.reportTaskHealth = s.noteTaskHealth
+	s.triggers.reconcile = s.reconcileEndpoint
 	waitForScans(t, s)
 
 	return s
@@ -3402,5 +3407,228 @@ func TestAFaultyTriggerNamesOnlyItsOwnWarrant(t *testing.T) {
 			"and the trigger XIDs are %v — naming the working warrant would have somebody act on "+
 			"an interception that is running, and naming a trigger XID names something the LIPF "+
 			"never issued", named, faulty.XID, working.XID, held)
+	}
+}
+
+// TestATriggerThatStopsRunningAfterStartupIsReported drives the path that matters, which is not
+// the one the original coverage drove.
+//
+// A POI's account of the tasks it holds is the only way this element learns that a trigger it
+// installed has stopped running. That account used to be read exactly once per POI per process,
+// during start-up reconciliation — *before this process has installed anything*. Every trigger it
+// went on to install was therefore outside the only window in which its health could be observed,
+// for the life of the process: the one condition `triggerFaulty` exists for was the one condition
+// it could not see.
+//
+// The original test passed anyway, because it installed the trigger and *then* ran reconciliation.
+// Production cannot do that. This one keeps the order production has — reconcile first, install
+// after — and asks on the keepalive round, which is where the question now gets asked.
+func TestATriggerThatStopsRunningAfterStartupIsReported(t *testing.T) {
+	poi := newFakePOI(t)
+	s := triggerSubsystem(t, poi)
+	taskReports := &recordingTaskReporter{}
+	s.taskReporter = taskReports
+
+	// Start-up reconciliation, in the state production is actually in: this process has
+	// installed nothing, so the POI's account names nothing this element is answerable for.
+	s.reconcileOne()
+
+	// Only now does a session establish and a trigger get installed.
+	warrant := types.InterceptTask{
+		XID:      "11111111-1111-4111-8111-111111111111",
+		Products: []types.ProductType{types.ProductCC},
+	}
+	s.installFor("session-1", []types.InterceptTask{warrant},
+		[]upfSession{{node: upfNode(trigNodeA), seid: 42}}, 7)
+
+	var mine []string
+	for _, installed := range s.triggers.installed {
+		mine = append(mine, string(installed.xid))
+	}
+
+	if len(mine) == 0 {
+		t.Fatal("no trigger was installed, so this test would prove nothing")
+	}
+
+	// Later, the POI reports it as not running — a failed provisioning, an unresolved fault, a
+	// datapath that refused the duplication rule.
+	poi.mu.Lock()
+	poi.holds = mine
+	poi.unhealthy = map[string]string{mine[0]: "failed"}
+	poi.mu.Unlock()
+
+	// The keepalive round is what asks. It already contacts every endpoint this element owes a
+	// signal to, and it owes one exactly when it holds tasking there.
+	s.triggers.keepaliveRound()
+
+	var found bool
+
+	for _, r := range taskReports.reports {
+		if r.xid == string(warrant.XID) && strings.Contains(r.details, x1.TaskIssueTriggerNotRunning) {
+			found = true
+		}
+	}
+
+	if !found {
+		t.Errorf("a trigger the POI reports as not running was not reported against its warrant. "+
+			"Content interception has stopped while the warrant is live, and the only party that "+
+			"can notice is this one. Reports seen: %+v", taskReports.reports)
+	}
+
+	// And it is reported, not acted on: the warrant is live, so tearing its interception down
+	// would be the wrong remedy.
+	if n := poi.countMessages("DeactivateTaskRequest"); n != 0 {
+		t.Errorf("sent %d deactivations for a faulty trigger; the warrant is live", n)
+	}
+}
+
+// TestAPOIWhoseClaimsWereDiscardedIsReconciledAgain covers the half of the restart handling that
+// was missing, and the two halves are not separable.
+//
+// ForgetPOI drops this element's claims for a POI without withdrawing them. That is right when the
+// POI really restarted and holds nothing, and wrong when it is merely unreachable and holds
+// everything — and the liveness-timeout path cannot tell the two apart. Because markReconciled was
+// monotone, the element never asked again: the discarded triggers stayed at the POI for the life
+// of the process, and once new sessions installed new triggers there, keepalives resumed and
+// preserved the orphans along with them.
+//
+// Clearing `reconciled` alone would be worse, not better. keepaliveDue answers false for an
+// unreconciled endpoint, so the element would fall silent toward a POI at which it may hold *live*
+// tasking, and that POI's own fail-safe would purge the live triggers with the orphans. The
+// silence is only safe because reconciliation ends it.
+func TestAPOIWhoseClaimsWereDiscardedIsReconciledAgain(t *testing.T) {
+	poi := newFakePOI(t)
+	s := triggerSubsystem(t, poi)
+
+	s.reconcileOne()
+
+	warrant := types.InterceptTask{
+		XID:      "22222222-2222-4222-8222-222222222222",
+		Products: []types.ProductType{types.ProductCC},
+	}
+	s.installFor("session-1", []types.InterceptTask{warrant},
+		[]upfSession{{node: upfNode(trigNodeA), seid: 42}}, 7)
+
+	var mine []string
+	for _, installed := range s.triggers.installed {
+		mine = append(mine, string(installed.xid))
+	}
+
+	if len(mine) == 0 {
+		t.Fatal("no trigger was installed, so this test would prove nothing")
+	}
+
+	// The N4 path drops for long enough to time out. The POI has *not* restarted — it still
+	// holds everything this element installed.
+	poi.mu.Lock()
+	poi.holds = mine
+	poi.mu.Unlock()
+
+	if n := s.triggers.ForgetPOI(trigNodeA); n == 0 {
+		t.Fatal("ForgetPOI discarded nothing, so this test would prove nothing")
+	}
+
+	endpoint := s.triggers.endpoints[trigNodeA]
+	if endpoint.isReconciled() {
+		t.Error("the endpoint is still marked reconciled after its claims were discarded. This " +
+			"element can no longer name what that POI holds, so it must not go on asserting " +
+			"that it can")
+	}
+
+	// The keepalive round is what notices and reconciles again.
+	s.triggers.keepaliveRound()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for !endpoint.isReconciled() && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if !endpoint.isReconciled() {
+		t.Fatal("the endpoint was never reconciled again, so this element stays silent toward a " +
+			"POI where it may hold live tasking — and that POI's fail-safe will purge it")
+	}
+
+	// And the tasking it could no longer name is withdrawn, through the ordinary
+	// pending-removal machinery rather than abandoned.
+	if n := poi.countMessages("DeactivateTaskRequest"); n == 0 {
+		t.Error("the orphaned trigger was never withdrawn. It was discarded from this element's " +
+			"registry without being withdrawn from the POI, so it goes on duplicating under a " +
+			"warrant this element can no longer name — and once new tasking arrives at that POI, " +
+			"this element's keepalives preserve it")
+	}
+}
+
+// TestAFaultyTriggerIsAnsweredAndNotOnlyPushed covers the other obligation.
+//
+// `The element reports the fault conditions that currently hold` requires a condition the element
+// can re-observe to be available when the ADMF *asks*, not only pushed when it happens. A fault
+// reported once and then unavailable to an interrogation is one the provisioning function cannot
+// confirm still holds — and this element answered "nothing is wrong" for every task it held, which
+// was true of its IRI-POI role and false of its CC triggering role.
+func TestAFaultyTriggerIsAnsweredAndNotOnlyPushed(t *testing.T) {
+	poi := newFakePOI(t)
+	s := triggerSubsystem(t, poi)
+	s.taskReporter = &recordingTaskReporter{}
+
+	s.reconcileOne()
+
+	warrant := types.InterceptTask{
+		XID:      "33333333-3333-4333-8333-333333333333",
+		Products: []types.ProductType{types.ProductCC},
+	}
+	s.installFor("session-1", []types.InterceptTask{warrant},
+		[]upfSession{{node: upfNode(trigNodeA), seid: 42}}, 7)
+
+	var mine []string
+	for _, installed := range s.triggers.installed {
+		mine = append(mine, string(installed.xid))
+	}
+
+	if len(mine) == 0 {
+		t.Fatal("no trigger was installed, so this test would prove nothing")
+	}
+
+	if got := s.taskFaults(warrant.XID); len(got) != 0 {
+		t.Errorf("a healthy warrant answered with faults: %+v", got)
+	}
+
+	// The POI reports the trigger as not running.
+	poi.mu.Lock()
+	poi.holds = mine
+	poi.unhealthy = map[string]string{mine[0]: "failed"}
+	poi.mu.Unlock()
+
+	s.triggers.keepaliveRound()
+
+	got := s.taskFaults(warrant.XID)
+	if len(got) == 0 {
+		t.Fatal("an interrogation about a warrant whose content trigger a POI reports as not " +
+			"running answered that nothing is wrong. The condition was pushed and then became " +
+			"unanswerable, so the ADMF cannot confirm it still holds")
+	}
+
+	// It clears when the POI says the trigger is running again — a state, not a history.
+	poi.mu.Lock()
+	poi.unhealthy = nil
+	poi.mu.Unlock()
+
+	s.triggers.keepaliveRound()
+
+	if got := s.taskFaults(warrant.XID); len(got) != 0 {
+		t.Errorf("the fault survived the condition clearing: %+v — a status answer that "+
+			"accumulates makes an element permanently faulty, which is ignored as fast as one "+
+			"that is never faulty", got)
+	}
+
+	// And a withdrawn warrant answers nothing, rather than leaving an entry nothing removes.
+	poi.mu.Lock()
+	poi.unhealthy = map[string]string{mine[0]: "failed"}
+	poi.mu.Unlock()
+
+	s.triggers.keepaliveRound()
+	s.triggers.takeForWarrant(warrant.XID)
+
+	if got := s.taskFaults(warrant.XID); len(got) != 0 {
+		t.Errorf("a withdrawn warrant still answers with a fault: %+v", got)
 	}
 }

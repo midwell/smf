@@ -101,23 +101,41 @@ func (s *subsystem) modificationNotApplied(req lisequence.Request) {
 	if s.attemptsFor(req) >= maxModificationAttempts {
 		s.giveUpOn(req)
 
-		// Named at element scope and countable, carrying no target and no warrant. Which
-		// interception this was is the ADMF's to work out from its own provisioning, and
-		// this element may not put a warrant on this channel to say it.
+		// **Two channels, because they carry different things and only one of them may name
+		// a warrant.** The NE-level report below carries no target and no warrant, which is
+		// what that channel permits — an earlier version of this comment read that limit as
+		// meaning the condition could not be attributed at all, and left it at element scope.
+		// It can be: a task report is scoped to a warrant by construction, and this element
+		// knows which warrants cover the session, because the SEID names it.
+		//
+		// Without that, a LIPF holding several warrants is told only that *some* content
+		// interception this element triggers is not running, which is a condition nobody can
+		// act on — the same defect `triggerFaulty` was corrected for.
 		//
 		// The two directions are separate facts and are reported as such: an activation
 		// that did not take is an interception that is not running, and a withdrawal that
 		// did not take is content still being duplicated under authority that has gone.
+		detail := "the user plane did not apply the removal of a duplication this element has " +
+			"withdrawn; a session may still be duplicated under authority that has gone"
 		if req.Duplicating {
-			s.reporter.NotifyAsync(x1.NEIssueDuplicationRefused,
-				"the user plane did not apply a duplication this element has acknowledged; "+
-					"content interception is not running for a session it covers")
-
-			return
+			detail = "the user plane did not apply a duplication this element has acknowledged; " +
+				"content interception is not running for a session it covers"
 		}
-		s.reporter.NotifyAsync(x1.NEIssueDuplicationRefused,
-			"the user plane did not apply the removal of a duplication this element has "+
-				"withdrawn; a session may still be duplicated under authority that has gone")
+
+		s.reporter.NotifyAsync(x1.NEIssueDuplicationRefused, detail)
+
+		// And against each warrant the session is covered by. Non-terminating for the same
+		// reason the trigger-health report is: the tasking is intact and it is the product
+		// that has stopped, so telling the LIPF to re-provision would be the wrong remedy.
+		//
+		// Best-effort by nature — if the session has already gone there is nothing left to
+		// attribute, and the element-scoped report above has already said what happened.
+		if sc := smfctx.GetSMContextBySEID(req.SEID); sc != nil {
+			for _, task := range s.matchingTasks(sc) {
+				s.reportTaskIssueAs(task.XID, x1.TaskReportNonTerminatingFault,
+					x1.TaskIssueTriggerNotRunning+": "+detail)
+			}
+		}
 
 		return
 	}

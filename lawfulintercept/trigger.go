@@ -78,15 +78,59 @@ type upfEndpoint struct {
 	// never withdraw it — so it owes the POI no liveness signal, and the POI's own
 	// fail-safe is left free to act. See keepaliveDue.
 	reconciled bool
+	// reconciling guards against starting a second reconciliation for this endpoint while
+	// one is already retrying. See beginReconcile.
+	reconciling bool
 }
 
 // markReconciled records that this POI has given an authoritative account of its
-// tasking. It never goes back to false: what reconciliation establishes is that
-// this process, from here on, knows what it installed there.
+// tasking.
+//
+// It used to be documented as never going back to false. That was true while the only thing
+// that could invalidate the account was a restart of *this* process — but ForgetPOI discards
+// this element's claims for a POI on a liveness timeout too, and after that this process can
+// no longer name what that POI holds. See forgetReconciled.
 func (e *upfEndpoint) markReconciled() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.reconciled = true
+}
+
+// forgetReconciled records that this element's account of what a POI holds is no longer good.
+//
+// **It must be paired with reconciling again, and that is not optional.** keepaliveDue answers
+// false for an unreconciled endpoint, so this alone stops the liveness signal — which is right
+// while the element holds nothing it can name there, and wrong the moment a new session installs
+// a trigger at that POI. The element would then hold live tasking it never signals for, and the
+// POI's own fail-safe would purge it along with the orphans. Re-reconciliation is what closes
+// that window; the silence is only safe because it is temporary.
+func (e *upfEndpoint) forgetReconciled() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.reconciled = false
+}
+
+// beginReconcile claims the right to reconcile this endpoint, so that a reconciliation asked for
+// on every keepalive round starts at most one goroutine per endpoint. reconcileEndpoint retries
+// until it has an answer, which can be minutes; without this, a POI that is down would accumulate
+// one retrying goroutine per round for as long as it stayed down.
+func (e *upfEndpoint) beginReconcile() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if e.reconciling {
+		return false
+	}
+
+	e.reconciling = true
+
+	return true
+}
+
+func (e *upfEndpoint) endReconcile() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.reconciling = false
 }
 
 func (e *upfEndpoint) isReconciled() bool {
@@ -133,6 +177,36 @@ type triggerRegistry struct {
 	// tell a triggering function that has gone away from one that is merely late, and
 	// will report the first. nil when no ADMF is configured.
 	reportCadenceMissed func(time.Duration)
+	// reportTaskHealth carries a POI's own account of the tasks it holds back to the
+	// subsystem, once per keepalive round.
+	//
+	// **A condition that can only be observed once is not a condition this element can
+	// report.** The POI's account is the only way a triggering function learns that a trigger
+	// it installed has stopped running — a failed provisioning, an unresolved fault, a
+	// datapath that refused the duplication rule. It used to be read exactly once per POI per
+	// process, during start-up reconciliation, which is *before this process has installed
+	// anything*: every trigger it goes on to install is outside that window for the life of
+	// the process. So the one condition `triggerFaulty` exists for was the one condition it
+	// could not see.
+	//
+	// Asked on the keepalive round because that round already contacts every endpoint this
+	// element owes a signal to, and owes one exactly when it holds tasking there — which is
+	// exactly when a task's health is worth asking about.
+	reportTaskHealth func(nodeID string, reported []x1.TaskResponseDetails)
+	// reconcile re-establishes what one POI holds. Held as a callback for the same reason
+	// reportTaskHealth is: the registry keeps the endpoints and the cadence, the subsystem
+	// owns what reconciliation means.
+	reconcile func(nodeID string, e *upfEndpoint)
+	// unhealthy is what a POI last said about a trigger this element installed, keyed by the
+	// warrant it serves. Empty means every POI holding one of this warrant's triggers last
+	// reported it as running.
+	//
+	// Refreshed on the keepalive cadence rather than by asking when the question arrives: an
+	// X1 status request answered by dialling every POI would put a round trip per endpoint on
+	// the request goroutine, which is the cost this element's own worker exists to keep off it.
+	// The cadence is the same one the fail-safe windows are chosen against, so the answer is at
+	// most one round old.
+	unhealthy map[types.XID]string
 
 	// sleep and now are the withdrawal retry loop's clock, held here so a test can
 	// drive a backoff measured in minutes without spending it. Nil means the real
@@ -310,6 +384,7 @@ func newTriggerRegistry(
 		resolved:             make(map[string]string, len(cfg.UPFTriggers)),
 		installed:            make(map[string]installedTrigger),
 		pending:              make(map[string]*pendingWithdrawal),
+		unhealthy:            make(map[types.XID]string),
 		reportUnattributable: onUnattributable,
 		reportCadenceMissed:  onCadenceMissed,
 	}
@@ -721,12 +796,22 @@ func (r *triggerRegistry) keepaliveRound() {
 	started := time.Now()
 
 	for nodeID, endpoint := range due {
+		// An endpoint whose account this element has lost — a restart, or a liveness timeout
+		// that made ForgetPOI discard its claims — is reconciled again rather than left
+		// silent. Until it answers, keepaliveDue keeps this element quiet toward it, which is
+		// what lets the POI's own fail-safe reclaim tasking nobody here can name.
+		if !endpoint.isReconciled() && r.reconcile != nil {
+			go r.reconcile(nodeID, endpoint)
+
+			continue
+		}
+
 		if !r.keepaliveDue(nodeID, endpoint) {
 			continue
 		}
 
 		wg.Add(1)
-		go func(endpoint *upfEndpoint) {
+		go func(nodeID string, endpoint *upfEndpoint) {
 			defer wg.Done()
 
 			// Best-effort: a missed keepalive is transient, and a POI that has really
@@ -743,7 +828,20 @@ func (r *triggerRegistry) keepaliveRound() {
 			if err := endpoint.req.Keepalive(); err != nil && r.reportUnattributable != nil {
 				r.reportUnattributable(err)
 			}
-		}(endpoint)
+
+			// And what the POI says about the tasks it holds, on the same round and the same
+			// goroutine. Best-effort in the same sense: a POI that cannot answer is either
+			// transiently unreachable, which the keepalive above already accounts for, or gone,
+			// which its own fail-safe handles. What must not happen is this element never
+			// asking, which is the state it was in.
+			if r.reportTaskHealth == nil {
+				return
+			}
+
+			if reported, err := endpoint.req.ReportedTasks(); err == nil {
+				r.reportTaskHealth(nodeID, reported)
+			}
+		}(nodeID, endpoint)
 	}
 
 	wg.Wait()
@@ -838,6 +936,14 @@ func (s *subsystem) reconcileTriggers() {
 // makes that state temporary, and the keepalive gating (keepaliveDue) is what makes
 // it safe while it lasts.
 func (s *subsystem) reconcileEndpoint(nodeID string, endpoint *upfEndpoint) {
+	// At most one per endpoint: this is called from start-up and from every keepalive round,
+	// and it retries until it has an answer.
+	if !endpoint.beginReconcile() {
+		return
+	}
+
+	defer endpoint.endReconcile()
+
 	var reported []x1.TaskResponseDetails
 	for attempt := 0; ; attempt++ {
 		if attempt > 0 {
@@ -866,6 +972,11 @@ func (s *subsystem) reconcileEndpoint(nodeID string, endpoint *upfEndpoint) {
 	// fail-safe reclaim tasking nobody can name.
 	endpoint.markReconciled()
 
+	// This account is judged like any other. At start-up it almost never says anything —
+	// this process has installed nothing yet, so it holds nothing to be answerable for —
+	// which is precisely why the same judgement must run on the keepalive round.
+	s.noteTaskHealth(nodeID, reported)
+
 	var orphans []withdrawal
 	for _, task := range reported {
 		xid := types.XID(task.TaskDetails.XID)
@@ -878,35 +989,9 @@ func (s *subsystem) reconcileEndpoint(nodeID string, endpoint *upfEndpoint) {
 		// now would otherwise have its brand-new trigger withdrawn by the cleanup —
 		// and one being withdrawn right now would be withdrawn twice, by two
 		// parties neither of which can read the other's answer.
-		if held, withdrawing, warrant := s.triggers.holdsFor(xid); held {
-			// It is ours, so it is not stale — but the POI's account of it is the
-			// only way this function learns that a trigger it installed is not
-			// actually running. A failed provisioning or an unresolved fault means
-			// content interception has stopped while the warrant is live, which is
-			// precisely what a CC triggering function exists to notice. The reply
-			// was previously read for XIDs and nothing else. A trigger already on
-			// its way out is exempt: it is meant to stop.
-			if !withdrawing && !task.TaskStatus.Healthy() {
-				// **Against the warrant, which is what makes this actionable.** Reported at
-				// element scope, this said that something among the content interceptions
-				// this element triggers had stopped, and a LIPF holding several warrants
-				// could not tell which — so the report named a condition nobody could act
-				// on. `triggerFaulty` exists for exactly this attribution, and until the POI
-				// could answer per task there was nothing to attribute.
-				//
-				// Non-terminating: the POI holds the task and this element holds the trigger,
-				// so what has stopped is the product rather than the tasking, and a
-				// terminating report would tell the LIPF to re-provision an element whose
-				// provisioning is intact.
-				//
-				// Describe() renders the POI's own account and is documented never to include
-				// a target identifier, which is the property that lets it be forwarded.
-				s.reportTaskIssueAs(warrant, x1.TaskReportNonTerminatingFault,
-					x1.TaskIssueTriggerNotRunning+": a UPF reports the content trigger this "+
-						"element installed for this warrant as not running: "+
-						task.TaskStatus.Describe())
-			}
-
+		// Anything this process is answerable for is not stale. Its health is judged by
+		// noteTaskHealth, which runs for this account and for every later one.
+		if held, _, _ := s.triggers.holdsFor(xid); held {
 			continue
 		}
 
@@ -921,6 +1006,106 @@ func (s *subsystem) reconcileEndpoint(nodeID string, endpoint *upfEndpoint) {
 	// Synchronously, on this endpoint's own goroutine: a POI that will not
 	// acknowledge holds up nothing but its own reconciliation.
 	s.deactivate(orphans)
+}
+
+// noteTaskHealth reports every trigger this element holds that the POI says is not running.
+//
+// The POI's account is the only way a triggering function learns that a trigger it installed has
+// stopped: a failed provisioning, an unresolved fault, a datapath that refused the duplication
+// rule. Content interception has then stopped while the warrant is live, which is precisely what a
+// CC triggering function exists to notice.
+//
+// **Against the warrant, which is what makes it actionable.** Reported at element scope this said
+// that something among the content interceptions this element triggers had stopped, and a LIPF
+// holding several warrants could not tell which — a condition nobody could act on.
+//
+// Non-terminating: the POI holds the task and this element holds the trigger, so what has stopped
+// is the product rather than the tasking, and a terminating report would tell the LIPF to
+// re-provision an element whose provisioning is intact.
+//
+// A trigger already on its way out is exempt: it is meant to stop. Describe() renders the POI's own
+// account and is documented never to include a target identifier, which is what lets it be
+// forwarded.
+func (s *subsystem) noteTaskHealth(_ string, reported []x1.TaskResponseDetails) {
+	if s.triggers == nil {
+		return
+	}
+
+	for _, task := range reported {
+		xid := types.XID(task.TaskDetails.XID)
+		if xid == "" {
+			continue
+		}
+
+		held, withdrawing, warrant := s.triggers.holdsFor(xid)
+		if !held || withdrawing {
+			continue
+		}
+
+		if task.TaskStatus.Healthy() {
+			s.triggers.noteHealthy(warrant)
+
+			continue
+		}
+
+		// Kept as well as pushed. The push tells the LIPF when it happens; this is what lets
+		// the same condition be *answered* when the ADMF asks, which is a separate obligation
+		// — a fault reported once and then unavailable to an interrogation is a fault the
+		// provisioning function cannot confirm still holds.
+		s.triggers.noteUnhealthy(warrant, task.TaskStatus.Describe())
+
+		s.reportTaskIssueAs(warrant, x1.TaskReportNonTerminatingFault,
+			x1.TaskIssueTriggerNotRunning+": a UPF reports the content trigger this "+
+				"element installed for this warrant as not running: "+
+				task.TaskStatus.Describe())
+	}
+}
+
+// noteUnhealthy and noteHealthy record what a POI last said about the triggers serving one
+// warrant, so the same condition can be answered when the ADMF asks and not only pushed when it
+// happens.
+func (r *triggerRegistry) noteUnhealthy(warrant types.XID, why string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.unhealthy[warrant] = why
+}
+
+func (r *triggerRegistry) noteHealthy(warrant types.XID) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	delete(r.unhealthy, warrant)
+}
+
+// taskFaults answers what is currently wrong with one warrant's content interception, for the X1
+// status a provisioning function can ask for.
+//
+// **This element used to answer "nothing" for every task, and that was recorded as a decision.**
+// The reasoning held for the IRI-POI role — a quiet subscriber is indistinguishable from one this
+// element has stopped watching, and a destination's failure belongs to the destination rather than
+// to each warrant pointing at it. It did not hold for the CC triggering role, which is the other
+// thing this element is: a trigger a POI reports as not running is task-scoped, re-observable, and
+// means this warrant's content interception has stopped while the warrant is live.
+//
+// It was unanswerable only because this element asked once per process, at start-up, before it had
+// installed anything. Asking on the keepalive round is what makes it a state rather than an event.
+func (s *subsystem) taskFaults(xid types.XID) []x1.X1Error {
+	if s.triggers == nil {
+		return nil
+	}
+
+	s.triggers.mu.Lock()
+	why, faulty := s.triggers.unhealthy[xid]
+	s.triggers.mu.Unlock()
+
+	if !faulty {
+		return nil
+	}
+
+	return []x1.X1Error{x1.TaskFault(x1.TaskIssueTriggerNotRunning,
+		"a point of interception reports the content trigger this element installed for this "+
+			"warrant as not running: "+why)}
 }
 
 // upfSession is one UPF serving a session, with the detection criterion for that
@@ -1766,6 +1951,11 @@ func (r *triggerRegistry) takeForSession(ref string) []withdrawal {
 // installed, into the pending-removal state. Used when a warrant is deactivated
 // while its sessions are still live.
 func (r *triggerRegistry) takeForWarrant(warrant types.XID) []withdrawal {
+	// The warrant is going, so what a POI last said about its triggers is no longer an answer
+	// this element should give about anything. Left behind it would be both a stale fault and an
+	// entry nothing ever removes.
+	r.noteHealthy(warrant)
+
 	return r.takeForWarrantExcept(warrant, nil)
 }
 
@@ -1835,6 +2025,15 @@ func (r *triggerRegistry) forgetRestartedPOI(session upfSession) int {
 func (r *triggerRegistry) ForgetPOI(nodeID string) int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
+	// This element's account of what that POI holds is exactly what has just become
+	// untrustworthy, so it is no longer reconciled. The claims below are dropped without being
+	// withdrawn — right when the POI really restarted and holds nothing, and wrong when it is
+	// merely unreachable and holds everything — and reconciling again is how the second case
+	// is discovered instead of assumed.
+	if e, ok := r.endpoints[nodeID]; ok {
+		e.forgetReconciled()
+	}
 
 	forgotten := 0
 	for key := range r.installed {
