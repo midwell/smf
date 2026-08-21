@@ -169,6 +169,10 @@ func (smf *SMF) Start() {
 		// Inject the PFCP session-modification hook the mid-session CC trigger
 		// needs. Done before Init mounts the X1 listener so the hook is in place
 		// before any tasking can arrive.
+		// The strict `li`-block decode's verdict, carried from the factory rather than acted
+		// on there. Same reasoning as the fail-safe window above: the refusal is scoped to
+		// interception here, and the fault reporter exists by then.
+		liBlockErr := factory.LiBlockError()
 		lawfulintercept.SetSessionModifier(producer.ModifySessionForLI)
 		// And the restart notification the adapter's PFCP handlers raise. It is a package
 		// variable there rather than a direct call because pfcp/adapter may not import
@@ -192,7 +196,8 @@ func (smf *SMF) Start() {
 			})
 		}
 		if err := lawfulintercept.Init(lawfulintercept.Config{
-			X1Listen: li.X1Listen, MDF2: li.MDF2, NEID: li.NEID,
+			BlockError: liBlockErr,
+			X1Listen:   li.X1Listen, MDF2: li.MDF2, NEID: li.NEID,
 			Cert: li.Cert, Key: li.Key, CACert: li.CACert,
 			MDF3: li.MDF3, UPFTriggers: triggers,
 			Destinations: dests,

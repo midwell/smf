@@ -27,6 +27,18 @@ import (
 // The block is isolated first and decoded strictly second, because strictness lives on the decode
 // and a decode covers everything it is given. The lenient first pass models nothing but the path
 // to the block, so no key outside it is visible to be refused.
+// liBlockErr records why the `li` block was refused, if it was. Package-level because
+// InitConfigFactory has no other channel to the LI subsystem, and it is reset on every load so a
+// reload that fixes the block clears it.
+var liBlockErr error
+
+// LiBlockError reports why the `li` block was refused, or nil. The LI subsystem consults it at
+// start-up: interception does not start on a refusal, and the refusal is reported to the ADMF.
+//
+// **The caller must not log this, and must not fail the network function on it.** The text names
+// LI configuration keys, so it belongs on the X1 fault channel and nowhere else.
+func LiBlockError() error { return liBlockErr }
+
 func strictLiBlock(content []byte) error {
 	// Only the path to the block. This struct must not grow: modelling anything else here would
 	// make it a second, diverging definition of the configuration.

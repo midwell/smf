@@ -34,6 +34,16 @@ import (
 
 // Config configures the SMF LI IRI-POI. Init is only called when LI is enabled.
 type Config struct {
+	// BlockError, when non-nil, is why the element's `li` configuration block was refused
+	// before it reached here — an unrecognised key, most likely a misspelling of one this
+	// element does model.
+	//
+	// It is carried rather than acted on by the loader because refusing a configuration is not
+	// the same as refusing to run: the network function has work of its own, and stopping it
+	// over an optional subsystem is both an outage and the loudest way to disclose that this
+	// element is LI-provisioned. Interception does not start on it; the SMF does.
+	BlockError error
+
 	X1Listen string // address for the X1 provisioning listener, e.g. ":8443"
 	MDF2     string // X2 delivery destination (MDF2 "host:port")
 	NEID     string // this network element's identifier (echoed in X1 responses)
@@ -379,6 +389,18 @@ func Init(cfg Config) error {
 	// will ever report it — see errNoX1Listen. Reported to the ADMF, because an element that
 	// cannot be provisioned is precisely what the ADMF needs to hear about, and refused,
 	// because starting is what makes it look healthy.
+	// The refused `li` block, now that there is somewhere to report it. Checked before any
+	// value out of that block is used, because the block is exactly what could not be read:
+	// the keys that did decode are not trustworthy as a set, and one of the ones that did not
+	// may be the fail-safe window or the fault endpoint.
+	if cfg.BlockError != nil {
+		reporter.Notify(x1.NEIssueInvalidConfig,
+			"this element's interception configuration carries a setting it does not "+
+				"recognise, so the values it would fall back on cannot be trusted; "+
+				"interception has not been started")
+
+		return cfg.BlockError
+	}
 	if cfg.X1Listen == "" {
 		reporter.Notify(x1.NEIssueInvalidConfig,
 			"no X1 listen address is configured, so this element would accept tasking on an "+
