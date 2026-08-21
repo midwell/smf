@@ -689,6 +689,23 @@ func ReportEstablishmentReject(sc *smfctx.SMContext, cause uint8) {
 	reportUnsuccessful(sc, iri.SMFFailedPDUSessionEstablishment, cause)
 }
 
+// ReportModificationReject emits an SMFUnsuccessfulProcedure xIRI when a PDU session
+// modification fails for a tasked target.
+//
+// **It is the counterpart to a record this element already emits.** ReportModification is raised
+// before the PFCP modification is attempted, because the state the record describes may be gone by
+// the time the outcome is known — a legitimate choice, and one that obliges the element to report
+// the failure that follows. Without this the agency held a record asserting a modification that
+// never took effect, with nothing to say so; the release path has handled exactly this shape on
+// all three of its failure branches since it was written.
+//
+// cause is the 5GSM cause where the element decided one. The PFCP-timeout path decides none — it
+// answers the AMF with a 503 and a release command rather than a 5GSM reject — so it passes the
+// generic rejection rather than inventing a specific cause the element never chose.
+func ReportModificationReject(sc *smfctx.SMContext, cause uint8) {
+	reportUnsuccessful(sc, iri.SMFFailedPDUSessionModification, cause)
+}
+
 // ReportReleaseReject emits an SMFUnsuccessfulProcedure xIRI when the SMF refuses
 // a PDU session release for a tasked target. cause is the 5GSM cause the reject
 // carries.

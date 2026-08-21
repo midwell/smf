@@ -186,6 +186,11 @@ func (smf *SMF) Start() {
 		// hook whose presence depends on enableUPFAdapter — and the adapter path had none of
 		// these, which meant the DUPL FAR went to the UPF and the ActivateTask that authorises
 		// it never did.
+		// And the two failure paths that build their own reject below the producer's helper,
+		// in pfcp/message — which may not import lawfulintercept, since that package's tests
+		// import this one.
+		message.ReportEstablishmentReject = lawfulintercept.ReportEstablishmentReject
+		message.ReportModificationReject = lawfulintercept.ReportModificationReject
 		adapter.ReportEstablishment = lawfulintercept.ReportEstablishment
 		adapter.ApplyCCAfterEstablishment = lawfulintercept.ApplyCCAfterEstablishment
 		adapter.TriggerCC = lawfulintercept.TriggerCC
