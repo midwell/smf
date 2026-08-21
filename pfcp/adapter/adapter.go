@@ -44,6 +44,64 @@ func notifyLIModificationAnswered(req lisequence.Request, cause uint8, answered 
 	}
 }
 
+// ReportEstablishment, ApplyCCAfterEstablishment and TriggerCC are the Lawful Interception hooks
+// this package raises when a PFCP session establishment response completes. They are assigned by
+// the same service wiring that assigns POIRestarted, for the same reason: this package may not
+// import lawfulintercept.
+//
+// **They exist because only one of the native and adapter handlers runs in a deployment.** The
+// native handler in pfcp/handler has carried these three since interception was built; this one
+// had none of them, so with enableUPFAdapter set — the chart's default — the SMF sent the UPF a
+// DUPL FAR and then never sent the ActivateTask that authorises it. The CC-POI held no task for
+// the session, dropped every copy as unattributable, and the establishment record was never
+// produced. Nothing anywhere raised a fault, because from the SMF's side nothing had failed.
+var (
+	ReportEstablishment       func(sc *context.SMContext)
+	ApplyCCAfterEstablishment func(sc *context.SMContext)
+	TriggerCC                 func(sc *context.SMContext)
+)
+
+// notifyReportEstablishment calls the hook if one is wired.
+func notifyReportEstablishment(sc *context.SMContext) {
+	if ReportEstablishment != nil {
+		ReportEstablishment(sc)
+	}
+}
+
+// notifyApplyCCAfterEstablishment calls the hook if one is wired.
+func notifyApplyCCAfterEstablishment(sc *context.SMContext) {
+	if ApplyCCAfterEstablishment != nil {
+		ApplyCCAfterEstablishment(sc)
+	}
+}
+
+// notifyTriggerCC calls the hook if one is wired.
+//
+// One helper per hook, named for it, rather than one that raises both: the call site is what a
+// reader and a parity check both look at, and a helper that groups two hooks hides their names
+// from it. That is not hypothetical either — the first version of this grouped them, and the
+// parity guard in this package failed until they were named here.
+func notifyTriggerCC(sc *context.SMContext) {
+	if TriggerCC != nil {
+		TriggerCC(sc)
+	}
+}
+
+// establishmentAccepted reports whether the response carries an accepted cause.
+//
+// A copy of pfcp/handler's helper rather than a shared one: this package cannot import that one
+// without a cycle, and the alternative — moving the shared response handling into a package both
+// can import — is a restructuring of upstream code on a fork that must stay readable as a diff.
+func establishmentAccepted(rsp *message.SessionEstablishmentResponse) bool {
+	if rsp.Cause == nil {
+		return false
+	}
+
+	cause, err := rsp.Cause.Cause()
+
+	return err == nil && cause == ie.CauseRequestAccepted
+}
+
 // notifyPOIRestarted calls the hook if one is wired. Written once so a new call site cannot
 // forget the nil check — a nil function value panics, and these are PFCP message handlers.
 func notifyPOIRestarted(node context.NodeID, addr string) {
@@ -367,6 +425,17 @@ func HandlePfcpSessionEstablishmentResponse(msg *udp.Message) {
 		}
 		// UPF Accept
 		if causeValue == ie.CauseRequestAccepted {
+			// Lawful Interception IRI-POI: the session now exists on the UPF, so its F-SEID
+			// (the X2 correlation identifier) and F-TEID are known — both were set above from
+			// this response. At most once per session; silent no-op unless LI is configured.
+			// SMLock is held for the whole handler.
+			//
+			// Inside the anchor branch, as in the native handler: the record's correlation
+			// identifier is the *default path's* F-SEID, so emitting it on some other UPF's
+			// response would produce the one record describing the session with nothing to
+			// join it to.
+			notifyReportEstablishment(smContext)
+
 			smContext.SBIPFCPCommunicationChan <- context.SessionEstablishSuccess
 			smContext.SubPfcpLog.Infof("PFCP Session Establishment accepted")
 		} else {
@@ -376,6 +445,25 @@ func HandlePfcpSessionEstablishmentResponse(msg *udp.Message) {
 				SetUpfInactive(*rspNodeID)
 			}
 		}
+	}
+
+	// Lawful Interception CC-TF: task the CC-POI of the UPF that has just created this session.
+	// The trigger's packet detection criterion is the F-SEID that response assigns, so this is
+	// the earliest point it can be sent — the duplication instruction itself rode out with the
+	// request.
+	//
+	// Outside the anchor branch above, as in the native handler, because a session can be served
+	// by more than one UPF and only the anchor's response takes that branch. Inside it, an
+	// additional PSA got its DUPL FAR but never its trigger, so it duplicated the target's
+	// traffic into content the CC-POI could not attribute and correctly dropped. Triggering is
+	// idempotent per (warrant, session, UPF).
+	if establishmentAccepted(rsp) {
+		// Re-derive duplication before tasking: a warrant that activated while this session was
+		// being established has not been applied to its FARs by anyone, and this is the first
+		// point ordered after the session exists. Under the same lock, so it cannot race the
+		// rules it reads.
+		notifyApplyCCAfterEstablishment(smContext)
+		notifyTriggerCC(smContext)
 	}
 }
 

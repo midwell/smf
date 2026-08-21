@@ -181,6 +181,14 @@ func (smf *SMF) Start() {
 		// and adapter handlers is active in a deployment, and a remedy present in one of them
 		// is a remedy whose presence depends on enableUPFAdapter.
 		adapter.POIRestarted = lawfulintercept.POIRestarted
+		// And the three establishment hooks, for the same reason. Only one of the native and
+		// adapter handlers is active in a deployment, so a hook present in one of them is a
+		// hook whose presence depends on enableUPFAdapter — and the adapter path had none of
+		// these, which meant the DUPL FAR went to the UPF and the ActivateTask that authorises
+		// it never did.
+		adapter.ReportEstablishment = lawfulintercept.ReportEstablishment
+		adapter.ApplyCCAfterEstablishment = lawfulintercept.ApplyCCAfterEstablishment
+		adapter.TriggerCC = lawfulintercept.TriggerCC
 		// And the answer to this element's own PFCP modifications, for the same reason.
 		adapter.LIModificationAnswered = lawfulintercept.ModificationAnswered
 		triggers := make([]lawfulintercept.UPFTrigger, 0, len(li.UPFTriggers))

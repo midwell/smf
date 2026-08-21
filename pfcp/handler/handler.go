@@ -193,6 +193,18 @@ func SetUpfInactive(nodeID smf_context.NodeID, msgTypeName string) {
 	defer upf.UpfLock.Unlock()
 	upf.UPFStatus = smf_context.NotAssociated
 	upf.NHeartBeat = 0 // reset Heartbeat attempt to 0
+
+	// Lawful Interception: this UPF has stopped answering, so what it holds is no longer
+	// knowable and the claims this element keeps for it are worse than useless — they make the
+	// planning path skip every triple as already claimed, and they keep this element telling a
+	// POI it may not be reaching that its triggering function is present, which is what
+	// disables that POI's own fail-safe.
+	//
+	// The adapter's twin of this function has raised it since it was written; this one did not,
+	// so on the native path a UPF reporting no established association was discovered only by
+	// the next probe cycle. Only one of the two runs in a deployment, which is exactly what
+	// makes a remedy present in one of them a remedy that depends on enableUPFAdapter.
+	POIRestarted(upf.NodeID, upf.NodeID.ResolveNodeIdToIp().String())
 }
 
 func HandlePfcpPfdManagementRequest(msg *udp.Message) {
