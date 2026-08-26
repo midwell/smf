@@ -745,6 +745,9 @@ func smfUnsuccessful(sc *smfctx.SMContext, procedure iri.SMFFailedProcedureType,
 		DNN:                 iri.DNN(sc.Dnn),
 		RequestType:         requestType(sc),
 		AccessType:          accessType(sc),
+		SUPIUnauthenticated: supiUnauthenticatedOf(sc),
+		AMFID:               amfIDOf(sc),
+		RATType:             ratTypeOf(sc.RatType),
 	}
 }
 
@@ -1499,23 +1502,124 @@ func targetsOf(sc *smfctx.SMContext) []types.TargetIdentifier {
 	return ids
 }
 
+// ratTypeOf maps the 5GC RAT type to TS 33.128's enumeration. An unmapped value
+// yields zero, which encodes as absent: reporting no RAT type is right where
+// reporting the wrong one would be a claim about the access the session used.
+func ratTypeOf(rat models.RatType) iri.RATType {
+	switch rat {
+	case models.RATTYPE_NR:
+		return iri.RATNR
+	case models.RATTYPE_EUTRA:
+		return iri.RATEUTRA
+	case models.RATTYPE_WLAN:
+		return iri.RATWLAN
+	case models.RATTYPE_VIRTUAL:
+		return iri.RATVirtual
+	case models.RATTYPE_NBIOT:
+		return iri.RATNBIOT
+	case models.RATTYPE_LTE_M:
+		return iri.RATLTEM
+	case models.RATTYPE_NR_U:
+		return iri.RATNRU
+	case models.RATTYPE_EUTRA_U:
+		return iri.RATEUTRAU
+	case models.RATTYPE_TRUSTED_N3_GA:
+		return iri.RATTrustedN3GA
+	case models.RATTYPE_TRUSTED_WLAN:
+		return iri.RATTrustedWLAN
+	// Non-terrestrial access, which this deployment serves.
+	case models.RATTYPE_NR_LEO:
+		return iri.RATNRLEO
+	case models.RATTYPE_NR_MEO:
+		return iri.RATNRMEO
+	case models.RATTYPE_NR_GEO:
+		return iri.RATNRGEO
+	case models.RATTYPE_NR_OTHER_SAT:
+		return iri.RATNROtherSat
+	case models.RATTYPE_NR_REDCAP:
+		return iri.RATNRRedCap
+	}
+
+	return 0
+}
+
+// servingNetworkOf maps the session's serving PLMN. An incomplete PLMN yields the
+// zero value, which encodes as absent.
+func servingNetworkOf(sc *smfctx.SMContext) iri.SMFServingNetwork {
+	mcc, mnc := sc.ServingNetwork.GetMcc(), sc.ServingNetwork.GetMnc()
+	if mcc == "" || mnc == "" {
+		return iri.SMFServingNetwork{}
+	}
+
+	return iri.SMFServingNetwork{
+		PLMNID: iri.PLMNID{MCC: iri.MCC(mcc), MNC: iri.MNC(mnc)},
+		NID:    iri.NID(sc.ServingNetwork.GetNid()),
+	}
+}
+
+// amfIDOf decomposes the serving AMF's GUAMI into TS 23.003 clause 2.10.1's three
+// parts, which is what TS 33.128's aMFID is.
+//
+// Not from SMContext.ServingNfId: that is the AMF's NF instance UUID and carries no
+// AMF identifier at all. The AMF sends its GUAMI on N11 and SetCreateData retains it.
+//
+// AmfId is six hex digits — region (8 bits), set (10) and pointer (6) — and anything
+// else yields the zero value, which encodes as absent rather than as a guess about
+// which AMF served the session.
+func amfIDOf(sc *smfctx.SMContext) iri.AMFID {
+	id := sc.Guami.AmfId
+	if len(id) != 6 {
+		return iri.AMFID{}
+	}
+	raw, err := hex.DecodeString(id)
+	if err != nil {
+		return iri.AMFID{}
+	}
+
+	return iri.AMFID{
+		AMFRegionID: iri.AMFRegionID(raw[0]),
+		AMFSetID:    iri.AMFSetID(uint16(raw[1])<<2 | uint16(raw[2])>>6),
+		AMFPointer:  iri.AMFPointer(raw[2] & 0x3f),
+	}
+}
+
+// supiUnauthenticatedOf reports the authentication status of the SUPI the record
+// carries. TS 33.128: "shall be present if a SUPI is present in the message and set
+// to true if the SUPI has not been authenticated, or false if it has been".
+//
+// Absent means the record carries no SUPI, so the governing condition does not hold.
+// It does not mean authenticated — which is why this returns a pointer, and why the
+// codec had to learn to emit an OPTIONAL field equal to its type's zero value.
+func supiUnauthenticatedOf(sc *smfctx.SMContext) *iri.SUPIUnauthenticatedIndication {
+	if supiChoice(sc) == nil {
+		return nil
+	}
+	v := iri.SUPIUnauthenticatedIndication(sc.UnauthenticatedSupi)
+
+	return &v
+}
+
 // smfEstablishment maps an SMContext to a TS 33.128 SMFPDUSessionEstablishment
 // record. Deferred optionals (deeper subtrees): uEEndpoint, location, and the
 // long tail.
 func smfEstablishment(sc *smfctx.SMContext) iri.SMFPDUSessionEstablishment {
 	return iri.SMFPDUSessionEstablishment{
-		SUPI:           supiChoice(sc),
-		PEI:            peiChoice(sc),
-		GPSI:           gpsiChoice(sc),
-		PDUSessionID:   iri.PDUSessionID(sc.PDUSessionID),
-		GTPTunnelID:    servingUPFTEID(sc),
-		PDUSessionType: iri.PDUSessionType(sc.SelectedPDUSessionType),
-		SNSSAI:         snssai(sc),
-		UEEndpoint:     ueEndpoint(sc),
-		DNN:            iri.DNN(sc.Dnn),
-		RequestType:    requestType(sc),
-		AccessType:     accessType(sc),
-		GTPTunnelInfo:  gtpTunnelInfo(sc),
+		SUPI:                supiChoice(sc),
+		PEI:                 peiChoice(sc),
+		GPSI:                gpsiChoice(sc),
+		PDUSessionID:        iri.PDUSessionID(sc.PDUSessionID),
+		GTPTunnelID:         servingUPFTEID(sc),
+		PDUSessionType:      iri.PDUSessionType(sc.SelectedPDUSessionType),
+		SNSSAI:              snssai(sc),
+		UEEndpoint:          ueEndpoint(sc),
+		DNN:                 iri.DNN(sc.Dnn),
+		RequestType:         requestType(sc),
+		AccessType:          accessType(sc),
+		GTPTunnelInfo:       gtpTunnelInfo(sc),
+		SUPIUnauthenticated: supiUnauthenticatedOf(sc),
+		AMFID:               amfIDOf(sc),
+		RATType:             ratTypeOf(sc.RatType),
+		ServingNetwork:      servingNetworkOf(sc),
 	}
 }
 
@@ -1540,18 +1644,22 @@ func ueEndpoint(sc *smfctx.SMContext) []any {
 // as the establishment record, but requestType marks the session as pre-existing.
 func smfStartOfInterception(sc *smfctx.SMContext) iri.SMFStartOfInterceptionWithEstablishedPDUSession {
 	return iri.SMFStartOfInterceptionWithEstablishedPDUSession{
-		SUPI:           supiChoice(sc),
-		PEI:            peiChoice(sc),
-		GPSI:           gpsiChoice(sc),
-		PDUSessionID:   iri.PDUSessionID(sc.PDUSessionID),
-		GTPTunnelID:    servingUPFTEID(sc),
-		PDUSessionType: iri.PDUSessionType(sc.SelectedPDUSessionType),
-		SNSSAI:         snssai(sc),
-		UEEndpoint:     ueEndpoint(sc),
-		DNN:            iri.DNN(sc.Dnn),
-		RequestType:    iri.SMRequestExisting,
-		AccessType:     accessType(sc),
-		GTPTunnelInfo:  gtpTunnelInfo(sc),
+		SUPI:                supiChoice(sc),
+		PEI:                 peiChoice(sc),
+		GPSI:                gpsiChoice(sc),
+		PDUSessionID:        iri.PDUSessionID(sc.PDUSessionID),
+		GTPTunnelID:         servingUPFTEID(sc),
+		PDUSessionType:      iri.PDUSessionType(sc.SelectedPDUSessionType),
+		SNSSAI:              snssai(sc),
+		UEEndpoint:          ueEndpoint(sc),
+		DNN:                 iri.DNN(sc.Dnn),
+		RequestType:         iri.SMRequestExisting,
+		AccessType:          accessType(sc),
+		GTPTunnelInfo:       gtpTunnelInfo(sc),
+		SUPIUnauthenticated: supiUnauthenticatedOf(sc),
+		AMFID:               amfIDOf(sc),
+		RATType:             ratTypeOf(sc.RatType),
+		ServingNetwork:      servingNetworkOf(sc),
 	}
 }
 
@@ -1559,14 +1667,18 @@ func smfStartOfInterception(sc *smfctx.SMContext) iri.SMFStartOfInterceptionWith
 // record. Only requestType is mandatory.
 func smfModification(sc *smfctx.SMContext) iri.SMFPDUSessionModification {
 	return iri.SMFPDUSessionModification{
-		SUPI:          supiChoice(sc),
-		PEI:           peiChoice(sc),
-		GPSI:          gpsiChoice(sc),
-		SNSSAI:        snssai(sc),
-		RequestType:   iri.SMRequestModification,
-		AccessType:    accessType(sc),
-		PDUSessionID:  iri.PDUSessionID(sc.PDUSessionID),
-		GTPTunnelInfo: gtpTunnelInfo(sc),
+		SUPI:                supiChoice(sc),
+		PEI:                 peiChoice(sc),
+		GPSI:                gpsiChoice(sc),
+		SNSSAI:              snssai(sc),
+		RequestType:         iri.SMRequestModification,
+		AccessType:          accessType(sc),
+		PDUSessionID:        iri.PDUSessionID(sc.PDUSessionID),
+		GTPTunnelInfo:       gtpTunnelInfo(sc),
+		SUPIUnauthenticated: supiUnauthenticatedOf(sc),
+		RATType:             ratTypeOf(sc.RatType),
+		UEEndpoint:          ueEndpoint(sc),
+		ServingNetwork:      servingNetworkOf(sc),
 	}
 }
 

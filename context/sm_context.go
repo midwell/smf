@@ -90,14 +90,18 @@ type SMContext struct {
 	Ref string `json:"ref" yaml:"ref" bson:"ref"`
 
 	// SUPI or PEI
-	Supi              string `json:"supi,omitempty" yaml:"supi" bson:"supi,omitempty"`
-	Pei               string `json:"pei,omitempty" yaml:"pei" bson:"pei,omitempty"`
-	Identifier        string `json:"identifier" yaml:"identifier" bson:"identifier"`
-	Gpsi              string `json:"gpsi,omitempty" yaml:"gpsi" bson:"gpsi,omitempty"`
-	Dnn               string `json:"dnn" yaml:"dnn" bson:"dnn"`
-	UeTimeZone        string `json:"ueTimeZone,omitempty" yaml:"ueTimeZone" bson:"ueTimeZone,omitempty"` // ignore
-	ServingNfId       string `json:"servingNfId,omitempty" yaml:"servingNfId" bson:"servingNfId,omitempty"`
-	SmStatusNotifyUri string `json:"smStatusNotifyUri,omitempty" yaml:"smStatusNotifyUri" bson:"smStatusNotifyUri,omitempty"`
+	Supi        string `json:"supi,omitempty" yaml:"supi" bson:"supi,omitempty"`
+	Pei         string `json:"pei,omitempty" yaml:"pei" bson:"pei,omitempty"`
+	Identifier  string `json:"identifier" yaml:"identifier" bson:"identifier"`
+	Gpsi        string `json:"gpsi,omitempty" yaml:"gpsi" bson:"gpsi,omitempty"`
+	Dnn         string `json:"dnn" yaml:"dnn" bson:"dnn"`
+	UeTimeZone  string `json:"ueTimeZone,omitempty" yaml:"ueTimeZone" bson:"ueTimeZone,omitempty"` // ignore
+	ServingNfId string `json:"servingNfId,omitempty" yaml:"servingNfId" bson:"servingNfId,omitempty"`
+	// Guami is the AMF serving this session, as the AMF itself reported it on N11.
+	// ServingNfId above is that AMF's instance UUID and cannot yield an AMF
+	// identifier; TS 33.128's aMFID needs the region/set/pointer this carries.
+	Guami             models.Guami `json:"guami,omitempty" yaml:"guami" bson:"guami,omitempty"`
+	SmStatusNotifyUri string       `json:"smStatusNotifyUri,omitempty" yaml:"smStatusNotifyUri" bson:"smStatusNotifyUri,omitempty"`
 
 	UpCnxState         models.UpCnxState         `json:"upCnxState,omitempty" yaml:"upCnxState" bson:"upCnxState,omitempty"`
 	AMFProfile         models.NFProfileDiscovery `json:"amfProfile,omitempty" yaml:"amfProfile" bson:"amfProfile,omitempty"`
@@ -182,7 +186,7 @@ type SMContext struct {
 	PDUSessionID                        int32          `json:"pduSessionID" yaml:"pduSessionID" bson:"pduSessionID"`
 	OldPduSessionId                     int32          `json:"oldPduSessionId,omitempty" yaml:"oldPduSessionId" bson:"oldPduSessionId,omitempty"`
 	SelectedPDUSessionType              uint8          `json:"selectedPDUSessionType,omitempty" yaml:"selectedPDUSessionType" bson:"selectedPDUSessionType,omitempty"`
-	UnauthenticatedSupi                 bool           `json:"unauthenticatedSupi,omitempty" yaml:"unauthenticatedSupi" bson:"unauthenticatedSupi,omitempty"`                                                 // ignore
+	UnauthenticatedSupi                 bool           `json:"unauthenticatedSupi,omitempty" yaml:"unauthenticatedSupi" bson:"unauthenticatedSupi,omitempty"`                                                 // sUPIUnauthenticated, TS 33.128 table 6.2.3-1
 	PDUSessionRelease_DUE_TO_DUP_PDU_ID bool           `json:"pduSessionRelease_DUE_TO_DUP_PDU_ID,omitempty" yaml:"pduSessionRelease_DUE_TO_DUP_PDU_ID" bson:"pduSessionRelease_DUE_TO_DUP_PDU_ID,omitempty"` // ignore
 	LocalPurged                         bool           `json:"localPurged,omitempty" yaml:"localPurged" bson:"localPurged,omitempty"`                                                                         // ignore
 	// NAS
@@ -402,6 +406,17 @@ func (smContext *SMContext) SetCreateData(createData *models.SmContextCreateData
 	smContext.AddUeLocation = createData.AddUeLocation
 	smContext.OldPduSessionId = createData.GetOldPduSessionId()
 	smContext.ServingNfId = createData.GetServingNfId()
+	// Guami and UnauthenticatedSupi are both mandatory conditional fields of the
+	// Lawful Intercept session records, and both were sent by the AMF and dropped
+	// here. Same shape as RequestType above, which "previously reported every session
+	// as an initial request because nothing retained the real value".
+	//
+	// ServingNfId is not a substitute for Guami: it is an NF instance UUID, while
+	// TS 33.128's aMFID is the AMF region/set/pointer of TS 23.003 clause 2.10.1.
+	if guami := createData.Guami; guami != nil {
+		smContext.Guami = *guami
+	}
+	smContext.UnauthenticatedSupi = createData.GetUnauthenticatedSupi()
 }
 
 // RebuildCommunicationClient reconstructs the Namf_Communication API client
