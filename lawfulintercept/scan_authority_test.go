@@ -13,6 +13,7 @@ import (
 	"github.com/omec-project/li/store"
 	"github.com/omec-project/li/types"
 	"github.com/omec-project/li/x2x3"
+	"github.com/omec-project/nas/v2/nasMessage"
 	smfctx "github.com/omec-project/smf/context"
 )
 
@@ -103,6 +104,18 @@ func scanFixture(t *testing.T, task types.InterceptTask, sessions int) (*subsyst
 		// the scan's goroutine may still be reading, which -race reports as the test's
 		// own race rather than the element's.
 		sc.PDUAddress = &smfctx.UeIpAddr{Ip: net.ParseIP("10.250.0.9"), UpfProvided: true}
+
+		// And a PDU session type, which is the third mandatory member this fixture was
+		// missing. The two above were found by the record silently not being delivered;
+		// this one is refused by li/iri since v0.9.9, because pDUSessionType is mandatory
+		// in this record and its enumeration has no zero — so a session left at the Go
+		// zero value produced a record a conformant mediation function discards.
+		//
+		// A session that has an address has completed establishment, and establishment is
+		// where the type is chosen: HandlePDUSessionEstablishmentRequest refuses the
+		// request outright while SelectedPDUSessionType is still 0. So an address without
+		// a type is a session the SMF cannot produce, and the fixture was describing one.
+		sc.SelectedPDUSessionType = nasMessage.PDUSessionTypeIPv4
 
 		// A default data path with a serving UPF, because the correlation the record
 		// carries is that UPF's PFCP session id, and a session without one is deferred

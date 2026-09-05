@@ -68,4 +68,4 @@ require (
 	gopkg.in/validator.v2 v2.0.1 // indirect
 )
 
-replace github.com/omec-project/li => github.com/midwell/li v0.9.8
+replace github.com/omec-project/li => github.com/midwell/li v0.9.9

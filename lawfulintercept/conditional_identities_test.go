@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/omec-project/li/iri"
+	"github.com/omec-project/nas/v2/nasMessage"
 	"github.com/omec-project/openapi/v2/models"
 	smfctx "github.com/omec-project/smf/context"
 )
@@ -34,6 +35,10 @@ func fullSession() *smfctx.SMContext {
 		UnauthenticatedSupi: false,
 	}
 	sc.PDUAddress = &smfctx.UeIpAddr{Ip: []byte{10, 45, 0, 7}}
+	// Mandatory in the two establishment records this session builds, and its enumeration
+	// has no zero — see the note in scan_authority_test.go. A session holding an address
+	// has completed establishment, so it always has one.
+	sc.SelectedPDUSessionType = nasMessage.PDUSessionTypeIPv4
 
 	return sc
 }
