@@ -717,6 +717,16 @@ func HandlePfcpSessionModificationResponse(msg *udp.Message) {
 		return
 	}
 
+	// Upstream guards this immediately after the lookup (omec-project/smf#643). Here it has to
+	// come after the interception block above, not before it: that block answers a modification
+	// this element sent itself, keyed on the sequence number alone, and it must still run when
+	// the session has since been released. Guarding at the lookup would discard those answers and
+	// reinstate exactly the defect the block was added to fix.
+	if smContext == nil {
+		logger.PfcpLog.Warnf("PFCP Session Modification Response found SM context nil for SEID[%d], response discarded", SEID)
+		return
+	}
+
 	if smf_context.SMF_Self().ULCLSupport && smContext.BPManager != nil {
 		if smContext.BPManager.BPStatus == smf_context.AddingPSA {
 			smContext.SubPfcpLog.Infoln("keep Adding PSAAndULCL")
