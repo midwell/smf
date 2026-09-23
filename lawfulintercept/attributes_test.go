@@ -8,7 +8,6 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/omec-project/li/iri"
 	"github.com/omec-project/li/store"
 	"github.com/omec-project/li/types"
 	"github.com/omec-project/li/x2x3"
@@ -37,8 +36,8 @@ func activateSessionIRI(t *testing.T, snd sender) {
 	})
 	active.Store(&subsystem{
 		store: st, senderFor: func(string) sender { return snd },
-		mdf2: configuredMDF2, iriCtx: iri.NewContext(),
-		ids: x2x3.NewIdentity("smf-1", smfInterceptionPoint), neID: "smf-1",
+		mdf2: configuredMDF2,
+		ids:  x2x3.NewIdentity("smf-1", smfInterceptionPoint), neID: "smf-1",
 	})
 	t.Cleanup(func() { active.Store(nil) })
 }

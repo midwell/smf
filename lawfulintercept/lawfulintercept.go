@@ -21,7 +21,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	liasn1 "github.com/omec-project/li/asn1"
 	"github.com/omec-project/li/iri"
 	"github.com/omec-project/li/mtls"
 	"github.com/omec-project/li/store"
@@ -174,9 +173,8 @@ type subsystem struct {
 	unreachableAt func(addr string) bool
 	// mdf2 is the configured X2 endpoint, used only for a task that names no
 	// destination this element can resolve.
-	mdf2   string
-	iriCtx *liasn1.Context
-	neID   string
+	mdf2 string
+	neID string
 	// ids supplies the conditional attributes that belong to this element rather than
 	// to the task — its two identities and the per-context sequence numbering — shared
 	// with the AMF's IRI-POI and the UPF's CC-POI through li/x2x3.
@@ -483,7 +481,6 @@ func Init(cfg Config) error {
 		store:     st,
 		senderFor: func(addr string) sender { return pool.For(addr) },
 		mdf2:      cfg.MDF2,
-		iriCtx:    iri.NewContext(),
 		neID:      cfg.NEID,
 		ids:       x2x3.NewIdentity(cfg.NEID, smfInterceptionPoint),
 		reporter:  reporter,
@@ -1338,7 +1335,7 @@ func (s *subsystem) deliverIRI(tasks []types.InterceptTask, corr [8]byte, subjec
 		// session's own goroutine.
 		return
 	}
-	payload, err := iri.EncodeXIRI(s.iriCtx, event)
+	payload, err := iri.EncodeXIRI(event)
 	if err != nil {
 		// **A record this element could not encode is product it produced and did not
 		// deliver, so it is reported.** It used to return silently, which was defensible

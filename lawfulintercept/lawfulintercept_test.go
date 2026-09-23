@@ -374,7 +374,7 @@ func TestReportEstablishmentEmitsOnce(t *testing.T) {
 		Products: []types.ProductType{types.ProductIRI},
 		State:    types.TaskActive,
 	})
-	active.Store(&subsystem{store: st, senderFor: func(string) sender { return cap }, mdf2: configuredMDF2, iriCtx: iri.NewContext(), ids: x2x3.NewIdentity("smf-1", smfInterceptionPoint), neID: "ne"})
+	active.Store(&subsystem{store: st, senderFor: func(string) sender { return cap }, mdf2: configuredMDF2, ids: x2x3.NewIdentity("smf-1", smfInterceptionPoint), neID: "ne"})
 	t.Cleanup(func() { active.Store(nil) })
 
 	sc := targetSM()
@@ -398,7 +398,7 @@ func TestReportReleaseDeduplicates(t *testing.T) {
 		Products: []types.ProductType{types.ProductIRI},
 		State:    types.TaskActive,
 	})
-	active.Store(&subsystem{store: st, senderFor: func(string) sender { return cap }, mdf2: configuredMDF2, iriCtx: iri.NewContext(), ids: x2x3.NewIdentity("smf-1", smfInterceptionPoint), neID: "ne"})
+	active.Store(&subsystem{store: st, senderFor: func(string) sender { return cap }, mdf2: configuredMDF2, ids: x2x3.NewIdentity("smf-1", smfInterceptionPoint), neID: "ne"})
 	t.Cleanup(func() { active.Store(nil) })
 
 	sc := targetSM()
@@ -437,7 +437,7 @@ func TestDeliveryIsolation(t *testing.T) {
 	st.Activate(types.InterceptTask{XID: xidCC, Targets: []types.TargetIdentifier{target}, Products: []types.ProductType{types.ProductCC}, State: types.TaskActive})
 
 	cap := &captureSender{}
-	active.Store(&subsystem{store: st, senderFor: func(string) sender { return cap }, mdf2: configuredMDF2, iriCtx: iri.NewContext(), ids: x2x3.NewIdentity("smf-1", smfInterceptionPoint)})
+	active.Store(&subsystem{store: st, senderFor: func(string) sender { return cap }, mdf2: configuredMDF2, ids: x2x3.NewIdentity("smf-1", smfInterceptionPoint)})
 	t.Cleanup(func() { active.Store(nil) })
 
 	ReportEstablishment(targetSM())
@@ -458,11 +458,10 @@ func TestDeliveryIsolation(t *testing.T) {
 }
 
 // TestEncodeAllEvents verifies every SMF xIRI a reporter can produce encodes
-// through the real TS 33.128 context without error — mandatory members present,
+// through the real TS 33.128 encoder without error — mandatory members present,
 // CHOICE arms registered. The correctness check a pure-mapping test can't give.
 func TestEncodeAllEvents(t *testing.T) {
 	sc := targetSM()
-	ctx := iri.NewContext()
 	events := map[string]any{
 		"establishment":         smfEstablishment(sc),
 		"modification":          smfModification(sc),
@@ -470,7 +469,7 @@ func TestEncodeAllEvents(t *testing.T) {
 		"start-of-interception": smfStartOfInterception(sc),
 	}
 	for name, ev := range events {
-		if _, err := iri.EncodeXIRI(ctx, ev); err != nil {
+		if _, err := iri.EncodeXIRI(ev); err != nil {
 			t.Errorf("encode %s: %v", name, err)
 		}
 	}
@@ -669,7 +668,7 @@ func TestXIRIGoesToTheDestinationsTheTaskNamed(t *testing.T) {
 
 	capture := newAddressCapture()
 	active.Store(&subsystem{
-		store: st, senderFor: capture.senderFor, mdf2: configuredMDF2, iriCtx: iri.NewContext(), ids: x2x3.NewIdentity("smf-1", smfInterceptionPoint),
+		store: st, senderFor: capture.senderFor, mdf2: configuredMDF2, ids: x2x3.NewIdentity("smf-1", smfInterceptionPoint),
 	})
 	t.Cleanup(func() { active.Store(nil) })
 
@@ -704,7 +703,7 @@ func TestATaskNamingNoDestinationFallsBackToConfiguration(t *testing.T) {
 
 	capture := newAddressCapture()
 	active.Store(&subsystem{
-		store: st, senderFor: capture.senderFor, mdf2: configuredMDF2, iriCtx: iri.NewContext(), ids: x2x3.NewIdentity("smf-1", smfInterceptionPoint),
+		store: st, senderFor: capture.senderFor, mdf2: configuredMDF2, ids: x2x3.NewIdentity("smf-1", smfInterceptionPoint),
 	})
 	t.Cleanup(func() { active.Store(nil) })
 
@@ -889,12 +888,12 @@ func TestUEEndpointAbsentAddress(t *testing.T) {
 	if est.UEEndpoint != nil {
 		t.Errorf("establishment uEEndpoint = %#v, want nil (field omitted)", est.UEEndpoint)
 	}
-	if _, err := iri.EncodeXIRI(iri.NewContext(), est); err != nil {
+	if _, err := iri.EncodeXIRI(est); err != nil {
 		t.Errorf("establishment must still encode without an address: %v", err)
 	}
 
 	// The mandatory-field record must be refused, not silently emitted empty.
-	if _, err := iri.EncodeXIRI(iri.NewContext(), smfStartOfInterception(sc)); err == nil {
+	if _, err := iri.EncodeXIRI(smfStartOfInterception(sc)); err == nil {
 		t.Error("start-of-interception encoded with an empty uEEndpoint; want a refusal")
 	}
 }
@@ -932,7 +931,6 @@ func activateIRISub(t *testing.T, snd sender, tasks ...types.InterceptTask) {
 		store:     st,
 		senderFor: func(string) sender { return snd },
 		mdf2:      configuredMDF2,
-		iriCtx:    iri.NewContext(),
 		ids:       x2x3.NewIdentity("smf-1", smfInterceptionPoint),
 		neID:      "ne",
 	})
@@ -954,16 +952,22 @@ func iriTask() types.InterceptTask {
 // decodeOne decodes the single xIRI a capture holds, and fails if there is not
 // exactly one — "at least one record arrived" is the assertion that let an empty
 // uEEndpoint through for months.
-func decodeOne(t *testing.T, cap *captureSender) any {
+func decodeOne(t *testing.T, cap *captureSender) wireRecord {
 	t.Helper()
 	if len(cap.pdus) != 1 {
 		t.Fatalf("captured %d PDUs, want exactly 1", len(cap.pdus))
 	}
-	var payload iri.XIRIPayload
-	if _, err := iri.NewContext().Decode(cap.pdus[0].Payload, &payload); err != nil {
-		t.Fatalf("decode xIRI: %v", err)
+	return decodeRecords(t, cap)[0]
+}
+
+// unsuccessfulSM is decodeOne for an SMFUnsuccessfulProcedure, failing on any other record.
+func unsuccessfulSM(t *testing.T, cap *captureSender) wireRecord {
+	t.Helper()
+	rec := decodeOne(t, cap)
+	if rec.event != eventUnsuccessfulSMProcedure {
+		t.Fatalf("delivered XIRIEvent [%d], want unsuccessfulSMProcedure [%d]", rec.event, eventUnsuccessfulSMProcedure)
 	}
-	return payload.Event
+	return rec
 }
 
 // TestUnsuccessfulProcedureReportsRefusedEstablishment covers task 3.1 for the
@@ -975,21 +979,18 @@ func TestUnsuccessfulProcedureReportsRefusedEstablishment(t *testing.T) {
 
 	ReportEstablishmentReject(targetSM(), nasMessage.Cause5GSMInsufficientResources)
 
-	rec, ok := decodeOne(t, cap).(iri.SMFUnsuccessfulProcedure)
-	if !ok {
-		t.Fatalf("decoded a %T, want SMFUnsuccessfulProcedure", decodeOne(t, cap))
+	rec := unsuccessfulSM(t, cap)
+	if got := integer(t, rec.member(t, 1)); got != int64(iri.SMFFailedPDUSessionEstablishment) {
+		t.Errorf("failedProcedureType = %d, want pDUSessionEstablishment(1)", got)
 	}
-	if rec.FailedProcedureType != iri.SMFFailedPDUSessionEstablishment {
-		t.Errorf("failedProcedureType = %d, want pDUSessionEstablishment(1)", rec.FailedProcedureType)
+	if got := integer(t, rec.member(t, 2)); got != int64(nasMessage.Cause5GSMInsufficientResources) {
+		t.Errorf("failureCause = %d, want %d", got, nasMessage.Cause5GSMInsufficientResources)
 	}
-	if rec.FailureCause != iri.FiveGSMCause(nasMessage.Cause5GSMInsufficientResources) {
-		t.Errorf("failureCause = %d, want %d", rec.FailureCause, nasMessage.Cause5GSMInsufficientResources)
+	if got := integer(t, rec.member(t, 3)); got != int64(iri.InitiatorNetwork) {
+		t.Errorf("initiator = %d, want network(2) — the SMF is refusing", got)
 	}
-	if rec.Initiator != iri.InitiatorNetwork {
-		t.Errorf("initiator = %d, want network(2) — the SMF is refusing", rec.Initiator)
-	}
-	if supi, ok := rec.SUPI.(iri.IMSI); !ok || supi != "262019876543210" {
-		t.Errorf("SUPI = %#v", rec.SUPI)
+	if supi := imsiOf(t, rec.member(t, 5)); supi != "262019876543210" {
+		t.Errorf("SUPI = %q", supi)
 	}
 }
 
@@ -1001,12 +1002,12 @@ func TestUnsuccessfulProcedureReportsRefusedRelease(t *testing.T) {
 
 	ReportReleaseReject(targetSM(), nasMessage.Cause5GSMRequestRejectedUnspecified)
 
-	rec := decodeOne(t, cap).(iri.SMFUnsuccessfulProcedure) //nolint:errcheck // asserted below
-	if rec.FailedProcedureType != iri.SMFFailedPDUSessionRelease {
-		t.Errorf("failedProcedureType = %d, want pDUSessionRelease(3)", rec.FailedProcedureType)
+	rec := unsuccessfulSM(t, cap)
+	if got := integer(t, rec.member(t, 1)); got != int64(iri.SMFFailedPDUSessionRelease) {
+		t.Errorf("failedProcedureType = %d, want pDUSessionRelease(3)", got)
 	}
-	if rec.FailureCause != iri.FiveGSMCause(nasMessage.Cause5GSMRequestRejectedUnspecified) {
-		t.Errorf("failureCause = %d", rec.FailureCause)
+	if got := integer(t, rec.member(t, 2)); got != int64(nasMessage.Cause5GSMRequestRejectedUnspecified) {
+		t.Errorf("failureCause = %d", got)
 	}
 }
 
@@ -1084,9 +1085,8 @@ func TestUnsuccessfulProcedureCauseMatchesTheReject(t *testing.T) {
 
 			ReportEstablishmentReject(targetSM(), want)
 
-			rec := decodeOne(t, cap).(iri.SMFUnsuccessfulProcedure) //nolint:errcheck // asserted by construction
-			if rec.FailureCause != iri.FiveGSMCause(want) {
-				t.Errorf("failureCause = %d, want %d (the value the reject carries)", rec.FailureCause, want)
+			if got := integer(t, unsuccessfulSM(t, cap).member(t, 2)); got != int64(want) {
+				t.Errorf("failureCause = %d, want %d (the value the reject carries)", got, want)
 			}
 		})
 	}

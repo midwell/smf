@@ -123,7 +123,6 @@ var recordedConversions = map[string]iriConversion{
 	"SUPIUnauthenticatedIndication": {kind: carried, note: "BOOLEAN"},
 
 	// Calls into li/iri rather than conversions.
-	"NewContext": {kind: built, note: "constructs the asn1 context with this module's CHOICE registrations"},
 	"EncodeXIRI": {kind: built, note: "the encode entry point, which is where validateConstraints runs"},
 	"UEEndpoint": {kind: built, note: "builds the ueEndpoint CHOICE list, discriminating v4 from v6"},
 	"FiveGSMCause": {kind: carried, note: "INTEGER (0..255). **Not mapped, and the distinction is " +

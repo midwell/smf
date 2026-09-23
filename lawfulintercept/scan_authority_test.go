@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/omec-project/li/iri"
 	"github.com/omec-project/li/store"
 	"github.com/omec-project/li/types"
 	"github.com/omec-project/li/x2x3"
@@ -81,10 +80,9 @@ func scanFixture(t *testing.T, task types.InterceptTask, sessions int) (*subsyst
 
 			return snd
 		},
-		mdf2:   "10.0.60.122:42069",
-		iriCtx: iri.NewContext(),
-		neID:   "smf-1",
-		ids:    x2x3.NewIdentity("smf-1", smfInterceptionPoint),
+		mdf2: "10.0.60.122:42069",
+		neID: "smf-1",
+		ids:  x2x3.NewIdentity("smf-1", smfInterceptionPoint),
 	}
 	active.Store(sub)
 	t.Cleanup(func() { active.Store(nil) })
