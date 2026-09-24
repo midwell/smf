@@ -54,6 +54,12 @@ func associationConfig(t *testing.T) {
 			EnableUpfAdapter: false,
 		},
 	}
+
+	// These tests are about the interception notification. The restoration a restart also
+	// starts runs in the background and would outlive the test, so it is stubbed out.
+	previous := context.OnRestart
+	context.OnRestart = func(context.NodeID, time.Time) {}
+	t.Cleanup(func() { context.OnRestart = previous })
 }
 
 // TestReAssociationIsRecognisedAsARestart is the discovery path the notification never
@@ -100,6 +106,8 @@ func TestReAssociationIsRecognisedAsARestart(t *testing.T) {
 			held := time.Now().Add(-time.Hour).Truncate(time.Second)
 			upNodeID := context.NewNodeID(tc.node)
 			upf := context.NewUPF(upNodeID, nil)
+			// Removed again, or the next run of this test finds this UPF in the pool first.
+			t.Cleanup(func() { context.RemoveUPFNodeByNodeID(*upNodeID) })
 			upf.RecoveryTimeStamp = context.RecoveryTimeStamp{RecoveryTimeStamp: held}
 
 			announced := held
@@ -143,6 +151,7 @@ func TestAnInboundAssociationIsRecognisedAsARestart(t *testing.T) {
 
 	upNodeID := context.NewNodeID("3.3.3.3")
 	upf := context.NewUPF(upNodeID, nil)
+	t.Cleanup(func() { context.RemoveUPFNodeByNodeID(*upNodeID) })
 	upf.RecoveryTimeStamp = context.RecoveryTimeStamp{RecoveryTimeStamp: time.Now().Add(-time.Hour)}
 
 	handler.HandlePfcpAssociationSetupRequest(&udp.Message{
