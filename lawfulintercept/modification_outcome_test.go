@@ -28,9 +28,9 @@ import (
 func duplicatingSession(t *testing.T) *smfctx.SMContext {
 	t.Helper()
 
-	sc := pooledSession(t, "imsi-262019876543210", 1)
+	sc := pooledSession(t, testSUPI, 1)
 	node := smfctx.NewDataPathNode()
-	node.UPF = &smfctx.UPF{NodeID: upfNode("10.0.1.5")}
+	node.UPF = &smfctx.UPF{NodeID: upfNode(trigNodeA)}
 	node.UpLinkTunnel.PDR["default"] = &smfctx.PDR{
 		FAR: &smfctx.FAR{
 			ApplyAction: smfctx.ApplyAction{Forw: true, Dupl: true},
@@ -46,7 +46,7 @@ func duplicatingSession(t *testing.T) *smfctx.SMContext {
 	// a session not in that index is one the retry cannot find — and the test would then
 	// pass against a retry that never ran.
 	sc.AllocateLocalSEIDForDataPath(sc.Tunnel.DataPathPool[1])
-	sc.PFCPContext["10.0.1.5"].RemoteSEID = 0x2632898145f4d191
+	sc.PFCPContext[trigNodeA].RemoteSEID = 0x2632898145f4d191
 
 	return sc
 }
@@ -62,9 +62,9 @@ func outcomeFixture(t *testing.T) (*subsystem, *admfStub, func() int) {
 	admf := newADMFStub(t)
 	sub := &subsystem{
 		store:    store.New(),
-		neID:     "smf-1",
-		ids:      x2x3.NewIdentity("smf-1", smfInterceptionPoint),
-		reporter: x1.NewReporter(admf.srv.URL, "admf-1", "smf-1", nil),
+		neID:     testNEID,
+		ids:      x2x3.NewIdentity(testNEID, smfInterceptionPoint),
+		reporter: x1.NewReporter(admf.srv.URL, testADMFID, testNEID, nil),
 	}
 	waitForScans(t, sub)
 
@@ -114,8 +114,8 @@ func TestARefusedDuplicationIsRetriedAndThenReported(t *testing.T) {
 	// The session has to be findable by the SEID the answer carries, which is how the
 	// response handler correlates it.
 	req := lisequence.Request{
-		SEID:        sc.PFCPContext["10.0.1.5"].LocalSEID,
-		NodeID:      "10.0.1.5",
+		SEID:        sc.PFCPContext[trigNodeA].LocalSEID,
+		NodeID:      trigNodeA,
 		Duplicating: true,
 	}
 
@@ -187,8 +187,8 @@ func TestARefusedWithdrawalIsNotBelieved(t *testing.T) {
 	sc.SMLock.Unlock()
 
 	req := lisequence.Request{
-		SEID:        sc.PFCPContext["10.0.1.5"].LocalSEID,
-		NodeID:      "10.0.1.5",
+		SEID:        sc.PFCPContext[trigNodeA].LocalSEID,
+		NodeID:      trigNodeA,
 		Duplicating: false,
 	}
 
@@ -232,8 +232,8 @@ func TestAnUnansweredModificationIsTreatedAsRefused(t *testing.T) {
 	sc := duplicatingSession(t)
 
 	req := lisequence.Request{
-		SEID:        sc.PFCPContext["10.0.1.5"].LocalSEID,
-		NodeID:      "10.0.1.5",
+		SEID:        sc.PFCPContext[trigNodeA].LocalSEID,
+		NodeID:      trigNodeA,
 		Duplicating: true,
 	}
 
@@ -252,8 +252,8 @@ func TestAnAcceptedModificationIsLeftAlone(t *testing.T) {
 	sc := duplicatingSession(t)
 
 	req := lisequence.Request{
-		SEID:        sc.PFCPContext["10.0.1.5"].LocalSEID,
-		NodeID:      "10.0.1.5",
+		SEID:        sc.PFCPContext[trigNodeA].LocalSEID,
+		NodeID:      trigNodeA,
 		Duplicating: true,
 	}
 
@@ -297,8 +297,8 @@ func TestARefusedDuplicationIsAttributedToItsWarrant(t *testing.T) {
 	}
 
 	req := lisequence.Request{
-		SEID:        sc.PFCPContext["10.0.1.5"].LocalSEID,
-		NodeID:      "10.0.1.5",
+		SEID:        sc.PFCPContext[trigNodeA].LocalSEID,
+		NodeID:      trigNodeA,
 		Duplicating: true,
 	}
 

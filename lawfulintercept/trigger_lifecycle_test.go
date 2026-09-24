@@ -79,26 +79,26 @@ func TestAFailedInitWithdrawsNothingAndLeavesNothingRunning(t *testing.T) {
 	// of — which from a fresh registry's point of view is all of it.
 	poi := newFakePOI(t)
 	poi.mu.Lock()
-	poi.holds = []string{"22222222-2222-4222-8222-222222222222"}
+	poi.holds = []string{testXIDSecondary}
 	poi.mu.Unlock()
 
 	// The port is already held, by something that keeps holding it. This is the bind
 	// failure as a deployment produces it, not an invalid address.
-	held, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
+	held, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", testListenEphemeral)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer held.Close() //nolint:errcheck // test
 
 	err = Init(Config{
-		NEID:     "smf-1",
+		NEID:     testNEID,
 		X1Listen: held.Addr().String(),
-		MDF2:     "10.0.60.122:42069",
-		MDF3:     "192.0.2.1:42069",
+		MDF2:     testDestinationAddr,
+		MDF3:     testMDF3Addr,
 		Cert:     cert, Key: key, CACert: ca,
-		AdmfURL: admf.srv.URL, AdmfID: "admf-1",
+		AdmfURL: admf.srv.URL, AdmfID: testADMFID,
 		UPFTriggers: []UPFTrigger{
-			{NodeID: "10.0.1.5", X1URL: poi.srv.URL, NEID: "upf-1"},
+			{NodeID: trigNodeA, X1URL: poi.srv.URL, NEID: testUPFNEID1},
 		},
 	})
 	if err == nil {
@@ -159,11 +159,11 @@ func TestTwoRelabelsReachThePOIInOrder(t *testing.T) {
 	poi := newFakePOI(t)
 	s := triggerSubsystem(t, poi)
 
-	const xid = types.XID("11111111-1111-4111-8111-111111111111")
+	const xid = types.XID(testXIDPrimary)
 	base := types.InterceptTask{XID: xid, Products: []types.ProductType{types.ProductCC}}
 
 	s.installFor("session-ref-1", []types.InterceptTask{base},
-		[]upfSession{{node: upfNode("10.0.1.5"), seid: 0x2632898145f4d191}}, 7)
+		[]upfSession{{node: upfNode(trigNodeA), seid: 0x2632898145f4d191}}, 7)
 	if n := poi.countMessages("ActivateTaskRequest"); n != 1 {
 		t.Fatalf("ActivateTaskRequest = %d, want 1", n)
 	}
@@ -245,9 +245,9 @@ func TestALateInstalledTriggerIsWithdrawnDurably(t *testing.T) {
 	var slept int
 	s.triggers.sleep = func(time.Duration) { slept++ }
 
-	const xid = types.XID("11111111-1111-4111-8111-111111111111")
+	const xid = types.XID(testXIDPrimary)
 	warrant := types.InterceptTask{XID: xid, Products: []types.ProductType{types.ProductCC}}
-	upfs := []upfSession{{node: upfNode("10.0.1.5"), seid: 0x2632898145f4d191}}
+	upfs := []upfSession{{node: upfNode(trigNodeA), seid: 0x2632898145f4d191}}
 
 	planned, unreachable, undeliverable := s.triggers.plan("session-ref-1",
 		[]types.InterceptTask{warrant}, upfs, 7)
@@ -316,10 +316,10 @@ func TestALateInstalledTriggerIsWithdrawnDurably(t *testing.T) {
 // its own in flight, and Stop may be called on one whose loops were never started.
 func TestARegistryStopEndsItsBackgroundWork(t *testing.T) {
 	reg := mustRegistry(Config{
-		NEID: "smf-1",
-		MDF3: "192.0.2.1:42069",
+		NEID: testNEID,
+		MDF3: testMDF3Addr,
 		UPFTriggers: []UPFTrigger{
-			{NodeID: "10.0.1.5", X1URL: "https://127.0.0.1:1/X1/NE", NEID: "upf-1"},
+			{NodeID: trigNodeA, X1URL: "https://127.0.0.1:1/X1/NE", NEID: testUPFNEID1},
 		},
 	})
 
@@ -342,13 +342,13 @@ func TestARegistryStopEndsItsBackgroundWork(t *testing.T) {
 	// Idempotent, and safe on a registry that was never started.
 	reg.Stop()
 
-	unstarted := mustRegistry(Config{NEID: "smf-1"})
+	unstarted := mustRegistry(Config{NEID: testNEID})
 	unstarted.Stop()
 
 	// A stopped registry dispatches nothing further: the propagation it would have
 	// ordered has nowhere to be ordered against.
 	ran := false
-	unstarted.dispatchForWarrant("11111111-1111-4111-8111-111111111111", func() { ran = true })
+	unstarted.dispatchForWarrant(testXIDPrimary, func() { ran = true })
 	unstarted.Stop()
 	if ran {
 		t.Error("a stopped registry dispatched outbound X1 work")
@@ -359,12 +359,12 @@ func TestARegistryStopEndsItsBackgroundWork(t *testing.T) {
 // X1 exchange: what a test above proves through a POI, this proves about the
 // mechanism, so a later change to the propagation cannot quietly lose it.
 func TestDispatchForWarrantRunsInOrder(t *testing.T) {
-	reg := mustRegistry(Config{NEID: "smf-1"})
+	reg := mustRegistry(Config{NEID: testNEID})
 	defer reg.Stop()
 
 	const (
-		one = types.XID("11111111-1111-4111-8111-111111111111")
-		two = types.XID("22222222-2222-4222-8222-222222222222")
+		one = types.XID(testXIDPrimary)
+		two = types.XID(testXIDSecondary)
 	)
 
 	start := make(chan struct{})

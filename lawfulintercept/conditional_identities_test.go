@@ -22,10 +22,10 @@ import (
 // fullSession is an SMContext holding every value the records below can report.
 func fullSession() *smfctx.SMContext {
 	sc := &smfctx.SMContext{
-		Supi:         "imsi-262019876543210",
+		Supi:         testSUPI,
 		Pei:          "imeisv-3534250000000151",
 		Gpsi:         "msisdn-4915123456789",
-		Dnn:          "internet",
+		Dnn:          testDNN,
 		PDUSessionID: 5,
 		RatType:      models.RATTYPE_NR,
 		// Region 0xC8, set 0x001, pointer 0x03 -> "c80043":
@@ -51,9 +51,9 @@ func TestSMFRecordsCarryTheAMFIdentity(t *testing.T) {
 		record string
 		got    iri.AMFID
 	}{
-		{"SMFPDUSessionEstablishment", smfEstablishment(sc).AMFID},
-		{"SMFStartOfInterceptionWithEstablishedPDUSession", smfStartOfInterception(sc).AMFID},
-		{"SMFUnsuccessfulProcedure", smfUnsuccessful(sc, iri.SMFFailedPDUSessionEstablishment, 26).AMFID},
+		{testRecEstablishment, smfEstablishment(sc).AMFID},
+		{testRecStartOfInterception, smfStartOfInterception(sc).AMFID},
+		{testRecUnsuccessful, smfUnsuccessful(sc, iri.SMFFailedPDUSessionEstablishment, 26).AMFID},
 	} {
 		t.Run(tc.record, func(t *testing.T) {
 			if tc.got != want {
@@ -72,10 +72,10 @@ func TestSMFRecordsCarryTheRATType(t *testing.T) {
 		record string
 		got    iri.RATType
 	}{
-		{"SMFPDUSessionEstablishment", smfEstablishment(sc).RATType},
-		{"SMFPDUSessionModification", smfModification(sc).RATType},
-		{"SMFStartOfInterceptionWithEstablishedPDUSession", smfStartOfInterception(sc).RATType},
-		{"SMFUnsuccessfulProcedure", smfUnsuccessful(sc, iri.SMFFailedPDUSessionEstablishment, 26).RATType},
+		{testRecEstablishment, smfEstablishment(sc).RATType},
+		{testRecModification, smfModification(sc).RATType},
+		{testRecStartOfInterception, smfStartOfInterception(sc).RATType},
+		{testRecUnsuccessful, smfUnsuccessful(sc, iri.SMFFailedPDUSessionEstablishment, 26).RATType},
 	} {
 		t.Run(tc.record, func(t *testing.T) {
 			if tc.got != iri.RATNR {
@@ -93,9 +93,9 @@ func TestSMFRecordsCarryTheServingNetwork(t *testing.T) {
 		record string
 		got    iri.SMFServingNetwork
 	}{
-		{"SMFPDUSessionEstablishment", smfEstablishment(sc).ServingNetwork},
-		{"SMFPDUSessionModification", smfModification(sc).ServingNetwork},
-		{"SMFStartOfInterceptionWithEstablishedPDUSession", smfStartOfInterception(sc).ServingNetwork},
+		{testRecEstablishment, smfEstablishment(sc).ServingNetwork},
+		{testRecModification, smfModification(sc).ServingNetwork},
+		{testRecStartOfInterception, smfStartOfInterception(sc).ServingNetwork},
 	} {
 		t.Run(tc.record, func(t *testing.T) {
 			if tc.got != want {
@@ -123,10 +123,10 @@ func TestSUPIUnauthenticatedIsCarriedAsFalse(t *testing.T) {
 		record string
 		got    *iri.SUPIUnauthenticatedIndication
 	}{
-		{"SMFPDUSessionEstablishment", smfEstablishment(sc).SUPIUnauthenticated},
-		{"SMFPDUSessionModification", smfModification(sc).SUPIUnauthenticated},
-		{"SMFStartOfInterceptionWithEstablishedPDUSession", smfStartOfInterception(sc).SUPIUnauthenticated},
-		{"SMFUnsuccessfulProcedure", smfUnsuccessful(sc, iri.SMFFailedPDUSessionEstablishment, 26).SUPIUnauthenticated},
+		{testRecEstablishment, smfEstablishment(sc).SUPIUnauthenticated},
+		{testRecModification, smfModification(sc).SUPIUnauthenticated},
+		{testRecStartOfInterception, smfStartOfInterception(sc).SUPIUnauthenticated},
+		{testRecUnsuccessful, smfUnsuccessful(sc, iri.SMFFailedPDUSessionEstablishment, 26).SUPIUnauthenticated},
 	} {
 		t.Run(tc.record, func(t *testing.T) {
 			if tc.got == nil {
@@ -149,7 +149,7 @@ func TestSUPIUnauthenticatedIsCarriedAsFalse(t *testing.T) {
 // The negatives: absent means the condition does not hold, and must not be confused
 // with a zero value that asserts something.
 func TestSMFConditionalsAreAbsentWhenUnheld(t *testing.T) {
-	bare := &smfctx.SMContext{PDUSessionID: 5, Dnn: "internet"}
+	bare := &smfctx.SMContext{PDUSessionID: 5, Dnn: testDNN}
 
 	est := smfEstablishment(bare)
 	if est.SUPIUnauthenticated != nil {
@@ -191,7 +191,7 @@ func TestTheN11RequestSuppliesTheAMFIdentityAndAuthenticationStatus(t *testing.T
 	guami := models.Guami{AmfId: "c80043", PlmnId: models.PlmnIdNid{Mcc: "262", Mnc: "01"}}
 	unauthenticated := true
 
-	supi, dnn := "imsi-262019876543210", "internet"
+	supi, dnn := testSUPI, testDNN
 	rat := models.RATTYPE_NR
 	create := &models.SmContextCreateData{
 		Supi:                &supi,

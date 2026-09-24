@@ -29,7 +29,7 @@ func activateSessionIRI(t *testing.T, snd sender) {
 	t.Helper()
 	st := store.New()
 	st.Activate(types.InterceptTask{
-		XID:      "task-iri",
+		XID:      testTaskIRI,
 		Targets:  []types.TargetIdentifier{{Type: types.TargetSUPI, Value: "262019876543210"}},
 		Products: []types.ProductType{types.ProductIRI},
 		State:    types.TaskActive,
@@ -37,7 +37,7 @@ func activateSessionIRI(t *testing.T, snd sender) {
 	active.Store(&subsystem{
 		store: st, senderFor: func(string) sender { return snd },
 		mdf2: configuredMDF2,
-		ids:  x2x3.NewIdentity("smf-1", smfInterceptionPoint), neID: "smf-1",
+		ids:  x2x3.NewIdentity(testNEID, smfInterceptionPoint), neID: testNEID,
 	})
 	t.Cleanup(func() { active.Store(nil) })
 }
@@ -54,7 +54,7 @@ func TestSessionXIRICarriesTheSixRequiredAttributes(t *testing.T) {
 	}
 	attrs := attrsOf(snd.pdus[0])
 
-	if got := attrs[x2x3.AttrNFID]; len(got) != 1 || got[0] != "smf-1" {
+	if got := attrs[x2x3.AttrNFID]; len(got) != 1 || got[0] != testNEID {
 		t.Errorf("NFID = %q, want the configured network element identifier", got)
 	}
 	if got := attrs[x2x3.AttrIPID]; len(got) != 1 || got[0] != smfInterceptionPoint {
@@ -115,7 +115,7 @@ func attrValue(t *testing.T, pdu *x2x3.PDU, typ uint16) []byte {
 // TestInitRefusesWithoutAnElementIdentifier is design D9 for this POI: the refusal is
 // a returned error, so interception does not start and the SMF keeps serving sessions.
 func TestInitRefusesWithoutAnElementIdentifier(t *testing.T) {
-	if err := Init(Config{X1Listen: "127.0.0.1:0"}); !errors.Is(err, errNoElementIdentifier) {
+	if err := Init(Config{X1Listen: testListenEphemeral}); !errors.Is(err, errNoElementIdentifier) {
 		t.Errorf("Init without a network element identifier returned %v, want errNoElementIdentifier", err)
 	}
 	if active.Load() != nil {

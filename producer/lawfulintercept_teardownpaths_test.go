@@ -28,25 +28,27 @@ import (
 // a teardown path is renamed — at which point the person renaming it decides whether the
 // obligation moved with it.
 func TestEveryTeardownPathReportsAndUntasks(t *testing.T) {
+	const pduSession = "pdu_session.go"
+
 	for _, tt := range []struct {
 		file string
 		fn   string
 		why  string
 	}{
 		{
-			"pdu_session.go", "HandlePduSessionContextReplacement",
+			pduSession, "HandlePduSessionContextReplacement",
 			"a session replaced by a new one for the same subscriber ends without ever being released",
 		},
 		{
-			"pdu_session.go", "HandlePDUSessionSMContextUpdate",
+			pduSession, "HandlePDUSessionSMContextUpdate",
 			"an update that deletes the session is a teardown the release handler never sees",
 		},
 		{
-			"pdu_session.go", "HandlePDUSessionSMContextRelease",
+			pduSession, "HandlePDUSessionSMContextRelease",
 			"the ordinary release, over the service-based interface",
 		},
 		{
-			"pdu_session.go", "HandlePFCPResponse",
+			pduSession, "HandlePFCPResponse",
 			"the N4-timeout release, where the user plane never answered",
 		},
 		{

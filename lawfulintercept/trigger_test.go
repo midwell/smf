@@ -70,7 +70,7 @@ func resolvingTo(reg *triggerRegistry, table map[string]string) {
 // nodes maps a configured NodeID to the address it is taken to resolve to.
 func staticRegistry(nodes map[string]string) *triggerRegistry {
 	reg := &triggerRegistry{
-		mdf3:      "192.0.2.1:42069",
+		mdf3:      testMDF3Addr,
 		endpoints: make(map[string]*upfEndpoint, len(nodes)),
 		resolved:  make(map[string]string, len(nodes)),
 		installed: make(map[string]installedTrigger),
@@ -111,7 +111,7 @@ func upfNode(s string) smfctx.NodeID { return *smfctx.NewNodeID(s) }
 
 // wrongNE is an element identifier this SMF does not address, which is how a POI
 // is made to answer correctly under a name the requester did not ask for.
-const wrongNE = "upf-2"
+const wrongNE = testUPFNEID2
 
 // mustRegistry builds a registry from a configuration the test knows is valid.
 // Construction only fails on an ambiguous configuration, which the tests that care
@@ -394,10 +394,10 @@ func triggerSubsystem(t *testing.T, poi *fakePOI) *subsystem {
 	t.Helper()
 
 	cfg := Config{
-		NEID: "smf-1",
-		MDF3: "192.0.2.1:42069",
+		NEID: testNEID,
+		MDF3: testMDF3Addr,
 		UPFTriggers: []UPFTrigger{
-			{NodeID: trigNodeA, X1URL: poi.srv.URL, NEID: "upf-1"},
+			{NodeID: trigNodeA, X1URL: poi.srv.URL, NEID: testUPFNEID1},
 		},
 	}
 
@@ -406,7 +406,7 @@ func triggerSubsystem(t *testing.T, poi *fakePOI) *subsystem {
 	// are reached from the trigger paths these tests drive. A test that wants a scan
 	// to run activates its task in here.
 	s := &subsystem{
-		neID:     "smf-1",
+		neID:     testNEID,
 		triggers: mustRegistry(cfg),
 		store:    store.New(),
 	}
@@ -447,7 +447,7 @@ func TestInstallTriggersSendsWarrantIdentity(t *testing.T) {
 	s := triggerSubsystem(t, poi)
 
 	warrant := types.InterceptTask{
-		XID:      "11111111-1111-4111-8111-111111111111",
+		XID:      testXIDPrimary,
 		Products: []types.ProductType{types.ProductCC},
 	}
 
@@ -501,7 +501,7 @@ func TestInstallTriggersIsIdempotent(t *testing.T) {
 	s := triggerSubsystem(t, poi)
 
 	warrant := types.InterceptTask{
-		XID:      "11111111-1111-4111-8111-111111111111",
+		XID:      testXIDPrimary,
 		Products: []types.ProductType{types.ProductCC},
 	}
 	upfs := []upfSession{{node: upfNode(trigNodeA), seid: 42}}
@@ -524,20 +524,20 @@ func TestInstallTriggersIsIdempotent(t *testing.T) {
 func TestInstallTriggersPerUPFAndWarrant(t *testing.T) {
 	poi := newFakePOI(t)
 	cfg := Config{
-		NEID: "smf-1",
-		MDF3: "192.0.2.1:42069",
+		NEID: testNEID,
+		MDF3: testMDF3Addr,
 		UPFTriggers: []UPFTrigger{
-			{NodeID: trigNodeA, X1URL: poi.srv.URL, NEID: "upf-1"},
-			{NodeID: "10.0.1.6", X1URL: poi.srv.URL, NEID: "upf-2"},
+			{NodeID: trigNodeA, X1URL: poi.srv.URL, NEID: testUPFNEID1},
+			{NodeID: trigNodeB, X1URL: poi.srv.URL, NEID: testUPFNEID2},
 		},
 	}
-	s := &subsystem{neID: "smf-1", triggers: mustRegistry(cfg)}
+	s := &subsystem{neID: testNEID, triggers: mustRegistry(cfg)}
 
 	warrants := []types.InterceptTask{
-		{XID: "11111111-1111-4111-8111-111111111111", Products: []types.ProductType{types.ProductCC}},
-		{XID: "22222222-2222-4222-8222-222222222222", Products: []types.ProductType{types.ProductCC}},
+		{XID: testXIDPrimary, Products: []types.ProductType{types.ProductCC}},
+		{XID: testXIDSecondary, Products: []types.ProductType{types.ProductCC}},
 	}
-	upfs := []upfSession{{node: upfNode(trigNodeA), seid: 42}, {node: upfNode("10.0.1.6"), seid: 43}}
+	upfs := []upfSession{{node: upfNode(trigNodeA), seid: 42}, {node: upfNode(trigNodeB), seid: 43}}
 
 	s.installFor("session-ref-1", warrants, upfs, 7)
 
@@ -573,7 +573,7 @@ func TestInstallTriggersReportsRefusal(t *testing.T) {
 	s.taskReporter = rec
 
 	warrant := types.InterceptTask{
-		XID:      "11111111-1111-4111-8111-111111111111",
+		XID:      testXIDPrimary,
 		Products: []types.ProductType{types.ProductCC},
 	}
 
@@ -606,7 +606,7 @@ func TestInstallTriggersRetriesAfterFailure(t *testing.T) {
 	s.taskReporter = &recordingTaskReporter{}
 
 	warrant := types.InterceptTask{
-		XID:      "11111111-1111-4111-8111-111111111111",
+		XID:      testXIDPrimary,
 		Products: []types.ProductType{types.ProductCC},
 	}
 	upfs := []upfSession{{node: upfNode(trigNodeA), seid: 42}}
@@ -638,13 +638,13 @@ func TestInstallTriggersReportsMissingEndpoint(t *testing.T) {
 	s.taskReporter = rec
 
 	warrant := types.InterceptTask{
-		XID:      "11111111-1111-4111-8111-111111111111",
+		XID:      testXIDPrimary,
 		Products: []types.ProductType{types.ProductCC},
 	}
 
 	// A UPF absent from the configured triggering endpoints.
 	s.installFor("session-ref-1", []types.InterceptTask{warrant},
-		[]upfSession{{node: upfNode("10.0.9.9"), seid: 42}}, 7)
+		[]upfSession{{node: upfNode(trigNodeElsewhere), seid: 42}}, 7)
 
 	if poi.requests != 0 {
 		t.Error("a request was sent for a UPF with no configured endpoint")
@@ -668,7 +668,7 @@ func TestTakeForSessionAndWarrant(t *testing.T) {
 	// Two warrants, two sessions, two UPFs.
 	for _, w := range []types.XID{"warrant-a", "warrant-b"} {
 		for _, ref := range []string{"sess-1", "sess-2"} {
-			for _, node := range []string{trigNodeA, "10.0.1.6"} {
+			for _, node := range []string{trigNodeA, trigNodeB} {
 				reg.installed[triggerKey(w, ref, node)] = installedTrigger{
 					xid: types.XID(string(w) + "|" + ref + "|" + node),
 				}
@@ -684,7 +684,7 @@ func TestTakeForSessionAndWarrant(t *testing.T) {
 	// the session, so a session whose PFCP state is already gone is still cleaned up.
 	got := reg.takeForSession("sess-1")
 	for _, w := range got {
-		if w.nodeID != trigNodeA && w.nodeID != "10.0.1.6" {
+		if w.nodeID != trigNodeA && w.nodeID != trigNodeB {
 			t.Errorf("takeForSession named an unexpected node %q", w.nodeID)
 		}
 	}
@@ -704,7 +704,7 @@ func TestTakeForSessionAndWarrant(t *testing.T) {
 	// must be deactivated at.
 	byWarrant := reg.takeForWarrant("warrant-a")
 	for _, w := range byWarrant {
-		if w.nodeID != trigNodeA && w.nodeID != "10.0.1.6" {
+		if w.nodeID != trigNodeA && w.nodeID != trigNodeB {
 			t.Errorf("takeForWarrant named an unexpected node %q", w.nodeID)
 		}
 	}
@@ -733,7 +733,7 @@ func TestInstallTriggersReprovisionsAfterRestart(t *testing.T) {
 	s.taskReporter = &recordingTaskReporter{}
 
 	warrant := types.InterceptTask{
-		XID:      "11111111-1111-4111-8111-111111111111",
+		XID:      testXIDPrimary,
 		Products: []types.ProductType{types.ProductCC},
 	}
 
@@ -773,7 +773,7 @@ func TestInstallTriggersReprovisionsAfterRestart(t *testing.T) {
 func TestReconcileWithdrawsTaskingFromAPreviousLife(t *testing.T) {
 	poi := newFakePOI(t)
 	poi.mu.Lock()
-	poi.holds = []string{"aaaaaaaa-1111-4111-8111-111111111111", "bbbbbbbb-2222-4222-8222-222222222222"}
+	poi.holds = []string{testXIDHeld, "bbbbbbbb-2222-4222-8222-222222222222"}
 	poi.mu.Unlock()
 
 	s := triggerSubsystem(t, poi)
@@ -796,7 +796,7 @@ func TestReconcileLeavesThisProcesssOwnTasking(t *testing.T) {
 	s.taskReporter = &recordingTaskReporter{}
 
 	warrant := types.InterceptTask{
-		XID:      "11111111-1111-4111-8111-111111111111",
+		XID:      testXIDPrimary,
 		Products: []types.ProductType{types.ProductCC},
 	}
 	s.installFor("session-1", []types.InterceptTask{warrant},
@@ -871,7 +871,7 @@ func TestTriggerInstalledAfterReleaseIsWithdrawn(t *testing.T) {
 	s := triggerSubsystem(t, poi)
 
 	warrant := types.InterceptTask{
-		XID:      "11111111-1111-4111-8111-111111111111",
+		XID:      testXIDPrimary,
 		Products: []types.ProductType{types.ProductCC},
 	}
 	upfs := []upfSession{{node: upfNode(trigNodeA), seid: 0x2632898145f4d191}}
@@ -920,7 +920,7 @@ func TestTriggerNotInstalledBeforeCorrelationExists(t *testing.T) {
 	s.taskReporter = rec
 
 	warrant := types.InterceptTask{
-		XID:      "11111111-1111-4111-8111-111111111111",
+		XID:      testXIDPrimary,
 		Products: []types.ProductType{types.ProductCC},
 	}
 	upfs := []upfSession{{node: upfNode(trigNodeA), seid: 0x2632898145f4d191}}
@@ -953,8 +953,8 @@ func TestMatchEndpointFollowsAUPFThatChangesAddress(t *testing.T) {
 	const name = "upf-moving.test"
 
 	reg := mustRegistry(Config{
-		NEID: "smf-1", MDF3: "192.0.2.1:42069",
-		UPFTriggers: []UPFTrigger{{NodeID: name, X1URL: "https://upf-1:8443/X1/NE", NEID: "upf-1"}},
+		NEID: testNEID, MDF3: testMDF3Addr,
+		UPFTriggers: []UPFTrigger{{NodeID: name, X1URL: testX1URLUPF1, NEID: testUPFNEID1}},
 	})
 	resolvingTo(reg, map[string]string{name: trigNodeA})
 
@@ -963,9 +963,9 @@ func TestMatchEndpointFollowsAUPFThatChangesAddress(t *testing.T) {
 	}
 
 	// The Service is recreated with a different address, and the refresh catches up.
-	resolvingTo(reg, map[string]string{name: "10.0.9.9"})
+	resolvingTo(reg, map[string]string{name: trigNodeElsewhere})
 
-	if _, ok := matchOn(reg, sessionOn("10.0.9.9")); !ok {
+	if _, ok := matchOn(reg, sessionOn(trigNodeElsewhere)); !ok {
 		t.Error("the UPF changed address and its triggering endpoint became unreachable " +
 			"for the life of the process; content interception is silently dead until an SMF restart")
 	}
@@ -982,8 +982,8 @@ func TestMatchEndpointFollowsAUPFThatChangesAddress(t *testing.T) {
 // UPF's warrant, delivering content under a warrant that does not cover it.
 func TestMatchEndpointNeverMatchesUnresolvableNodes(t *testing.T) {
 	reg := mustRegistry(Config{
-		NEID: "smf-1", MDF3: "192.0.2.1:42069",
-		UPFTriggers: []UPFTrigger{{NodeID: "upf-a.invalid", X1URL: "https://upf-a:8443/X1/NE", NEID: "upf-a"}},
+		NEID: testNEID, MDF3: testMDF3Addr,
+		UPFTriggers: []UPFTrigger{{NodeID: "upf-a.invalid", X1URL: testX1URLUPFA, NEID: "upf-a"}},
 	})
 	// A resolver that answers nothing, so upf-a has no address in the index — the
 	// state a name that has never resolved leaves it in.
@@ -1008,7 +1008,7 @@ func TestMatchEndpointPrefersIdentityOverResolution(t *testing.T) {
 	smfctx.InsertDnsHostIp(name, net.ParseIP("10.0.2.7"))
 
 	reg := mustRegistry(Config{
-		NEID: "smf-1", MDF3: "192.0.2.1:42069",
+		NEID: testNEID, MDF3: testMDF3Addr,
 		UPFTriggers: []UPFTrigger{
 			{NodeID: name, X1URL: "https://upf-named:8443/X1/NE", NEID: "upf-named"},
 			{NodeID: "10.0.2.7", X1URL: "https://upf-numeric:8443/X1/NE", NEID: "upf-numeric"},
@@ -1031,10 +1031,10 @@ func TestMatchEndpointPrefersIdentityOverResolution(t *testing.T) {
 // no fault raised.
 func TestTriggerRegistryRejectsAmbiguousNode(t *testing.T) {
 	_, err := newTriggerRegistry(Config{
-		NEID: "smf-1", MDF3: "192.0.2.1:42069",
+		NEID: testNEID, MDF3: testMDF3Addr,
 		UPFTriggers: []UPFTrigger{
-			{NodeID: trigNodeA, X1URL: "https://upf-1:8443/X1/NE", NEID: "upf-1"},
-			{NodeID: trigNodeA, X1URL: "https://upf-2:8443/X1/NE", NEID: "upf-2"},
+			{NodeID: trigNodeA, X1URL: testX1URLUPF1, NEID: testUPFNEID1},
+			{NodeID: trigNodeA, X1URL: "https://upf-2:8443/X1/NE", NEID: testUPFNEID2},
 		},
 	}, nil, nil, nil)
 	if err == nil {
@@ -1051,7 +1051,7 @@ func TestTriggerRegistryRejectsAmbiguousNode(t *testing.T) {
 // nondeterminism in warrant selection at the CC-POI.
 func TestMatchEndpointIsDeterministic(t *testing.T) {
 	reg := mustRegistry(Config{
-		NEID: "smf-1", MDF3: "192.0.2.1:42069",
+		NEID: testNEID, MDF3: testMDF3Addr,
 		UPFTriggers: []UPFTrigger{
 			{NodeID: "upf-one.test", X1URL: "https://upf-one:8443/X1/NE", NEID: "upf-one"},
 			{NodeID: "upf-two.test", X1URL: "https://upf-two:8443/X1/NE", NEID: "upf-two"},
@@ -1104,7 +1104,7 @@ func TestReconcileReportsATriggerThePOISaysIsNotRunning(t *testing.T) {
 	s.reporter = x1.NewReporter(admf.URL, "admf", "smf", nil)
 
 	warrant := types.InterceptTask{
-		XID:      "11111111-1111-4111-8111-111111111111",
+		XID:      testXIDPrimary,
 		Products: []types.ProductType{types.ProductCC},
 	}
 	s.installFor("session-1", []types.InterceptTask{warrant},
@@ -1122,7 +1122,7 @@ func TestReconcileReportsATriggerThePOISaysIsNotRunning(t *testing.T) {
 	// not provisioned.
 	poi.mu.Lock()
 	poi.holds = mine
-	poi.unhealthy = map[string]string{mine[0]: "failed"}
+	poi.unhealthy = map[string]string{mine[0]: testUnhealthyReason}
 	poi.mu.Unlock()
 
 	s.reconcileOne()
@@ -1146,7 +1146,7 @@ func TestReconcileReportsATriggerThePOISaysIsNotRunning(t *testing.T) {
 			t.Errorf("the report names %q; the warrant is %q and the trigger XIDs are %v — the "+
 				"LIPF never issued a trigger XID and cannot resolve one", r.xid, warrant.XID, mine)
 		}
-		if !strings.Contains(r.details, "failed") {
+		if !strings.Contains(r.details, testUnhealthyReason) {
 			t.Errorf("the report does not say what the POI reported: %q", r.details)
 		}
 		// Non-terminating: the tasking is in place at both ends and the product has stopped.
@@ -1167,7 +1167,7 @@ func installOneTrigger(t *testing.T, s *subsystem) (warrant types.InterceptTask,
 	t.Helper()
 
 	warrant = types.InterceptTask{
-		XID:      "11111111-1111-4111-8111-111111111111",
+		XID:      testXIDPrimary,
 		Products: []types.ProductType{types.ProductCC},
 	}
 	s.installFor("session-1", []types.InterceptTask{warrant},
@@ -1473,7 +1473,7 @@ func TestReconcileRetriesUntilThePOIAnswers(t *testing.T) {
 	poi := newFakePOI(t)
 	poi.mu.Lock()
 	poi.detailsFail = true
-	poi.holds = []string{"aaaaaaaa-1111-4111-8111-111111111111"}
+	poi.holds = []string{testXIDHeld}
 	poi.mu.Unlock()
 
 	s := triggerSubsystem(t, poi)
@@ -1516,7 +1516,7 @@ func TestReconcileRetriesUntilThePOIAnswers(t *testing.T) {
 func TestReconcileWithdrawalIsRetriedLikeAnyOther(t *testing.T) {
 	poi := newFakePOI(t)
 	poi.mu.Lock()
-	poi.holds = []string{"aaaaaaaa-1111-4111-8111-111111111111"}
+	poi.holds = []string{testXIDHeld}
 	poi.refuse = true // GetAllDetails still answers; DeactivateTask does not
 	poi.mu.Unlock()
 
@@ -1564,7 +1564,7 @@ func TestFailSafeCannotReclaimAnOrphanBesideLiveTasking(t *testing.T) {
 
 	// And an orphan the POI holds that this process is not tracking — the state a
 	// forgotten withdrawal leaves behind, and the reason the pending state exists.
-	orphan := "99999999-9999-4999-8999-999999999999"
+	orphan := testXIDOrphan
 	poi.mu.Lock()
 	poi.holds = []string{string(live), orphan}
 	poi.mu.Unlock()
@@ -1599,7 +1599,7 @@ func TestFailSafeCannotReclaimAnOrphanBesideLiveTasking(t *testing.T) {
 // registry once, so a trigger for a session that survives the retarget is never
 // among what is withdrawn, whatever order the goroutines run in.
 func TestRetargetDoesNotReapTheTriggerItInstalled(t *testing.T) {
-	const warrant = types.XID("11111111-1111-4111-8111-111111111111")
+	const warrant = types.XID(testXIDPrimary)
 
 	for range 200 {
 		poi := newFakePOI(t)
@@ -1937,7 +1937,7 @@ func TestAnUnbindableActivationAnswerIsReportedAsElementLevel(t *testing.T) {
 	poi.mu.Unlock()
 
 	warrant := types.InterceptTask{
-		XID:      "11111111-1111-4111-8111-111111111111",
+		XID:      testXIDPrimary,
 		Products: []types.ProductType{types.ProductCC},
 	}
 	s.installFor("session-1", []types.InterceptTask{warrant},
@@ -1993,8 +1993,8 @@ func TestTriggerCarriesDeliveryXIDNotTaskXID(t *testing.T) {
 	s := triggerSubsystem(t, poi)
 
 	const (
-		taskXID   = "11111111-1111-4111-8111-111111111111"
-		productID = "22222222-2222-4222-8222-222222222222"
+		taskXID   = testXIDPrimary
+		productID = testXIDSecondary
 	)
 	warrant := types.InterceptTask{
 		XID:       taskXID,
@@ -2052,7 +2052,7 @@ func TestTriggerWithoutProductIDCarriesTheTaskXID(t *testing.T) {
 	poi := newFakePOI(t)
 	s := triggerSubsystem(t, poi)
 
-	const taskXID = "11111111-1111-4111-8111-111111111111"
+	const taskXID = testXIDPrimary
 	warrant := types.InterceptTask{
 		XID:      taskXID,
 		Products: []types.ProductType{types.ProductCC},
@@ -2081,7 +2081,7 @@ func withdrawOne(t *testing.T, s *subsystem) []withdrawal {
 	t.Helper()
 
 	warrant := types.InterceptTask{
-		XID:      "11111111-1111-4111-8111-111111111111",
+		XID:      testXIDPrimary,
 		Products: []types.ProductType{types.ProductCC},
 	}
 	upfs := []upfSession{{node: upfNode(trigNodeA), seid: 0x2632898145f4d191}}
@@ -2289,8 +2289,8 @@ func TestTriggerNamesTheTasksOwnX3Destinations(t *testing.T) {
 	)
 
 	s.installFor("session-ref-1", []types.InterceptTask{
-		x3Task("11111111-1111-4111-8111-111111111111", agencyA),
-		x3Task("22222222-2222-4222-8222-222222222222", agencyB),
+		x3Task(testXIDPrimary, agencyA),
+		x3Task(testXIDSecondary, agencyB),
 	}, []upfSession{{node: upfNode(trigNodeA), seid: 0x2632898145f4d191}}, 7)
 
 	// Two destinations provisioned, one per agency, and neither is the configured
@@ -2310,7 +2310,7 @@ func TestTriggerNamesTheTasksOwnX3Destinations(t *testing.T) {
 			t.Errorf("no destination provisioned for %s; provisioned %v", want, got)
 		}
 	}
-	if got["192.0.2.1:42069"] {
+	if got[testMDF3Addr] {
 		t.Error("the configured MDF3 was provisioned for a task that named its own destination")
 	}
 
@@ -2352,8 +2352,8 @@ func TestTriggerNamesTheTasksOwnX3Destinations(t *testing.T) {
 			t.Fatalf("ActivateTask body is missing a productID or dId:\n%s", b)
 		}
 		want := map[string]string{
-			"11111111-1111-4111-8111-111111111111": perAddress[agencyA],
-			"22222222-2222-4222-8222-222222222222": perAddress[agencyB],
+			testXIDPrimary:   perAddress[agencyA],
+			testXIDSecondary: perAddress[agencyB],
 		}[x[1]]
 		if d[1] != want {
 			t.Errorf("warrant %s triggers against destination %s, want %s — its content would go to the other agency",
@@ -2380,7 +2380,7 @@ func TestTriggerFallsBackToTheConfiguredMDF3(t *testing.T) {
 	s.taskReporter = reporter
 
 	s.installFor("session-ref-1", []types.InterceptTask{{
-		XID:      "11111111-1111-4111-8111-111111111111",
+		XID:      testXIDPrimary,
 		Products: []types.ProductType{types.ProductCC},
 		// Named no destination at all: the gap the provisioning function left, which the
 		// configured endpoint is there to fill.
@@ -2391,7 +2391,7 @@ func TestTriggerFallsBackToTheConfiguredMDF3(t *testing.T) {
 	if len(addresses) != 1 || len(ports) != 1 {
 		t.Fatalf("provisioned %d destinations, want 1:\n%s", len(addresses), strings.Join(poi.sent(), "\n"))
 	}
-	if got := addresses[0] + ":" + ports[0]; got != "192.0.2.1:42069" {
+	if got := addresses[0] + ":" + ports[0]; got != testMDF3Addr {
 		t.Errorf("fell back to %s, want the configured MDF3", got)
 	}
 	if n := poi.countMessages("ActivateTaskRequest"); n != 1 {
@@ -2419,14 +2419,14 @@ func TestATaskWhoseDestinationsYieldNoX3EndpointIsNotServedFromConfiguration(t *
 	s.taskReporter = reporter
 
 	s.installFor("session-ref-1", []types.InterceptTask{{
-		XID:      "11111111-1111-4111-8111-111111111111",
+		XID:      testXIDPrimary,
 		Products: []types.ProductType{types.ProductCC},
 		// Named a destination, and it resolved — to an X2 endpoint, which carries no
 		// content. x1 accepts such a task: the identifier is resolvable, and the IRI-POI
 		// half of the same warrant delivers to it.
-		DIDs: []string{"99999999-9999-4999-8999-999999999999"},
+		DIDs: []string{testXIDOrphan},
 		Deliveries: []types.DeliveryEndpoint{
-			{DID: "99999999-9999-4999-8999-999999999999", Type: types.DeliveryX2, Address: "10.0.60.122:42069"},
+			{DID: testXIDOrphan, Type: types.DeliveryX2, Address: testDestinationAddr},
 		},
 	}}, []upfSession{{node: upfNode(trigNodeA), seid: 0x2632898145f4d191}}, 7)
 
@@ -2456,8 +2456,8 @@ func TestTwoWarrantsToOneEndpointShareItsDestination(t *testing.T) {
 	const shared = "198.51.100.10:5000"
 
 	s.installFor("session-ref-1", []types.InterceptTask{
-		x3Task("11111111-1111-4111-8111-111111111111", shared),
-		x3Task("22222222-2222-4222-8222-222222222222", shared),
+		x3Task(testXIDPrimary, shared),
+		x3Task(testXIDSecondary, shared),
 	}, []upfSession{{node: upfNode(trigNodeA), seid: 0x2632898145f4d191}}, 7)
 
 	if n := poi.countMessages("CreateDestinationRequest"); n != 1 {
@@ -2481,7 +2481,7 @@ func TestTriggerCarriesEveryDestinationATaskNames(t *testing.T) {
 	s.taskReporter = &recordingTaskReporter{}
 
 	s.installFor("session-ref-1", []types.InterceptTask{
-		x3Task("11111111-1111-4111-8111-111111111111", "198.51.100.10:5000", "198.51.100.11:5001"),
+		x3Task(testXIDPrimary, "198.51.100.10:5000", "198.51.100.11:5001"),
 	}, []upfSession{{node: upfNode(trigNodeA), seid: 0x2632898145f4d191}}, 7)
 
 	if n := poi.countMessages("CreateDestinationRequest"); n != 2 {
@@ -2505,7 +2505,7 @@ func TestWarrantWithNoResolvableDestinationAndNoFallbackIsReported(t *testing.T)
 	s.taskReporter = reporter
 
 	s.installFor("session-ref-1", []types.InterceptTask{{
-		XID:      "11111111-1111-4111-8111-111111111111",
+		XID:      testXIDPrimary,
 		Products: []types.ProductType{types.ProductCC},
 	}}, []upfSession{{node: upfNode(trigNodeA), seid: 0x2632898145f4d191}}, 7)
 
@@ -2607,7 +2607,7 @@ func TestAmbiguousActivationIsWithdrawnNotForgotten(t *testing.T) {
 	poi.setMisname("some-other-upf", "ActivateTaskRequest")
 
 	warrant := types.InterceptTask{
-		XID:      "11111111-1111-4111-8111-111111111111",
+		XID:      testXIDPrimary,
 		Products: []types.ProductType{types.ProductCC},
 	}
 	s.installFor("session-ref-1", []types.InterceptTask{warrant},
@@ -2641,7 +2641,7 @@ func TestRefusedActivationIsReleasedNotWithdrawn(t *testing.T) {
 	poi.mu.Unlock()
 
 	s.installFor("session-ref-1", []types.InterceptTask{{
-		XID:      "11111111-1111-4111-8111-111111111111",
+		XID:      testXIDPrimary,
 		Products: []types.ProductType{types.ProductCC},
 	}}, []upfSession{{node: upfNode(trigNodeA), seid: 0x2632898145f4d191}}, 7)
 
@@ -2683,7 +2683,7 @@ func TestWithdrawalOfATriggerThePOINeverReceivedCompletesAtOnce(t *testing.T) {
 	}
 
 	s.installFor("session-ref-1", []types.InterceptTask{{
-		XID:      "11111111-1111-4111-8111-111111111111",
+		XID:      testXIDPrimary,
 		Products: []types.ProductType{types.ProductCC},
 	}}, []upfSession{{node: upfNode(trigNodeA), seid: 0x2632898145f4d191}}, 7)
 
@@ -2708,7 +2708,7 @@ func TestWarrantWithdrawnAfterAnAmbiguousActivationStillReachesThePOI(t *testing
 
 	poi.setMisname("some-other-upf", "ActivateTaskRequest")
 
-	const warrantXID = "11111111-1111-4111-8111-111111111111"
+	const warrantXID = testXIDPrimary
 	s.installFor("session-ref-1", []types.InterceptTask{{
 		XID:      warrantXID,
 		Products: []types.ProductType{types.ProductCC},
@@ -2757,7 +2757,7 @@ func TestMatchEndpointPerformsNoResolution(t *testing.T) {
 	// loop running, a lookup it makes on its own goroutine is indistinguishable from
 	// one made here, and the assertion would be about timing rather than about the
 	// function under test.
-	reg := staticRegistry(map[string]string{name: trigNodeA, "10.0.4.4": "10.0.4.4"})
+	reg := staticRegistry(map[string]string{name: trigNodeA, trigNodeC: trigNodeC})
 	reg.lookup = func(_ context.Context, host string) (string, error) {
 		t.Errorf("matchEndpoint resolved %q; on this path a name lookup runs under the "+
 			"session lock of the subscriber being intercepted", host)
@@ -2771,8 +2771,8 @@ func TestMatchEndpointPerformsNoResolution(t *testing.T) {
 	for _, session := range []upfSession{
 		{node: upfNode(name), addr: trigNodeA},
 		{node: upfNode(trigNodeA), addr: trigNodeA},
-		{node: upfNode("10.0.4.4"), addr: "10.0.4.4"},
-		{node: upfNode("10.0.9.9"), addr: "10.0.9.9"},
+		{node: upfNode(trigNodeC), addr: trigNodeC},
+		{node: upfNode(trigNodeElsewhere), addr: trigNodeElsewhere},
 	} {
 		matchOn(reg, session) //nolint:errcheck // the assertion is in the resolver hook
 	}
@@ -2797,8 +2797,8 @@ func TestResolvingATriggeringEndpointIsSilent(t *testing.T) {
 
 	const name = "upf-secret.li.test"
 	reg := mustRegistry(Config{
-		NEID: "smf-1", MDF3: "192.0.2.1:42069",
-		UPFTriggers: []UPFTrigger{{NodeID: name, X1URL: "https://upf-1:8443/X1/NE", NEID: "upf-1"}},
+		NEID: testNEID, MDF3: testMDF3Addr,
+		UPFTriggers: []UPFTrigger{{NodeID: name, X1URL: testX1URLUPF1, NEID: testUPFNEID1}},
 	})
 	resolvingTo(reg, map[string]string{name: trigNodeA})
 
@@ -2856,9 +2856,9 @@ func TestProductIDChangeReachesTheInstalledTrigger(t *testing.T) {
 	s.taskReporter = &recordingTaskReporter{}
 
 	const (
-		warrantXID = "11111111-1111-4111-8111-111111111111"
-		oldLabel   = "22222222-2222-4222-8222-222222222222"
-		newLabel   = "33333333-3333-4333-8333-333333333333"
+		warrantXID = testXIDPrimary
+		oldLabel   = testXIDSecondary
+		newLabel   = testXIDTertiary
 	)
 	targets := []types.TargetIdentifier{{Type: types.TargetSUPI, Value: "262019876543210"}}
 
@@ -2921,7 +2921,7 @@ func TestAModificationThatChangesNoLabelSendsNothing(t *testing.T) {
 
 	targets := []types.TargetIdentifier{{Type: types.TargetSUPI, Value: "262019876543210"}}
 	prev := types.InterceptTask{
-		XID:      "11111111-1111-4111-8111-111111111111",
+		XID:      testXIDPrimary,
 		Targets:  targets,
 		Products: []types.ProductType{types.ProductCC},
 	}
@@ -2997,7 +2997,7 @@ func TestAModificationDoesNotWalkTheSessionPool(t *testing.T) {
 
 	const (
 		supi       = "262019876543210"
-		warrantXID = "11111111-1111-4111-8111-111111111111"
+		warrantXID = testXIDPrimary
 	)
 	targets := []types.TargetIdentifier{{Type: types.TargetSUPI, Value: supi}}
 
@@ -3058,8 +3058,8 @@ func TestSessionsWithTriggersNamesOnlyThisWarrantsSessions(t *testing.T) {
 	s.taskReporter = &recordingTaskReporter{}
 
 	const (
-		mine   = "11111111-1111-4111-8111-111111111111"
-		theirs = "22222222-2222-4222-8222-222222222222"
+		mine   = testXIDPrimary
+		theirs = testXIDSecondary
 	)
 	upfs := []upfSession{{node: upfNode(trigNodeA), addr: trigNodeA, seid: 0x2632898145f4d191}}
 	cc := func(xid string) types.InterceptTask {
@@ -3117,7 +3117,7 @@ func TestAnActivationThatTimesOutIsWithdrawnNotForgotten(t *testing.T) {
 	s.triggers.sleep = func(time.Duration) { poi.setRefuse(false) }
 
 	warrant := types.InterceptTask{
-		XID:      "11111111-1111-4111-8111-111111111111",
+		XID:      testXIDPrimary,
 		Products: []types.ProductType{types.ProductCC},
 	}
 
@@ -3165,9 +3165,9 @@ func TestALabelChangeArrivingWithATargetChangeStillReachesTheTrigger(t *testing.
 	s.taskReporter = &recordingTaskReporter{}
 
 	const (
-		warrantXID = "11111111-1111-4111-8111-111111111111"
-		oldLabel   = "22222222-2222-4222-8222-222222222222"
-		newLabel   = "33333333-3333-4333-8333-333333333333"
+		warrantXID = testXIDPrimary
+		oldLabel   = testXIDSecondary
+		newLabel   = testXIDTertiary
 		supi       = "262019876543210"
 	)
 
@@ -3231,24 +3231,24 @@ func TestALabelChangeArrivingWithATargetChangeStillReachesTheTrigger(t *testing.
 // anchor both serve one session, this is the ordinary multi-UPF case.
 func TestTwoTriggeringEndpointsMayNotShareAnElementIdentifier(t *testing.T) {
 	shared := Config{
-		NEID: "smf-1", MDF3: "192.0.2.1:42069",
+		NEID: testNEID, MDF3: testMDF3Addr,
 		UPFTriggers: []UPFTrigger{
-			{NodeID: trigNodeA, X1URL: "https://upf-a:8443/X1/NE", NEID: "upf-1"},
-			{NodeID: "10.0.1.6", X1URL: "https://upf-b:8443/X1/NE", NEID: "upf-1"},
+			{NodeID: trigNodeA, X1URL: testX1URLUPFA, NEID: testUPFNEID1},
+			{NodeID: trigNodeB, X1URL: "https://upf-b:8443/X1/NE", NEID: testUPFNEID1},
 		},
 	}
 	if _, err := newTriggerRegistry(shared, nil, nil, nil); err == nil {
 		t.Error("a configuration giving two points of interception one element identifier was accepted; " +
 			"their sequence numbering collides at the mediation function and neither element can see it")
-	} else if !strings.Contains(err.Error(), "upf-1") {
+	} else if !strings.Contains(err.Error(), testUPFNEID1) {
 		t.Errorf("the refusal does not name the identifier at fault: %v", err)
 	}
 
 	// Distinct identifiers are the ordinary multi-UPF case and must still build.
 	distinct := shared
 	distinct.UPFTriggers = []UPFTrigger{
-		{NodeID: trigNodeA, X1URL: "https://upf-a:8443/X1/NE", NEID: "upf-1"},
-		{NodeID: "10.0.1.6", X1URL: "https://upf-b:8443/X1/NE", NEID: "upf-2"},
+		{NodeID: trigNodeA, X1URL: testX1URLUPFA, NEID: testUPFNEID1},
+		{NodeID: trigNodeB, X1URL: "https://upf-b:8443/X1/NE", NEID: testUPFNEID2},
 	}
 	if _, err := newTriggerRegistry(distinct, nil, nil, nil); err != nil {
 		t.Errorf("two properly distinguished points of interception were refused: %v", err)
@@ -3275,21 +3275,21 @@ func TestTwoPointsOfInterceptionServingOneSessionShareTheWarrantAndNotTheirIdent
 	branch := newFakePOI(t)
 
 	s := &subsystem{
-		neID:  "smf-1",
+		neID:  testNEID,
 		store: store.New(),
 		triggers: mustRegistry(Config{
-			NEID: "smf-1", MDF3: "192.0.2.1:42069",
+			NEID: testNEID, MDF3: testMDF3Addr,
 			UPFTriggers: []UPFTrigger{
 				{NodeID: trigNodeA, X1URL: anchor.srv.URL, NEID: "upf-anchor"},
-				{NodeID: "10.0.1.6", X1URL: branch.srv.URL, NEID: "upf-branch"},
+				{NodeID: trigNodeB, X1URL: branch.srv.URL, NEID: "upf-branch"},
 			},
 		}),
 	}
 	s.taskReporter = &recordingTaskReporter{}
 
 	const (
-		warrantXID = "11111111-1111-4111-8111-111111111111"
-		label      = "22222222-2222-4222-8222-222222222222"
+		warrantXID = testXIDPrimary
+		label      = testXIDSecondary
 	)
 
 	warrant := types.InterceptTask{
@@ -3302,7 +3302,7 @@ func TestTwoPointsOfInterceptionServingOneSessionShareTheWarrantAndNotTheirIdent
 	const correlation = 7
 	upfs := []upfSession{
 		{node: upfNode(trigNodeA), addr: trigNodeA, seid: 0x2632898145f4d191},
-		{node: upfNode("10.0.1.6"), addr: "10.0.1.6", seid: 0x51f4d1912632898a},
+		{node: upfNode(trigNodeB), addr: trigNodeB, seid: 0x51f4d1912632898a},
 	}
 	s.installFor("session-ref-1", []types.InterceptTask{warrant}, upfs, correlation)
 
@@ -3364,11 +3364,11 @@ func TestAFaultyTriggerNamesOnlyItsOwnWarrant(t *testing.T) {
 	s.taskReporter = taskReports
 
 	faulty := types.InterceptTask{
-		XID:      "11111111-1111-4111-8111-111111111111",
+		XID:      testXIDPrimary,
 		Products: []types.ProductType{types.ProductCC},
 	}
 	working := types.InterceptTask{
-		XID:      "22222222-2222-4222-8222-222222222222",
+		XID:      testXIDSecondary,
 		Products: []types.ProductType{types.ProductCC},
 	}
 	s.installFor("session-1", []types.InterceptTask{faulty, working},
@@ -3388,7 +3388,7 @@ func TestAFaultyTriggerNamesOnlyItsOwnWarrant(t *testing.T) {
 
 	poi.mu.Lock()
 	poi.holds = held
-	poi.unhealthy = map[string]string{string(triggerFor[faulty.XID]): "failed"}
+	poi.unhealthy = map[string]string{string(triggerFor[faulty.XID]): testUnhealthyReason}
 	poi.mu.Unlock()
 
 	s.reconcileOne()
@@ -3435,7 +3435,7 @@ func TestATriggerThatStopsRunningAfterStartupIsReported(t *testing.T) {
 
 	// Only now does a session establish and a trigger get installed.
 	warrant := types.InterceptTask{
-		XID:      "11111111-1111-4111-8111-111111111111",
+		XID:      testXIDPrimary,
 		Products: []types.ProductType{types.ProductCC},
 	}
 	s.installFor("session-1", []types.InterceptTask{warrant},
@@ -3454,7 +3454,7 @@ func TestATriggerThatStopsRunningAfterStartupIsReported(t *testing.T) {
 	// datapath that refused the duplication rule.
 	poi.mu.Lock()
 	poi.holds = mine
-	poi.unhealthy = map[string]string{mine[0]: "failed"}
+	poi.unhealthy = map[string]string{mine[0]: testUnhealthyReason}
 	poi.mu.Unlock()
 
 	// The keepalive round is what asks. It already contacts every endpoint this element owes a
@@ -3503,7 +3503,7 @@ func TestAPOIWhoseClaimsWereDiscardedIsReconciledAgain(t *testing.T) {
 	s.reconcileOne()
 
 	warrant := types.InterceptTask{
-		XID:      "22222222-2222-4222-8222-222222222222",
+		XID:      testXIDSecondary,
 		Products: []types.ProductType{types.ProductCC},
 	}
 	s.installFor("session-1", []types.InterceptTask{warrant},
@@ -3573,7 +3573,7 @@ func TestAFaultyTriggerIsAnsweredAndNotOnlyPushed(t *testing.T) {
 	s.reconcileOne()
 
 	warrant := types.InterceptTask{
-		XID:      "33333333-3333-4333-8333-333333333333",
+		XID:      testXIDTertiary,
 		Products: []types.ProductType{types.ProductCC},
 	}
 	s.installFor("session-1", []types.InterceptTask{warrant},
@@ -3595,7 +3595,7 @@ func TestAFaultyTriggerIsAnsweredAndNotOnlyPushed(t *testing.T) {
 	// The POI reports the trigger as not running.
 	poi.mu.Lock()
 	poi.holds = mine
-	poi.unhealthy = map[string]string{mine[0]: "failed"}
+	poi.unhealthy = map[string]string{mine[0]: testUnhealthyReason}
 	poi.mu.Unlock()
 
 	s.triggers.keepaliveRound()
@@ -3622,7 +3622,7 @@ func TestAFaultyTriggerIsAnsweredAndNotOnlyPushed(t *testing.T) {
 
 	// And a withdrawn warrant answers nothing, rather than leaving an entry nothing removes.
 	poi.mu.Lock()
-	poi.unhealthy = map[string]string{mine[0]: "failed"}
+	poi.unhealthy = map[string]string{mine[0]: testUnhealthyReason}
 	poi.mu.Unlock()
 
 	s.triggers.keepaliveRound()

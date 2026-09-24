@@ -53,7 +53,7 @@ func TestAnUnreachableEndpointDoesNotDelayAHealthyOnesKeepalive(t *testing.T) {
 	poi := newFakePOI(t)
 
 	// One endpoint that answers, and several that never do.
-	triggers := []UPFTrigger{{NodeID: "10.0.1.5", X1URL: poi.srv.URL, NEID: "upf-1"}}
+	triggers := []UPFTrigger{{NodeID: trigNodeA, X1URL: poi.srv.URL, NEID: testUPFNEID1}}
 	for i := range 4 {
 		triggers = append(triggers, UPFTrigger{
 			NodeID: "10.0.2." + string(rune('1'+i)),
@@ -62,7 +62,7 @@ func TestAnUnreachableEndpointDoesNotDelayAHealthyOnesKeepalive(t *testing.T) {
 		})
 	}
 
-	reg := mustRegistry(Config{NEID: "smf-1", MDF3: "192.0.2.1:42069", UPFTriggers: triggers})
+	reg := mustRegistry(Config{NEID: testNEID, MDF3: testMDF3Addr, UPFTriggers: triggers})
 
 	// Keepalives are owed for tasking this element can name *at an endpoint it has
 	// reconciled with*, which is the state a running element reaches at startup. Both
@@ -107,10 +107,10 @@ func TestARestartedPointOfInterceptionIsReTasked(t *testing.T) {
 	s.taskReporter = &recordingTaskReporter{}
 
 	warrant := types.InterceptTask{
-		XID:      "11111111-1111-4111-8111-111111111111",
+		XID:      testXIDPrimary,
 		Products: []types.ProductType{types.ProductCC},
 	}
-	upfs := []upfSession{{node: upfNode("10.0.1.5"), addr: "10.0.1.5", seid: 0x2632898145f4d191}}
+	upfs := []upfSession{{node: upfNode(trigNodeA), addr: trigNodeA, seid: 0x2632898145f4d191}}
 
 	s.installFor("session-ref-1", []types.InterceptTask{warrant}, upfs, 7)
 	awaitMessages(t, poi, "ActivateTaskRequest", 1)
@@ -122,7 +122,7 @@ func TestARestartedPointOfInterceptionIsReTasked(t *testing.T) {
 	}
 
 	// The UPF restarts.
-	if forgotten := s.triggers.ForgetPOI("10.0.1.5"); forgotten != 1 {
+	if forgotten := s.triggers.ForgetPOI(trigNodeA); forgotten != 1 {
 		t.Fatalf("ForgetPOI discarded %d claims, want 1", forgotten)
 	}
 
@@ -140,12 +140,12 @@ func TestARestartedPointOfInterceptionIsReTasked(t *testing.T) {
 func TestAForgottenEndpointStopsEarningKeepalives(t *testing.T) {
 	poi := newFakePOI(t)
 	reg := mustRegistry(Config{
-		NEID: "smf-1", MDF3: "192.0.2.1:42069",
-		UPFTriggers: []UPFTrigger{{NodeID: "10.0.1.5", X1URL: poi.srv.URL, NEID: "upf-1"}},
+		NEID: testNEID, MDF3: testMDF3Addr,
+		UPFTriggers: []UPFTrigger{{NodeID: trigNodeA, X1URL: poi.srv.URL, NEID: testUPFNEID1}},
 	})
 
-	reg.endpoints["10.0.1.5"].markReconciled()
-	reg.installed[triggerKey(types.XID("W1"), "session-ref-1", "10.0.1.5")] = installedTrigger{
+	reg.endpoints[trigNodeA].markReconciled()
+	reg.installed[triggerKey(types.XID("W1"), "session-ref-1", trigNodeA)] = installedTrigger{
 		xid: types.XID(x1.NewUUID()), seid: 0x2632898145f4d191, correlation: 7,
 	}
 
@@ -155,7 +155,7 @@ func TestAForgottenEndpointStopsEarningKeepalives(t *testing.T) {
 	}
 
 	before := poi.countMessages("KeepaliveRequest")
-	reg.ForgetPOI("10.0.1.5")
+	reg.ForgetPOI(trigNodeA)
 	reg.keepaliveRound()
 
 	if after := poi.countMessages("KeepaliveRequest"); after != before {

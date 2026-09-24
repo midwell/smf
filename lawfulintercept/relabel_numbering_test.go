@@ -29,15 +29,15 @@ import (
 // function has already seen is how loss is signalled on this interface.
 func TestARelabelReleasesTheSupersededLabelsNumbering(t *testing.T) {
 	const (
-		xid      = types.XID("11111111-1111-4111-8111-111111111111")
-		oldLabel = types.XID("aaaaaaaa-1111-4111-8111-111111111111")
+		xid      = types.XID(testXIDPrimary)
+		oldLabel = types.XID(testXIDHeld)
 		newLabel = types.XID("cccccccc-3333-4333-8333-333333333333")
 	)
 
 	sub := &subsystem{
 		store: store.New(),
-		neID:  "smf-1",
-		ids:   x2x3.NewIdentity("smf-1", smfInterceptionPoint),
+		neID:  testNEID,
+		ids:   x2x3.NewIdentity(testNEID, smfInterceptionPoint),
 	}
 
 	prev := types.InterceptTask{
@@ -62,7 +62,7 @@ func TestARelabelReleasesTheSupersededLabelsNumbering(t *testing.T) {
 
 	// A modification that leaves the labelling alone: nothing is released.
 	unchanged := prev
-	unchanged.DIDs = []string{"33333333-3333-4333-8333-333333333333"}
+	unchanged.DIDs = []string{testXIDTertiary}
 	sub.modifyInterception(prev, unchanged)
 
 	if n := sub.ids.Contexts(); n != 2 {

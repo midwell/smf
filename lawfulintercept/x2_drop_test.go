@@ -83,7 +83,7 @@ func loopbackPKI(t *testing.T) (certPath, keyPath, caPath string, pair tls.Certi
 func slowMDF2(t *testing.T, pair tls.Certificate) string {
 	t.Helper()
 
-	ln, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{
+	ln, err := tls.Listen("tcp", testListenEphemeral, &tls.Config{
 		Certificates: []tls.Certificate{pair},
 		ClientAuth:   tls.RequireAnyClientCert,
 		MinVersion:   tls.VersionTLS12,
@@ -128,11 +128,11 @@ func TestProductDroppedByAFullQueueIsReported(t *testing.T) {
 	t.Cleanup(func() { active.Store(nil) })
 
 	if err := Init(Config{
-		NEID:     "smf-1",
-		X1Listen: "127.0.0.1:0",
+		NEID:     testNEID,
+		X1Listen: testListenEphemeral,
 		MDF2:     mdf2,
 		Cert:     cert, Key: key, CACert: ca,
-		AdmfURL: admf.srv.URL, AdmfID: "admf-1",
+		AdmfURL: admf.srv.URL, AdmfID: testADMFID,
 	}); err != nil {
 		t.Fatalf("Init: %v", err)
 	}
@@ -195,11 +195,11 @@ func TestADroppedUnitIsReportedAsALossAndNotAsUnreachability(t *testing.T) {
 	t.Cleanup(func() { active.Store(nil) })
 
 	if err := Init(Config{
-		NEID:     "smf-1",
-		X1Listen: "127.0.0.1:0",
-		MDF2:     "10.0.60.122:42069",
+		NEID:     testNEID,
+		X1Listen: testListenEphemeral,
+		MDF2:     testDestinationAddr,
 		Cert:     cert, Key: key, CACert: ca,
-		AdmfURL: admf.srv.URL, AdmfID: "admf-1",
+		AdmfURL: admf.srv.URL, AdmfID: testADMFID,
 	}); err != nil {
 		t.Fatalf("Init: %v", err)
 	}
@@ -238,11 +238,11 @@ func TestAnOrdinaryDeliveryFailureIsNotReportedAsALoss(t *testing.T) {
 	t.Cleanup(func() { active.Store(nil) })
 
 	if err := Init(Config{
-		NEID:     "smf-1",
-		X1Listen: "127.0.0.1:0",
-		MDF2:     "10.0.60.122:42069",
+		NEID:     testNEID,
+		X1Listen: testListenEphemeral,
+		MDF2:     testDestinationAddr,
 		Cert:     cert, Key: key, CACert: ca,
-		AdmfURL: admf.srv.URL, AdmfID: "admf-1",
+		AdmfURL: admf.srv.URL, AdmfID: testADMFID,
 	}); err != nil {
 		t.Fatalf("Init: %v", err)
 	}

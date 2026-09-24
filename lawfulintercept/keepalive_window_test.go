@@ -18,7 +18,7 @@ func TestKeepaliveWindowIsReadNotGuessed(t *testing.T) {
 		wantErr bool
 	}{
 		{value: ""},                    // the fail-safe off, stated
-		{value: "30s"},                 //
+		{value: testKeepalive30s},      //
 		{value: "5m"},                  //
 		{value: "30", wantErr: true},   // the typo this exists for
 		{value: "5min", wantErr: true}, // and the other one

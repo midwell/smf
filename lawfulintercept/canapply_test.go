@@ -106,14 +106,14 @@ func TestX1ServerRefusesTaskingItCannotAct(t *testing.T) {
 			// this element cannot resolve is now refused — and what this test is about is
 			// whether the element can act on the *targets*.
 			srv := newX1Server(st, Config{
-				NEID: "smf-1", AdmfID: "admf-1",
+				NEID: testNEID, AdmfID: testADMFID,
 				Destinations: []Destination{{
 					DID: "7d1c2f60-8a4e-4a1e-9f3b-2c5d6e7f8091", DeliveryType: "X2Only",
-					Address: "10.0.60.122:42069",
+					Address: testDestinationAddr,
 				}},
 			}, &subsystem{store: st})
 
-			resp, err := srv.Process([]byte(activateWithTargets(tc.targets)), admfCert(t, "admf-1"))
+			resp, err := srv.Process([]byte(activateWithTargets(tc.targets)), admfCert(t, testADMFID))
 			if err != nil {
 				t.Fatalf("Process: %v", err)
 			}

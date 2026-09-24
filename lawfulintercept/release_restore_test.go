@@ -32,7 +32,7 @@ func TestARestoredReleaseIsReportableAgainAndRetasksNothing(t *testing.T) {
 	// A warrant this element would task on, so a re-install would have something to
 	// install: without it the test would pass because there was nothing to do.
 	task := types.InterceptTask{
-		XID:      "11111111-1111-4111-8111-111111111111",
+		XID:      testXIDPrimary,
 		Targets:  []types.TargetIdentifier{{Type: types.TargetSUPI, Value: "262019876543210"}},
 		Products: []types.ProductType{types.ProductCC},
 		State:    types.TaskActive,
@@ -47,7 +47,7 @@ func TestARestoredReleaseIsReportableAgainAndRetasksNothing(t *testing.T) {
 	// The session as the restore branches actually hold it: released, its tunnel nilled
 	// by releaseTunnel, its release already reported. This is the shape production
 	// reaches, not a convenient one.
-	sc := pooledSession(t, "imsi-262019876543210", 1)
+	sc := pooledSession(t, testSUPI, 1)
 	sc.Tunnel = nil
 	sc.LiReleaseReported = true
 
@@ -82,7 +82,7 @@ func TestRestoreInterceptionPerformsNoX1Work(t *testing.T) {
 	sub := triggerSubsystem(t, poi)
 
 	task := types.InterceptTask{
-		XID:      "11111111-1111-4111-8111-111111111111",
+		XID:      testXIDPrimary,
 		Targets:  []types.TargetIdentifier{{Type: types.TargetSUPI, Value: "262019876543210"}},
 		Products: []types.ProductType{types.ProductCC},
 		State:    types.TaskActive,
@@ -94,9 +94,9 @@ func TestRestoreInterceptionPerformsNoX1Work(t *testing.T) {
 	active.Store(sub)
 	t.Cleanup(func() { active.Store(nil) })
 
-	sc := pooledSession(t, "imsi-262019876543210", 1)
+	sc := pooledSession(t, testSUPI, 1)
 	node := smfctx.NewDataPathNode()
-	node.UPF = &smfctx.UPF{NodeID: upfNode("10.0.1.5")}
+	node.UPF = &smfctx.UPF{NodeID: upfNode(trigNodeA)}
 	node.UpLinkTunnel.PDR["default"] = &smfctx.PDR{
 		FAR: &smfctx.FAR{ApplyAction: smfctx.ApplyAction{Forw: true}},
 	}

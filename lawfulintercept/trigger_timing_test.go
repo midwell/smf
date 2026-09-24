@@ -89,20 +89,20 @@ func sessionServedBy(supi, addr string) *smfctx.SMContext {
 // it a measurement of the warrant rather than of the network.
 func TestATaskedEstablishmentIsNotSlowedByAnUnreachableLIPF(t *testing.T) {
 	const (
-		supi     = "imsi-262019876543210"
-		servedBy = "10.0.9.9" // not the address triggerSubsystem configures an endpoint for
+		supi     = testSUPI
+		servedBy = trigNodeElsewhere // not the address triggerSubsystem configures an endpoint for
 	)
 
 	poi := newFakePOI(t)
 	s := triggerSubsystem(t, poi)
 	admf := newUnansweringADMF(t)
-	s.taskReporter = x1.NewReporter(admf.url, "admfID", "smf-1", nil)
+	s.taskReporter = x1.NewReporter(admf.url, "admfID", testNEID, nil)
 
 	st := store.New()
 	for _, xid := range []types.XID{
-		"11111111-1111-4111-8111-111111111111",
-		"22222222-2222-4222-8222-222222222222",
-		"33333333-3333-4333-8333-333333333333",
+		testXIDPrimary,
+		testXIDSecondary,
+		testXIDTertiary,
 	} {
 		if !st.Activate(types.InterceptTask{
 			XID:      xid,

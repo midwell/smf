@@ -237,8 +237,8 @@ func TestPDUSessionTypeCorrespondsToTS24501(t *testing.T) {
 			record string
 			got    iri.PDUSessionType
 		}{
-			{"SMFPDUSessionEstablishment", smfEstablishment(sc).PDUSessionType},
-			{"SMFStartOfInterceptionWithEstablishedPDUSession", smfStartOfInterception(sc).PDUSessionType},
+			{testRecEstablishment, smfEstablishment(sc).PDUSessionType},
+			{testRecStartOfInterception, smfStartOfInterception(sc).PDUSessionType},
 		} {
 			if int64(tc.got) != want {
 				t.Errorf("%s/pDUSessionType for %q is %d, and TS 33.128 defines %s as %d — the "+

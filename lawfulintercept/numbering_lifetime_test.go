@@ -32,14 +32,14 @@ import (
 // pass by accident — a release keyed on the wrong thing still empties a map with one entry.
 func TestNumberingReturnsToZeroWhenEveryWarrantIsWithdrawn(t *testing.T) {
 	const (
-		firstXID  = types.XID("11111111-1111-4111-8111-111111111111")
-		secondXID = types.XID("22222222-2222-4222-8222-222222222222")
+		firstXID  = types.XID(testXIDPrimary)
+		secondXID = types.XID(testXIDSecondary)
 	)
 
 	sub := &subsystem{
 		store: store.New(),
-		neID:  "smf-1",
-		ids:   x2x3.NewIdentity("smf-1", smfInterceptionPoint),
+		neID:  testNEID,
+		ids:   x2x3.NewIdentity(testNEID, smfInterceptionPoint),
 	}
 
 	task := func(xid types.XID, supi string) types.InterceptTask {

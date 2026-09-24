@@ -30,7 +30,7 @@ func TestARetargetMidScanStopsDeliveringForThePreviousSubject(t *testing.T) {
 	)
 
 	task := types.InterceptTask{
-		XID:      "11111111-1111-4111-8111-111111111111",
+		XID:      testXIDPrimary,
 		Targets:  []types.TargetIdentifier{{Type: types.TargetSUPI, Value: subject}},
 		Products: []types.ProductType{types.ProductIRI},
 		State:    types.TaskActive,
@@ -74,7 +74,7 @@ func TestARetargetMidScanStopsDeliveringForThePreviousSubject(t *testing.T) {
 // it covers.
 func TestAScanStillDeliversWhileTheSubjectIsNamed(t *testing.T) {
 	task := types.InterceptTask{
-		XID:      "11111111-1111-4111-8111-111111111111",
+		XID:      testXIDPrimary,
 		Targets:  []types.TargetIdentifier{{Type: types.TargetSUPI, Value: "262019876543210"}},
 		Products: []types.ProductType{types.ProductIRI},
 		State:    types.TaskActive,
@@ -100,7 +100,7 @@ func TestAScanStillDeliversWhileTheSubjectIsNamed(t *testing.T) {
 // the authority rule to the path that enforces it.
 func TestADeactivationScanIsNotSubjectChecked(t *testing.T) {
 	task := types.InterceptTask{
-		XID:      "11111111-1111-4111-8111-111111111111",
+		XID:      testXIDPrimary,
 		Targets:  []types.TargetIdentifier{{Type: types.TargetSUPI, Value: "262019876543210"}},
 		Products: []types.ProductType{types.ProductCC},
 		State:    types.TaskActive,

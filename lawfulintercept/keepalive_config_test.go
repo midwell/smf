@@ -32,7 +32,7 @@ func TestKeepaliveConfigFromOperatorSettings(t *testing.T) {
 		},
 		{
 			name:   "timers as configured",
-			cfg:    Config{X2X3KeepaliveTimeP1: "10s", X2X3KeepaliveTimeP2: "30s"},
+			cfg:    Config{X2X3KeepaliveTimeP1: "10s", X2X3KeepaliveTimeP2: testKeepalive30s},
 			wantP1: 10 * time.Second, wantP2: 30 * time.Second,
 		},
 		{
@@ -52,7 +52,7 @@ func TestKeepaliveConfigFromOperatorSettings(t *testing.T) {
 			// The pair that reads as harmless and would disconnect every connection
 			// before the keepalive that keeps it is even sent.
 			name: "TIME_P2 below TIME_P1 falls back to both defaults",
-			cfg:  Config{X2X3KeepaliveTimeP1: "60s", X2X3KeepaliveTimeP2: "30s"},
+			cfg:  Config{X2X3KeepaliveTimeP1: "60s", X2X3KeepaliveTimeP2: testKeepalive30s},
 		},
 		{
 			name:         "a disabled mechanism stays disabled through a fallback",

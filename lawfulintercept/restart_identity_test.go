@@ -26,13 +26,13 @@ func namedTriggerSubsystem(t *testing.T, poi *fakePOI, node, addr string) *subsy
 	t.Helper()
 
 	cfg := Config{
-		NEID: "smf-1",
-		MDF3: "192.0.2.1:42069",
+		NEID: testNEID,
+		MDF3: testMDF3Addr,
 		UPFTriggers: []UPFTrigger{
-			{NodeID: node, X1URL: poi.srv.URL, NEID: "upf-1"},
+			{NodeID: node, X1URL: poi.srv.URL, NEID: testUPFNEID1},
 		},
 	}
-	s := &subsystem{neID: "smf-1", triggers: mustRegistry(cfg), store: store.New()}
+	s := &subsystem{neID: testNEID, triggers: mustRegistry(cfg), store: store.New()}
 	waitForScans(t, s)
 
 	// The name resolves to the address the session path carries, which is what makes the
@@ -55,25 +55,25 @@ func namedTriggerSubsystem(t *testing.T, poi *fakePOI, node, addr string) *subsy
 // claims and the second establishment sends no activation.
 func TestARestartAtANamedNodeIsRecognised(t *testing.T) {
 	poi := newFakePOI(t)
-	s := namedTriggerSubsystem(t, poi, "upf", "10.0.1.5")
+	s := namedTriggerSubsystem(t, poi, "upf", trigNodeA)
 
 	active.Store(s)
 	t.Cleanup(func() { active.Store(nil) })
 
 	warrant := types.InterceptTask{
-		XID:      "11111111-1111-4111-8111-111111111111",
+		XID:      testXIDPrimary,
 		Products: []types.ProductType{types.ProductCC},
 	}
 	// The session names its serving UPF by address, as sessionUPFs builds it: the session
 	// path and the LI block are independent configuration and need not agree.
-	upfs := []upfSession{{node: upfNode("10.0.1.5"), addr: "10.0.1.5", seid: 0x2632898145f4d191}}
+	upfs := []upfSession{{node: upfNode(trigNodeA), addr: trigNodeA, seid: 0x2632898145f4d191}}
 
 	s.installFor("session-ref-1", []types.InterceptTask{warrant}, upfs, 7)
 	awaitMessages(t, poi, "ActivateTaskRequest", 1)
 
 	// The UPF restarts, discovered on whichever PFCP path noticed. The node identity is what
 	// the PFCP handlers hold.
-	POIRestarted(*smfctx.NewNodeID("10.0.1.5"), "10.0.1.5")
+	POIRestarted(*smfctx.NewNodeID(trigNodeA), trigNodeA)
 
 	// And the next establishment re-tasks it.
 	s.installFor("session-ref-1", []types.InterceptTask{warrant}, upfs, 7)
@@ -93,15 +93,15 @@ func TestARestartIsRecognisedThroughTheAddressFallbackToo(t *testing.T) {
 	t.Cleanup(func() { active.Store(nil) })
 
 	warrant := types.InterceptTask{
-		XID:      "11111111-1111-4111-8111-111111111111",
+		XID:      testXIDPrimary,
 		Products: []types.ProductType{types.ProductCC},
 	}
-	upfs := []upfSession{{node: upfNode("10.0.1.5"), addr: "10.0.1.5", seid: 0x2632898145f4d191}}
+	upfs := []upfSession{{node: upfNode(trigNodeA), addr: trigNodeA, seid: 0x2632898145f4d191}}
 
 	s.installFor("session-ref-1", []types.InterceptTask{warrant}, upfs, 7)
 	awaitMessages(t, poi, "ActivateTaskRequest", 1)
 
-	POIRestarted(*smfctx.NewNodeID("10.0.1.5"), "10.0.1.5")
+	POIRestarted(*smfctx.NewNodeID(trigNodeA), trigNodeA)
 
 	s.installFor("session-ref-1", []types.InterceptTask{warrant}, upfs, 7)
 	awaitMessages(t, poi, "ActivateTaskRequest", 2)
@@ -113,19 +113,19 @@ func TestARestartIsRecognisedThroughTheAddressFallbackToo(t *testing.T) {
 // documentation exists to prevent, arrived at from the restart path.
 func TestARestartAtAnUnconfiguredNodeDiscardsNothing(t *testing.T) {
 	poi := newFakePOI(t)
-	s := namedTriggerSubsystem(t, poi, "upf", "10.0.1.5")
+	s := namedTriggerSubsystem(t, poi, "upf", trigNodeA)
 
 	warrant := types.InterceptTask{
-		XID:      "11111111-1111-4111-8111-111111111111",
+		XID:      testXIDPrimary,
 		Products: []types.ProductType{types.ProductCC},
 	}
-	upfs := []upfSession{{node: upfNode("10.0.1.5"), addr: "10.0.1.5", seid: 0x2632898145f4d191}}
+	upfs := []upfSession{{node: upfNode(trigNodeA), addr: trigNodeA, seid: 0x2632898145f4d191}}
 	s.installFor("session-ref-1", []types.InterceptTask{warrant}, upfs, 7)
 	awaitMessages(t, poi, "ActivateTaskRequest", 1)
 
 	held := len(s.triggers.installed)
 	if n := s.triggers.forgetRestartedPOI(upfSession{
-		node: upfNode("10.0.9.9"), addr: "10.0.9.9",
+		node: upfNode(trigNodeElsewhere), addr: trigNodeElsewhere,
 	}); n != 0 {
 		t.Errorf("a restart at a node this element does not task discarded %d claims", n)
 	}
@@ -141,23 +141,23 @@ func TestARestartAtAnUnconfiguredNodeDiscardsNothing(t *testing.T) {
 // without disclosing tasking on a channel that must not carry it.
 func TestARecognisedRestartIsReported(t *testing.T) {
 	poi := newFakePOI(t)
-	s := namedTriggerSubsystem(t, poi, "upf", "10.0.1.5")
+	s := namedTriggerSubsystem(t, poi, "upf", trigNodeA)
 
 	admf := newADMFStub(t)
-	s.reporter = x1.NewReporter(admf.srv.URL, "admf-1", "smf-1", nil)
+	s.reporter = x1.NewReporter(admf.srv.URL, testADMFID, testNEID, nil)
 
 	active.Store(s)
 	t.Cleanup(func() { active.Store(nil) })
 
 	warrant := types.InterceptTask{
-		XID:      "11111111-1111-4111-8111-111111111111",
+		XID:      testXIDPrimary,
 		Products: []types.ProductType{types.ProductCC},
 	}
-	upfs := []upfSession{{node: upfNode("10.0.1.5"), addr: "10.0.1.5", seid: 0x2632898145f4d191}}
+	upfs := []upfSession{{node: upfNode(trigNodeA), addr: trigNodeA, seid: 0x2632898145f4d191}}
 	s.installFor("session-ref-1", []types.InterceptTask{warrant}, upfs, 7)
 	awaitMessages(t, poi, "ActivateTaskRequest", 1)
 
-	POIRestarted(*smfctx.NewNodeID("10.0.1.5"), "10.0.1.5")
+	POIRestarted(*smfctx.NewNodeID(trigNodeA), trigNodeA)
 
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {

@@ -38,10 +38,10 @@ func (c *captureSender) Send(p *x2x3.PDU) error {
 func targetSM() *smfctx.SMContext {
 	sd := "010203"
 	return &smfctx.SMContext{
-		Supi:                   "imsi-262019876543210",
+		Supi:                   testSUPI,
 		Pei:                    "imeisv-3534250000000151",
 		Gpsi:                   "msisdn-4915123456789",
-		Dnn:                    "internet",
+		Dnn:                    testDNN,
 		PDUSessionID:           5,
 		SelectedPDUSessionType: 1, // IPv4
 		Snssai:                 &models.Snssai{Sst: 1, Sd: &sd},
@@ -83,7 +83,7 @@ func TestEstablishmentMapping(t *testing.T) {
 	if est.PDUSessionID != 5 || est.PDUSessionType != iri.PDUSessionTypeIPv4 {
 		t.Errorf("id=%d type=%d", est.PDUSessionID, est.PDUSessionType)
 	}
-	if est.DNN != "internet" || est.RequestType != iri.SMRequestInitial {
+	if est.DNN != testDNN || est.RequestType != iri.SMRequestInitial {
 		t.Errorf("dnn=%q req=%d", est.DNN, est.RequestType)
 	}
 	if est.SNSSAI.SliceServiceType != 1 || !bytes.Equal(est.SNSSAI.SliceDifferentiator, []byte{0x01, 0x02, 0x03}) {
@@ -200,7 +200,7 @@ func ccSession(far *smfctx.FAR) *smfctx.SMContext {
 	node := smfctx.NewDataPathNode()
 	node.UpLinkTunnel.PDR["default"] = &smfctx.PDR{FAR: far}
 	return &smfctx.SMContext{
-		Supi:   "imsi-262019876543210",
+		Supi:   testSUPI,
 		Tunnel: &smfctx.UPTunnel{DataPathPool: smfctx.DataPathPool{1: &smfctx.DataPath{FirstDPNode: node}}},
 	}
 }
@@ -218,7 +218,7 @@ func activateWith(t *testing.T, task types.InterceptTask) {
 
 func TestApplyCCTriggerSetsDuplication(t *testing.T) {
 	activateWith(t, types.InterceptTask{
-		XID:      "task-cc",
+		XID:      testTaskCC,
 		Targets:  []types.TargetIdentifier{{Type: types.TargetSUPI, Value: "262019876543210"}},
 		Products: []types.ProductType{types.ProductIRI, types.ProductCC},
 		State:    types.TaskActive,
@@ -240,7 +240,7 @@ func TestApplyCCTriggerClearsWhenNotCCTasked(t *testing.T) {
 	// An IRI-only task must not trigger CC duplication, and must clear a FAR that
 	// was previously duplicating.
 	activateWith(t, types.InterceptTask{
-		XID:      "task-iri",
+		XID:      testTaskIRI,
 		Targets:  []types.TargetIdentifier{{Type: types.TargetSUPI, Value: "262019876543210"}},
 		Products: []types.ProductType{types.ProductIRI},
 		State:    types.TaskActive,
@@ -259,7 +259,7 @@ func TestApplyCCTriggerClearsWhenNotCCTasked(t *testing.T) {
 
 func TestApplyCCTriggerSkipsNonForwardingFAR(t *testing.T) {
 	activateWith(t, types.InterceptTask{
-		XID:      "task-cc",
+		XID:      testTaskCC,
 		Targets:  []types.TargetIdentifier{{Type: types.TargetSUPI, Value: "262019876543210"}},
 		Products: []types.ProductType{types.ProductCC},
 		State:    types.TaskActive,
@@ -280,7 +280,7 @@ func TestApplyCCTriggerSkipsNonForwardingFAR(t *testing.T) {
 // UPF. An establishment FAR (RULE_INITIAL) must be left as-is (sent as Create).
 func TestApplyCCTriggerMarksInstalledFARForUpdate(t *testing.T) {
 	activateWith(t, types.InterceptTask{
-		XID:      "task-cc",
+		XID:      testTaskCC,
 		Targets:  []types.TargetIdentifier{{Type: types.TargetSUPI, Value: "262019876543210"}},
 		Products: []types.ProductType{types.ProductCC},
 		State:    types.TaskActive,
@@ -316,7 +316,7 @@ func TestApplyCCTriggerMarksInstalledFARForUpdate(t *testing.T) {
 // this pins that it actually does.
 func TestApplyCCTriggerRecoversAfterFARReactivation(t *testing.T) {
 	activateWith(t, types.InterceptTask{
-		XID:      "task-cc",
+		XID:      testTaskCC,
 		Targets:  []types.TargetIdentifier{{Type: types.TargetSUPI, Value: "262019876543210"}},
 		Products: []types.ProductType{types.ProductCC},
 		State:    types.TaskActive,
@@ -366,23 +366,23 @@ func smfContextApplyActionForwardOnly() smfctx.ApplyAction {
 // from the PFCP establishment-response handler, which runs once per UPF, so a
 // session spanning several UPFs would otherwise produce one record per response.
 func TestReportEstablishmentEmitsOnce(t *testing.T) {
-	cap := &captureSender{}
+	capture := &captureSender{}
 	st := store.New()
 	st.Activate(types.InterceptTask{
-		XID:      "task-iri",
+		XID:      testTaskIRI,
 		Targets:  []types.TargetIdentifier{{Type: types.TargetSUPI, Value: "262019876543210"}},
 		Products: []types.ProductType{types.ProductIRI},
 		State:    types.TaskActive,
 	})
-	active.Store(&subsystem{store: st, senderFor: func(string) sender { return cap }, mdf2: configuredMDF2, ids: x2x3.NewIdentity("smf-1", smfInterceptionPoint), neID: "ne"})
+	active.Store(&subsystem{store: st, senderFor: func(string) sender { return capture }, mdf2: configuredMDF2, ids: x2x3.NewIdentity(testNEID, smfInterceptionPoint), neID: "ne"})
 	t.Cleanup(func() { active.Store(nil) })
 
 	sc := targetSM()
 	ReportEstablishment(sc)
 	ReportEstablishment(sc) // a second UPF's response must not emit again
 
-	if len(cap.pdus) != 1 {
-		t.Errorf("establishment emitted %d records, want exactly 1", len(cap.pdus))
+	if len(capture.pdus) != 1 {
+		t.Errorf("establishment emitted %d records, want exactly 1", len(capture.pdus))
 	}
 }
 
@@ -390,22 +390,22 @@ func TestReportEstablishmentEmitsOnce(t *testing.T) {
 // update-initiated delete and the dedicated release handler must emit only one
 // SMFPDUSessionRelease xIRI.
 func TestReportReleaseDeduplicates(t *testing.T) {
-	cap := &captureSender{}
+	capture := &captureSender{}
 	st := store.New()
 	st.Activate(types.InterceptTask{
-		XID:      "task-iri",
+		XID:      testTaskIRI,
 		Targets:  []types.TargetIdentifier{{Type: types.TargetSUPI, Value: "262019876543210"}},
 		Products: []types.ProductType{types.ProductIRI},
 		State:    types.TaskActive,
 	})
-	active.Store(&subsystem{store: st, senderFor: func(string) sender { return cap }, mdf2: configuredMDF2, ids: x2x3.NewIdentity("smf-1", smfInterceptionPoint), neID: "ne"})
+	active.Store(&subsystem{store: st, senderFor: func(string) sender { return capture }, mdf2: configuredMDF2, ids: x2x3.NewIdentity(testNEID, smfInterceptionPoint), neID: "ne"})
 	t.Cleanup(func() { active.Store(nil) })
 
 	sc := targetSM()
 	ReportRelease(sc)
 	ReportRelease(sc) // second call for the same teardown must be a no-op
-	if len(cap.pdus) != 1 {
-		t.Fatalf("release emitted %d xIRI, want exactly 1 (dedupe)", len(cap.pdus))
+	if len(capture.pdus) != 1 {
+		t.Fatalf("release emitted %d xIRI, want exactly 1 (dedupe)", len(capture.pdus))
 	}
 }
 
@@ -436,17 +436,17 @@ func TestDeliveryIsolation(t *testing.T) {
 	st.Activate(types.InterceptTask{XID: xidB, Targets: []types.TargetIdentifier{target}, Products: []types.ProductType{types.ProductIRI}, State: types.TaskActive})
 	st.Activate(types.InterceptTask{XID: xidCC, Targets: []types.TargetIdentifier{target}, Products: []types.ProductType{types.ProductCC}, State: types.TaskActive})
 
-	cap := &captureSender{}
-	active.Store(&subsystem{store: st, senderFor: func(string) sender { return cap }, mdf2: configuredMDF2, ids: x2x3.NewIdentity("smf-1", smfInterceptionPoint)})
+	capture := &captureSender{}
+	active.Store(&subsystem{store: st, senderFor: func(string) sender { return capture }, mdf2: configuredMDF2, ids: x2x3.NewIdentity(testNEID, smfInterceptionPoint)})
 	t.Cleanup(func() { active.Store(nil) })
 
 	ReportEstablishment(targetSM())
 
-	if len(cap.pdus) != 2 {
-		t.Fatalf("delivered %d xIRI PDUs, want 2 (the two IRI agencies; CC-only excluded)", len(cap.pdus))
+	if len(capture.pdus) != 2 {
+		t.Fatalf("delivered %d xIRI PDUs, want 2 (the two IRI agencies; CC-only excluded)", len(capture.pdus))
 	}
 	count := map[[16]byte]int{}
-	for _, p := range cap.pdus {
+	for _, p := range capture.pdus {
 		count[p.XID]++
 	}
 	if count[parseXID(xidA)] != 1 || count[parseXID(xidB)] != 1 {
@@ -652,7 +652,7 @@ func TestXIRIGoesToTheDestinationsTheTaskNamed(t *testing.T) {
 	const (
 		xidA    = "aaaaaaaa-0000-0000-0000-000000000001"
 		xidB    = "bbbbbbbb-0000-0000-0000-000000000002"
-		agencyA = "10.0.60.122:42069"
+		agencyA = testDestinationAddr
 		agencyB = "10.0.60.123:42070"
 	)
 	target := types.TargetIdentifier{Type: types.TargetSUPI, Value: "262019876543210"}
@@ -668,7 +668,7 @@ func TestXIRIGoesToTheDestinationsTheTaskNamed(t *testing.T) {
 
 	capture := newAddressCapture()
 	active.Store(&subsystem{
-		store: st, senderFor: capture.senderFor, mdf2: configuredMDF2, ids: x2x3.NewIdentity("smf-1", smfInterceptionPoint),
+		store: st, senderFor: capture.senderFor, mdf2: configuredMDF2, ids: x2x3.NewIdentity(testNEID, smfInterceptionPoint),
 	})
 	t.Cleanup(func() { active.Store(nil) })
 
@@ -703,7 +703,7 @@ func TestATaskNamingNoDestinationFallsBackToConfiguration(t *testing.T) {
 
 	capture := newAddressCapture()
 	active.Store(&subsystem{
-		store: st, senderFor: capture.senderFor, mdf2: configuredMDF2, ids: x2x3.NewIdentity("smf-1", smfInterceptionPoint),
+		store: st, senderFor: capture.senderFor, mdf2: configuredMDF2, ids: x2x3.NewIdentity(testNEID, smfInterceptionPoint),
 	})
 	t.Cleanup(func() { active.Store(nil) })
 
@@ -802,10 +802,10 @@ func TestDestinationsInUseFollowsTheTasking(t *testing.T) {
 		Targets:  []types.TargetIdentifier{{Type: types.TargetSUPI, Value: "208930100007488"}},
 		Products: []types.ProductType{types.ProductIRI},
 		Deliveries: []types.DeliveryEndpoint{
-			{Type: types.DeliveryX2, Address: "10.0.60.122:42069"},
+			{Type: types.DeliveryX2, Address: testDestinationAddr},
 		},
 	})
-	if got := sub.destinationsInUse(); len(got) != 1 || got[0] != "10.0.60.122:42069" {
+	if got := sub.destinationsInUse(); len(got) != 1 || got[0] != testDestinationAddr {
 		t.Errorf("destinationsInUse() = %v, want the endpoint the warrant named", got)
 	}
 
@@ -931,7 +931,7 @@ func activateIRISub(t *testing.T, snd sender, tasks ...types.InterceptTask) {
 		store:     st,
 		senderFor: func(string) sender { return snd },
 		mdf2:      configuredMDF2,
-		ids:       x2x3.NewIdentity("smf-1", smfInterceptionPoint),
+		ids:       x2x3.NewIdentity(testNEID, smfInterceptionPoint),
 		neID:      "ne",
 	})
 	t.Cleanup(func() { active.Store(nil) })
@@ -944,7 +944,7 @@ func iriTask() types.InterceptTask {
 		XID:        types.XID("aaaaaaaa-0000-0000-0000-000000000001"),
 		Targets:    []types.TargetIdentifier{{Type: types.TargetSUPI, Value: "262019876543210"}},
 		Products:   []types.ProductType{types.ProductIRI},
-		Deliveries: []types.DeliveryEndpoint{{Type: types.DeliveryX2, Address: "10.0.60.122:42069"}},
+		Deliveries: []types.DeliveryEndpoint{{Type: types.DeliveryX2, Address: testDestinationAddr}},
 		State:      types.TaskActive,
 	}
 }
@@ -952,18 +952,18 @@ func iriTask() types.InterceptTask {
 // decodeOne decodes the single xIRI a capture holds, and fails if there is not
 // exactly one — "at least one record arrived" is the assertion that let an empty
 // uEEndpoint through for months.
-func decodeOne(t *testing.T, cap *captureSender) wireRecord {
+func decodeOne(t *testing.T, capture *captureSender) wireRecord {
 	t.Helper()
-	if len(cap.pdus) != 1 {
-		t.Fatalf("captured %d PDUs, want exactly 1", len(cap.pdus))
+	if len(capture.pdus) != 1 {
+		t.Fatalf("captured %d PDUs, want exactly 1", len(capture.pdus))
 	}
-	return decodeRecords(t, cap)[0]
+	return decodeRecords(t, capture)[0]
 }
 
 // unsuccessfulSM is decodeOne for an SMFUnsuccessfulProcedure, failing on any other record.
-func unsuccessfulSM(t *testing.T, cap *captureSender) wireRecord {
+func unsuccessfulSM(t *testing.T, capture *captureSender) wireRecord {
 	t.Helper()
-	rec := decodeOne(t, cap)
+	rec := decodeOne(t, capture)
 	if rec.event != eventUnsuccessfulSMProcedure {
 		t.Fatalf("delivered XIRIEvent [%d], want unsuccessfulSMProcedure [%d]", rec.event, eventUnsuccessfulSMProcedure)
 	}
@@ -974,12 +974,12 @@ func unsuccessfulSM(t *testing.T, cap *captureSender) wireRecord {
 // sixteen establishment paths: a refused session for a tasked target produces a
 // record naming the procedure, the cause and the initiator.
 func TestUnsuccessfulProcedureReportsRefusedEstablishment(t *testing.T) {
-	cap := &captureSender{}
-	activateIRISub(t, cap, iriTask())
+	capture := &captureSender{}
+	activateIRISub(t, capture, iriTask())
 
 	ReportEstablishmentReject(targetSM(), nasMessage.Cause5GSMInsufficientResources)
 
-	rec := unsuccessfulSM(t, cap)
+	rec := unsuccessfulSM(t, capture)
 	if got := integer(t, rec.member(t, 1)); got != int64(iri.SMFFailedPDUSessionEstablishment) {
 		t.Errorf("failedProcedureType = %d, want pDUSessionEstablishment(1)", got)
 	}
@@ -997,12 +997,12 @@ func TestUnsuccessfulProcedureReportsRefusedEstablishment(t *testing.T) {
 // TestUnsuccessfulProcedureReportsRefusedRelease covers the other three sites:
 // same record, different procedure.
 func TestUnsuccessfulProcedureReportsRefusedRelease(t *testing.T) {
-	cap := &captureSender{}
-	activateIRISub(t, cap, iriTask())
+	capture := &captureSender{}
+	activateIRISub(t, capture, iriTask())
 
 	ReportReleaseReject(targetSM(), nasMessage.Cause5GSMRequestRejectedUnspecified)
 
-	rec := unsuccessfulSM(t, cap)
+	rec := unsuccessfulSM(t, capture)
 	if got := integer(t, rec.member(t, 1)); got != int64(iri.SMFFailedPDUSessionRelease) {
 		t.Errorf("failedProcedureType = %d, want pDUSessionRelease(3)", got)
 	}
@@ -1015,20 +1015,20 @@ func TestUnsuccessfulProcedureReportsRefusedRelease(t *testing.T) {
 // and the one that matters for undetectability: a refusal for someone who is not
 // under warrant must produce nothing at all.
 func TestUnsuccessfulProcedureSilentForUntaskedSubscriber(t *testing.T) {
-	cap := &captureSender{}
-	activateIRISub(t, cap, types.InterceptTask{
+	capture := &captureSender{}
+	activateIRISub(t, capture, types.InterceptTask{
 		XID:        "aaaaaaaa-0000-0000-0000-000000000009",
 		Targets:    []types.TargetIdentifier{{Type: types.TargetSUPI, Value: "999999999999999"}},
 		Products:   []types.ProductType{types.ProductIRI},
-		Deliveries: []types.DeliveryEndpoint{{Type: types.DeliveryX2, Address: "10.0.60.122:42069"}},
+		Deliveries: []types.DeliveryEndpoint{{Type: types.DeliveryX2, Address: testDestinationAddr}},
 		State:      types.TaskActive,
 	})
 
 	ReportEstablishmentReject(targetSM(), nasMessage.Cause5GSMInsufficientResources)
 	ReportReleaseReject(targetSM(), nasMessage.Cause5GSMRequestRejectedUnspecified)
 
-	if len(cap.pdus) != 0 {
-		t.Errorf("an untasked subscriber's refusal produced %d PDU(s)", len(cap.pdus))
+	if len(capture.pdus) != 0 {
+		t.Errorf("an untasked subscriber's refusal produced %d PDU(s)", len(capture.pdus))
 	}
 }
 
@@ -1080,12 +1080,12 @@ func TestUnsuccessfulProcedureCauseMatchesTheReject(t *testing.T) {
 			if !ok {
 				t.Fatalf("%s is not in smferrors.ErrorCause — the mapping this test guards has moved", key)
 			}
-			cap := &captureSender{}
-			activateIRISub(t, cap, iriTask())
+			capture := &captureSender{}
+			activateIRISub(t, capture, iriTask())
 
 			ReportEstablishmentReject(targetSM(), want)
 
-			if got := integer(t, unsuccessfulSM(t, cap).member(t, 2)); got != int64(want) {
+			if got := integer(t, unsuccessfulSM(t, capture).member(t, 2)); got != int64(want) {
 				t.Errorf("failureCause = %d, want %d (the value the reject carries)", got, want)
 			}
 		})
@@ -1108,7 +1108,7 @@ func TestUnsuccessfulProcedureCauseMatchesTheReject(t *testing.T) {
 // the subscriber's service depends on is the IE actually being in the message.
 func TestApplyCCDuringEstablishmentKeepsCreateFAR(t *testing.T) {
 	task := types.InterceptTask{
-		XID:      "task-cc",
+		XID:      testTaskCC,
 		Targets:  []types.TargetIdentifier{{Type: types.TargetSUPI, Value: "262019876543210"}},
 		Products: []types.ProductType{types.ProductIRI, types.ProductCC},
 		State:    types.TaskActive,
@@ -1186,19 +1186,19 @@ func establishingSession(t *testing.T, far *smfctx.FAR) *smfctx.SMContext {
 		t.Cleanup(func() { factory.SmfConfig.Configuration = nil })
 	}
 
-	sc := smfctx.NewSMContext("imsi-262019876543210", 5)
+	sc := smfctx.NewSMContext(testSUPI, 5)
 	t.Cleanup(func() { smfctx.RemoveSMContext(sc.Ref) })
 	// No PDUAddress: releasing the context returns the address to a pool these
 	// tests do not build, and nothing here matches on it — the task targets SUPI.
-	sc.Supi = "imsi-262019876543210"
+	sc.Supi = testSUPI
 
 	node := smfctx.NewDataPathNode()
 	node.UpLinkTunnel.PDR["default"] = &smfctx.PDR{FAR: far}
-	node.UPF = &smfctx.UPF{NodeID: *smfctx.NewNodeID("10.0.1.5")}
+	node.UPF = &smfctx.UPF{NodeID: *smfctx.NewNodeID(trigNodeA)}
 	sc.Tunnel = &smfctx.UPTunnel{DataPathPool: smfctx.DataPathPool{
 		1: &smfctx.DataPath{FirstDPNode: node, IsDefaultPath: true},
 	}}
-	sc.PFCPContext = map[string]*smfctx.PFCPSessionContext{"10.0.1.5": {}}
+	sc.PFCPContext = map[string]*smfctx.PFCPSessionContext{trigNodeA: {}}
 
 	return sc
 }
@@ -1206,7 +1206,7 @@ func establishingSession(t *testing.T, far *smfctx.FAR) *smfctx.SMContext {
 // establish assigns the F-SEID the UPF's response carries, which is what makes
 // the session exist as far as this element is concerned.
 func establish(sc *smfctx.SMContext, seid uint64) {
-	sc.PFCPContext["10.0.1.5"].RemoteSEID = seid
+	sc.PFCPContext[trigNodeA].RemoteSEID = seid
 }
 
 // TestWarrantActivatingDuringEstablishmentIsAppliedOnArrival covers the window
@@ -1234,7 +1234,7 @@ func TestWarrantActivatingDuringEstablishmentIsAppliedOnArrival(t *testing.T) {
 
 	// The warrant arrives while the session is mid-establishment.
 	task := types.InterceptTask{
-		XID:      "task-cc",
+		XID:      testTaskCC,
 		Targets:  []types.TargetIdentifier{{Type: types.TargetSUPI, Value: "262019876543210"}},
 		Products: []types.ProductType{types.ProductCC},
 		State:    types.TaskActive,
@@ -1297,7 +1297,7 @@ func TestEstablishmentReapplyIsSilentWhenNothingChanged(t *testing.T) {
 
 	st := store.New()
 	if !st.Activate(types.InterceptTask{
-		XID:      "task-cc",
+		XID:      testTaskCC,
 		Targets:  []types.TargetIdentifier{{Type: types.TargetSUPI, Value: "262019876543210"}},
 		Products: []types.ProductType{types.ProductCC},
 		State:    types.TaskActive,
@@ -1340,7 +1340,7 @@ func TestConcurrentEstablishmentAndTasking(t *testing.T) {
 	t.Cleanup(func() { active.Store(nil) })
 
 	task := types.InterceptTask{
-		XID:      "task-cc",
+		XID:      testTaskCC,
 		Targets:  []types.TargetIdentifier{{Type: types.TargetSUPI, Value: "262019876543210"}},
 		Products: []types.ProductType{types.ProductCC},
 		State:    types.TaskActive,

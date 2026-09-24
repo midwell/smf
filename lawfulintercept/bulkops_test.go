@@ -79,7 +79,7 @@ func bulkRequest(msgType, admfID, neID string) []byte {
 // arriving as nothing, and the failure it must not introduce is an unstated value arriving
 // as something.
 func TestBulkDeactivationFollowsConfiguration(t *testing.T) {
-	const admfID, neID = "admf-1", "smf-1"
+	const admfID, neID = testADMFID, testNEID
 	no := false
 
 	cases := []struct {
@@ -95,7 +95,7 @@ func TestBulkDeactivationFollowsConfiguration(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			st := store.New()
 			st.Activate(types.InterceptTask{
-				XID:      "11111111-1111-4111-8111-111111111111",
+				XID:      testXIDPrimary,
 				Targets:  []types.TargetIdentifier{{Type: types.TargetSUPI, Value: "262019876543210"}},
 				Products: []types.ProductType{types.ProductIRI},
 			})
@@ -150,7 +150,7 @@ func TestBulkDeactivationFollowsConfiguration(t *testing.T) {
 // call is shaped to invite — behaves correctly for bulk deactivation and ignores the
 // operator entirely for bulk removal, and every other test here passes.
 func TestBulkRemovalFollowsConfiguration(t *testing.T) {
-	const admfID, neID = "admf-1", "smf-1"
+	const admfID, neID = testADMFID, testNEID
 	yes := true
 
 	cases := []struct {

@@ -80,16 +80,16 @@ func scanFixture(t *testing.T, task types.InterceptTask, sessions int) (*subsyst
 
 			return snd
 		},
-		mdf2: "10.0.60.122:42069",
-		neID: "smf-1",
-		ids:  x2x3.NewIdentity("smf-1", smfInterceptionPoint),
+		mdf2: testDestinationAddr,
+		neID: testNEID,
+		ids:  x2x3.NewIdentity(testNEID, smfInterceptionPoint),
 	}
 	active.Store(sub)
 	t.Cleanup(func() { active.Store(nil) })
 	waitForScans(t, sub)
 
 	for i := range sessions {
-		sc := pooledSession(t, "imsi-262019876543210", int32(i+1))
+		sc := pooledSession(t, testSUPI, int32(i+1))
 		// The two things the record and the scan each refuse to proceed without: an
 		// endpoint address, because a record asserting the session has none would be
 		// untrue, and a PFCP session, because its SEID is the correlation the mediation
@@ -119,7 +119,7 @@ func scanFixture(t *testing.T, task types.InterceptTask, sessions int) (*subsyst
 		// carries is that UPF's PFCP session id, and a session without one is deferred
 		// by the scan as still establishing rather than reported.
 		node := smfctx.NewDataPathNode()
-		node.UPF = &smfctx.UPF{NodeID: upfNode("10.0.1.5")}
+		node.UPF = &smfctx.UPF{NodeID: upfNode(trigNodeA)}
 		// ApplyAction.Forw, because forEachForwardingFAR — which is what applies and
 		// clears duplication — only visits forwarding FARs. A FAR without it is
 		// invisible to every part of this path.
@@ -149,7 +149,7 @@ func scanFixture(t *testing.T, task types.InterceptTask, sessions int) (*subsyst
 // interception as ended, and records keep arriving.
 func TestAWithdrawalDuringAScanStopsTheRemainingRecords(t *testing.T) {
 	task := types.InterceptTask{
-		XID:      "11111111-1111-4111-8111-111111111111",
+		XID:      testXIDPrimary,
 		Targets:  []types.TargetIdentifier{{Type: types.TargetSUPI, Value: "262019876543210"}},
 		Products: []types.ProductType{types.ProductIRI},
 		State:    types.TaskActive,
@@ -180,12 +180,12 @@ func TestAWithdrawalDuringAScanStopsTheRemainingRecords(t *testing.T) {
 // that has retired one is product going somewhere it should not.
 func TestAScanDeliversToTheDestinationsTheTaskNowNames(t *testing.T) {
 	const (
-		before = "10.0.60.122:42069"
+		before = testDestinationAddr
 		after  = "10.0.60.123:42069"
 	)
 
 	task := types.InterceptTask{
-		XID:      "11111111-1111-4111-8111-111111111111",
+		XID:      testXIDPrimary,
 		Targets:  []types.TargetIdentifier{{Type: types.TargetSUPI, Value: "262019876543210"}},
 		Products: []types.ProductType{types.ProductIRI},
 		State:    types.TaskActive,
@@ -244,11 +244,11 @@ func TestAModificationThatAddsIRIBeginsIt(t *testing.T) {
 		{
 			name: "a product added, targets unchanged",
 			prev: types.InterceptTask{
-				XID: "11111111-1111-4111-8111-111111111111", Targets: targets,
+				XID: testXIDPrimary, Targets: targets,
 				Products: []types.ProductType{types.ProductCC}, State: types.TaskActive,
 			},
 			next: types.InterceptTask{
-				XID: "11111111-1111-4111-8111-111111111111", Targets: targets,
+				XID: testXIDPrimary, Targets: targets,
 				Products: []types.ProductType{types.ProductCC, types.ProductIRI}, State: types.TaskActive,
 			},
 		},
@@ -257,12 +257,12 @@ func TestAModificationThatAddsIRIBeginsIt(t *testing.T) {
 			// coverage from the outside.
 			name: "targets changed",
 			prev: types.InterceptTask{
-				XID:      "11111111-1111-4111-8111-111111111111",
+				XID:      testXIDPrimary,
 				Targets:  []types.TargetIdentifier{{Type: types.TargetSUPI, Value: "262010000000000"}},
 				Products: []types.ProductType{types.ProductCC, types.ProductIRI}, State: types.TaskActive,
 			},
 			next: types.InterceptTask{
-				XID: "11111111-1111-4111-8111-111111111111", Targets: targets,
+				XID: testXIDPrimary, Targets: targets,
 				Products: []types.ProductType{types.ProductCC, types.ProductIRI}, State: types.TaskActive,
 			},
 		},
@@ -305,7 +305,7 @@ func TestAModificationThatAddsIRIBeginsIt(t *testing.T) {
 // duplicating once the warrant is withdrawn" and it did not.
 func TestAWithdrawalStopsDuplicationEvenThoughTheTaskIsGone(t *testing.T) {
 	task := types.InterceptTask{
-		XID:      "11111111-1111-4111-8111-111111111111",
+		XID:      testXIDPrimary,
 		Targets:  []types.TargetIdentifier{{Type: types.TargetSUPI, Value: "262019876543210"}},
 		Products: []types.ProductType{types.ProductCC},
 		State:    types.TaskActive,
