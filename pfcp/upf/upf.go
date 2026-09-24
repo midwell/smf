@@ -61,11 +61,6 @@ func InitPfcpHeartbeatRequest() {
 				// Discarding them is the same conclusion the heartbeat mismatch and the
 				// re-association paths reach, by the route that reaches it first: a claim
 				// that cannot be true must not be treated as one.
-				//
-				// This does not restore the subscriber's sessions. Those are the upstream
-				// `// TODO: Session cleanup required` on the association paths, which is
-				// larger and separate; what is in scope is that the interception
-				// bookkeeping stops being the reason re-tasking cannot happen.
 				lawfulintercept.POIRestarted(upf.NodeID, upf.NodeID.ResolveNodeIdToIp().String())
 			}
 

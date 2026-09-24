@@ -1184,7 +1184,7 @@ func TriggerCC(sc *smfctx.SMContext) {
 
 // POIRestarted tells the CC Triggering Function that a triggered point of interception
 // has restarted, so the tasking this element believes it holds there is discarded and
-// subsequent establishments and scans re-install it. Silent no-op unless LI is configured.
+// subsequent establishments -- including restored ones -- and scans re-install it. Silent no-op unless LI is configured.
 //
 // **It takes the node identity and its address, not a pre-resolved string**, because the
 // registry has to be allowed to apply its own matching rule. Trigger keys carry
@@ -1200,10 +1200,14 @@ func TriggerCC(sc *smfctx.SMContext) {
 // resolves them to a configured key — identity first, then the refreshed address index —
 // which is the same rule the trigger path uses. ForgetPOI stays as the key-level primitive.
 //
-// **What this does not do is restore the subscriber's sessions.** Those are lost on the same
-// path, which is the pre-existing upstream `// TODO: Session cleanup required` beside each
-// caller and a larger problem than this one. What is in scope is that the interception
-// bookkeeping stops being the reason re-tasking cannot happen once that TODO is addressed.
+// **Restoring the subscriber's sessions is upstream's, not this function's.** It is raised on
+// two kinds of path: a detected restart, where the callers sit inside the same branch that
+// starts upstream's session restoration (OnRestart) and ahead of it; and a UPF that has
+// stopped answering, where nothing is restored until it comes back and re-associates. Either
+// way the next establishment on the POI -- a restored one included, since it is answered
+// through the ordinary response handler -- reaches TriggerCC with no stale claim, and the
+// tasking is re-installed. e2e-li section 34 asserts the restored case on the rig, and fails
+// with the restart-path calls removed.
 func POIRestarted(node smfctx.NodeID, addr string) {
 	sub := active.Load()
 	if sub == nil || sub.triggers == nil {
