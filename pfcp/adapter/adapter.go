@@ -511,10 +511,6 @@ func HandlePfcpSessionModificationResponse(msg *udp.Message) {
 
 	smContext := context.GetSMContextBySEID(SEID)
 	logger.PfcpLog.Infof("in HandlePfcpSessionModificationResponse smContext found by SEID %v", smContext)
-	if smContext == nil {
-		logger.PfcpLog.Warnf("PFCP Session Modification Response found SM context nil for SEID %d, response discarded", SEID)
-		return
-	}
 
 	// A modification this element sent for Lawful Interception, not one the session's
 	// own procedures sent — the same guard the native handler applies, on the path
@@ -539,6 +535,14 @@ func HandlePfcpSessionModificationResponse(msg *udp.Message) {
 	if req, ok := lisequence.Take(pfcpRsp.Sequence()); ok {
 		notifyLIModificationAnswered(req, causeValue, true)
 
+		return
+	}
+
+	// After the interception block, as in the native handler: that block answers a
+	// modification this element sent itself, keyed on the sequence number alone, and it must
+	// still run when the session has since been released.
+	if smContext == nil {
+		logger.PfcpLog.Warnf("PFCP Session Modification Response found SM context nil for SEID %d, response discarded", SEID)
 		return
 	}
 

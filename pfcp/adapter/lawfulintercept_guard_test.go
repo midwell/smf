@@ -104,3 +104,43 @@ func TestOrdinaryModificationResponseStillCompletesInAdapterMode(t *testing.T) {
 		t.Error("an ordinary modification's answer did not complete the session's procedure")
 	}
 }
+
+// TestLIAnswerSurvivesAReleasedSessionInAdapterMode is the native handler's
+// TestLIAnswerSurvivesAReleasedSession on the adapter path, which is the one a deployment
+// with enableUPFAdapter takes. A modification this element sent for interception is
+// answered on the sequence number alone, and it must still be answered when the session it
+// referred to has since been released: discarding it at the context lookup leaves a refused
+// activation never retried, or a refused withdrawal believed to have succeeded.
+func TestLIAnswerSurvivesAReleasedSessionInAdapterMode(t *testing.T) {
+	if factory.SmfConfig.Configuration == nil {
+		off := false
+		factory.SmfConfig.Configuration = &factory.Configuration{
+			KafkaInfo: factory.KafkaInfo{EnableKafka: &off},
+		}
+		t.Cleanup(func() { factory.SmfConfig.Configuration = nil })
+	}
+
+	const seq uint32 = 5253
+	req := lisequence.Request{SEID: 0xDEADBEEF, NodeID: "5.5.5.5", Duplicating: true}
+	lisequence.Mark(seq, req)
+
+	var gotReq lisequence.Request
+	var called bool
+
+	orig := adapter.LIModificationAnswered
+	adapter.LIModificationAnswered = func(r lisequence.Request, _ uint8, _ bool) {
+		gotReq, called = r, true
+	}
+	t.Cleanup(func() { adapter.LIModificationAnswered = orig })
+
+	// No SM context is registered for this SEID, so the lookup yields nil.
+	adapter.HandlePfcpSessionModificationResponse(modificationResponse(seq, 0xDEADBEEF))
+
+	if !called {
+		t.Fatal("the interception answer was not made for a released session; the nil guard " +
+			"is placed ahead of the interception block")
+	}
+	if gotReq.NodeID != req.NodeID || gotReq.Duplicating != req.Duplicating {
+		t.Errorf("answered with the wrong request: got %+v, want %+v", gotReq, req)
+	}
+}
