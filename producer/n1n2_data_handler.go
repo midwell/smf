@@ -164,6 +164,11 @@ func HandleUpdateN1Msg(txn *transaction.Transaction, response *models.UpdateSmCo
 			smContext.SubPduSessLog.Infof("PDUSessionSMContextUpdate, N1 Msg PDU Session Release Request received")
 			pduSessIDRelReq := int32(m.PDUSessionReleaseRequest.GetPDUSessionID())
 			smContext.SubPduSessLog.Debugln("PDU Session ID in Rel Req:", pduSessIDRelReq)
+			// Record the procedure transaction identity before the PDU session id is compared: the
+			// mismatch branch answers with a release reject built from the SM context but never
+			// reaches HandlePDUSessionReleaseRequest, which is otherwise the only place it is
+			// stored, so the reject would carry an identity the UE cannot match to its request.
+			smContext.Pti = m.PDUSessionReleaseRequest.GetPTI()
 			pduSessIDSmCxt := smContext.PDUSessionID
 			smContext.SubPduSessLog.Debugln("PDU Session ID in SM Context:", pduSessIDSmCxt)
 			if smContext.SMContextState != context.SmStateActive {
@@ -226,7 +231,7 @@ func HandleUpdateN1Msg(txn *transaction.Transaction, response *models.UpdateSmCo
 					} else {
 						response.SetBinaryDataN1SmMessage(tmpFile)
 						jsonData := response.GetJsonData()
-						jsonData.SetN1SmMsg(models.RefToBinaryData{ContentId: "PDUSessionReleaseReject"})
+						jsonData.SetN1SmMsg(models.RefToBinaryData{ContentId: context.PDU_SESS_REL_REJECT})
 						response.SetJsonData(jsonData)
 					}
 				}
@@ -242,11 +247,17 @@ func HandleUpdateN1Msg(txn *transaction.Transaction, response *models.UpdateSmCo
 			}
 			// Send Release Notify to AMF
 			smContext.SubPduSessLog.Infof("PDUSessionSMContextUpdate, send Update SmContext Response")
-			smContext.ChangeState(context.SmStateInit)
-			smContext.SubCtxLog.Debugln("PDUSessionSMContextUpdate, SMContextState Change State:", smContext.SMContextState.String())
 			jsonData := response.GetJsonData()
 			jsonData.SetUpCnxState(models.UPCNXSTATE_DEACTIVATED)
 			response.SetJsonData(jsonData)
+			// This is the UE's confirmation that the release procedure it started has completed
+			// (TS 23.502 clause 4.3.4), so the session is torn down here rather than left
+			// registered in SmStateInit forever: RemoveSMContextLocked both removes the pool/
+			// canonicalRef entries and publishes the terminal Kafka event via its own
+			// ChangeState(SmStateRelease). RemoveSMContextLocked, not RemoveSMContext, since
+			// HandlePDUSessionSMContextUpdate already holds smContext.SMLock and it is not
+			// reentrant.
+			context.RemoveSMContextLocked(smContext)
 			smContext.SubPduSessLog.Debugln("PDUSessionSMContextUpdate, sent SMContext Status Notification successfully")
 		}
 	} else {
@@ -611,10 +622,12 @@ func HandleUpdateN2Msg(txn *transaction.Transaction, response *models.UpdateSmCo
 			// this session, so it owes the release record and the withdrawal of the
 			// triggers it held — a trigger left installed here keeps the CC-TF
 			// keeping its POI alive, which is what disables that POI's fail-safe.
-			// Before RemoveSMContext, while the session can still be read. Silent
+			// Before RemoveSMContextLocked, while the session can still be read. Silent
 			// no-op unless LI is configured.
 			reportAndUntask(smContext)
-			context.RemoveSMContext(smContext.Ref)
+			// RemoveSMContextLocked, not RemoveSMContext, since HandlePDUSessionSMContextUpdate
+			// already holds smContext.SMLock and it is not reentrant.
+			context.RemoveSMContextLocked(smContext)
 			problemDetails, err := consumer.SendSMContextStatusNotification(smContext.SmStatusNotifyUri)
 			if problemDetails != nil || err != nil {
 				if problemDetails != nil {

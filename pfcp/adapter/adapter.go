@@ -231,15 +231,18 @@ func HandlePfcpAssociationSetupResponse(msg *udp.Message) {
 			logger.PfcpLog.Errorf("pfcp association setup response RecoveryTimeStamp error: %v", err)
 			return
 		}
-
-		// Lawful Interception: re-association is the common way a restart is discovered, and
-		// this is that path in adapter mode. Only one of the two handlers is active in a
-		// deployment, so a remedy in the native one alone is a remedy whose presence depends
-		// on enableUPFAdapter — which is exactly the asymmetry the lisequence guard already
-		// had to be fixed for. Compared before the overwrite, and only where it changed.
-		if restarted := !upf.RecoveryTimeStamp.RecoveryTimeStamp.IsZero() &&
-			upf.RecoveryTimeStamp.RecoveryTimeStamp != recoveryTimestamp; restarted {
+		// Compared before the overwrite below, for the same reason as on the native path: once the
+		// held value has been replaced the evidence of the restart is gone, and what remains is the
+		// state that hides it.
+		if upf.HasRestarted(recoveryTimestamp) {
+			logger.PfcpLog.Warnf("PFCP Association Setup Response, upf [%v] recovery timestamp changed", upf.NodeID)
+			// Lawful Interception: discard the trigger claims the restarted UPF no longer
+			// holds, as the native handler does. Only one of the two handlers is active in a
+			// deployment, so a remedy in the native one alone would depend on enableUPFAdapter.
 			notifyPOIRestarted(upf.NodeID, upf.NodeID.ResolveNodeIdToIp().String())
+			if context.OnRestart != nil {
+				context.OnRestart(upf.NodeID, recoveryTimestamp)
+			}
 		}
 
 		upf.RecoveryTimeStamp = context.RecoveryTimeStamp{
@@ -286,7 +289,7 @@ func HandlePfcpHeartbeatResponse(msg *udp.Message) {
 		return
 	}
 
-	if recoveryTimestamp != upf.RecoveryTimeStamp.RecoveryTimeStamp {
+	if upf.HasRestarted(recoveryTimestamp) {
 		// change UPF state to not associated so that
 		// PFCP Association can be initiated again
 		upf.UPFStatus = context.NotAssociated
@@ -296,13 +299,11 @@ func HandlePfcpHeartbeatResponse(msg *udp.Message) {
 		// restarted, so the LI_T3 triggers this element believes it installed there are gone
 		// with its memory — and keeping the claims makes the planning path skip every triple
 		// as claimed, so nothing re-installs.
-		//
-		// This does not address the TODO below and is not a step toward it: the subscriber's
-		// PFCP sessions are lost on this path too, which is larger and separate.
 		notifyPOIRestarted(upf.NodeID, upf.NodeID.ResolveNodeIdToIp().String())
 
-		// TODO: Session cleanup required and updated to AMF/PCF
-		// metrics.IncrementN4MsgStats(context.SMF_Self().NfInstanceID, pfcpmsgtypes.PfcpMsgTypeString(msg.PfcpMessage.Header.MessageType), "In", "Failure", "RecoveryTimeStamp_mismatch")
+		if context.OnRestart != nil {
+			context.OnRestart(upf.NodeID, recoveryTimestamp)
+		}
 	}
 
 	upf.NHeartBeat = 0 // reset Heartbeat attempt to 0
@@ -423,6 +424,10 @@ func HandlePfcpSessionEstablishmentResponse(msg *udp.Message) {
 			logger.PfcpLog.Errorf("pfcp session establishment response cause error: %v", err)
 			return
 		}
+		// Gated on the state, like the modification and release handlers. Restoration issues an
+		// establishment without waiting on this channel, so an unconditional send here would leave a
+		// stale value for whichever unrelated modification or release next waits on it.
+		awaited := smContext.SMContextState == context.SmStatePfcpCreatePending
 		// UPF Accept
 		if causeValue == ie.CauseRequestAccepted {
 			// Lawful Interception IRI-POI: the session now exists on the UPF, so its F-SEID
@@ -436,10 +441,14 @@ func HandlePfcpSessionEstablishmentResponse(msg *udp.Message) {
 			// join it to.
 			notifyReportEstablishment(smContext)
 
-			smContext.SBIPFCPCommunicationChan <- context.SessionEstablishSuccess
+			if awaited {
+				smContext.SBIPFCPCommunicationChan <- context.SessionEstablishSuccess
+			}
 			smContext.SubPfcpLog.Infof("PFCP Session Establishment accepted")
 		} else {
-			smContext.SBIPFCPCommunicationChan <- context.SessionEstablishFailed
+			if awaited {
+				smContext.SBIPFCPCommunicationChan <- context.SessionEstablishFailed
+			}
 			smContext.SubPfcpLog.Errorf("PFCP Session Establishment rejected with cause [%v]", causeValue)
 			if causeValue == ie.CauseNoEstablishedPFCPAssociation {
 				SetUpfInactive(*rspNodeID)

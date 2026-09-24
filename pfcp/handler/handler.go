@@ -138,7 +138,7 @@ func HandlePfcpHeartbeatResponse(msg *udp.Message) {
 		upf.RecoveryTimeStamp = smf_context.RecoveryTimeStamp{
 			RecoveryTimeStamp: rspRecoveryTimeStamp,
 		}
-	} else if rspRecoveryTimeStamp != upf.RecoveryTimeStamp.RecoveryTimeStamp {
+	} else if upf.HasRestarted(rspRecoveryTimeStamp) {
 		// change UPF state to not associated so that
 		// PFCP Association can be initiated again
 		upf.UPFStatus = smf_context.NotAssociated
@@ -152,14 +152,12 @@ func HandlePfcpHeartbeatResponse(msg *udp.Message) {
 		//
 		// The node identity travels with its address, because the registry is keyed by
 		// the configured node name and only the registry can match one to the other.
-		//
-		// This does not address the TODO below, and is not a step toward it: the
-		// subscriber's PFCP sessions are lost on this path too, which is larger and
-		// separate. What it does is stop the interception bookkeeping from being the
-		// reason re-tasking cannot happen once that TODO is addressed.
 		POIRestarted(upf.NodeID, upf.NodeID.ResolveNodeIdToIp().String())
 
-		// TODO: Session cleanup required and updated to AMF/PCF
+		if smf_context.OnRestart != nil {
+			smf_context.OnRestart(upf.NodeID, rspRecoveryTimeStamp)
+		}
+
 		metrics.IncrementN4MsgStats(smf_context.SMF_Self().NfInstanceID, rsp.MessageTypeName(), "In", "Failure", "RecoveryTimeStamp_mismatch")
 	}
 
@@ -254,23 +252,21 @@ func HandlePfcpAssociationSetupRequest(msg *udp.Message) {
 	upf.UpfLock.Lock()
 	defer upf.UpfLock.Unlock()
 
-	// Lawful Interception: **re-association is the common way a restart is discovered**, and
-	// it was the one path that overwrote the recovery timestamp without saying so. The
-	// heartbeat mismatch only fires for a UPF this element was still successfully
-	// heartbeating; a UPF that went away and came back re-associates, and until now that
-	// left every claim in the trigger registry pointing at a POI holding no tasking. The
-	// planning path then found each triple already claimed and installed nothing.
-	//
-	// Compared before the overwrite, and only where it changed: an association from a UPF
-	// whose timestamp is the one this element already held is a re-association without a
-	// restart, and discarding claims there would withdraw nothing and re-install everything
-	// for no reason.
-	//
-	// As at the heartbeat site, this does not address the TODO on that path: the subscriber's
-	// PFCP sessions are lost with the UPF's memory either way, which is larger and separate.
-	if restarted := !upf.RecoveryTimeStamp.RecoveryTimeStamp.IsZero() &&
-		upf.RecoveryTimeStamp.RecoveryTimeStamp != recoveryTimestamp; restarted {
+	// A UPF that restarted announces itself with this message, carrying a recovery timestamp
+	// it did not have before. That is the path a crash takes, because the node is back before
+	// its absence has been noticed. Compare before the overwrite below: afterwards the
+	// evidence of the restart is gone, and what replaces it is the state that hides it — a
+	// current timestamp, a healthy-looking association, and sessions reported as active that
+	// the UPF knows nothing about.
+	if upf.HasRestarted(recoveryTimestamp) {
+		logger.PfcpLog.Warnf("PFCP Association Setup Request, upf [%v] recovery timestamp changed, previous [%v], new [%v]",
+			upf.NodeID, upf.RecoveryTimeStamp.RecoveryTimeStamp, recoveryTimestamp)
+		// Lawful Interception: discard the trigger claims the restarted UPF no longer
+		// holds, as at the heartbeat site.
 		POIRestarted(upf.NodeID, upf.NodeID.ResolveNodeIdToIp().String())
+		if smf_context.OnRestart != nil {
+			smf_context.OnRestart(upf.NodeID, recoveryTimestamp)
+		}
 	}
 
 	upf.RecoveryTimeStamp = smf_context.RecoveryTimeStamp{
@@ -342,14 +338,18 @@ func HandlePfcpAssociationSetupResponse(msg *udp.Message) {
 			logger.PfcpLog.Errorf("failed to parse RecoveryTimeStamp: %+v", err)
 			return
 		}
-
-		// Lawful Interception: the other half of re-association — this element initiated it,
-		// which is what ProbeInactiveUpfs does for every UPF it has marked NotAssociated. See
-		// the request handler above for why this path matters and why the comparison is made
-		// before the overwrite.
-		if restarted := !upf.RecoveryTimeStamp.RecoveryTimeStamp.IsZero() &&
-			upf.RecoveryTimeStamp.RecoveryTimeStamp != recoveryTimestamp; restarted {
+		// The other half of re-association: ProbeInactiveUpfs initiated this one for a UPF it
+		// had marked NotAssociated, and the response is where a restart becomes visible on
+		// that path. Compared before the overwrite, for the reason given in the request
+		// handler above.
+		if upf.HasRestarted(recoveryTimestamp) {
+			logger.PfcpLog.Warnf("PFCP Association Setup Response, upf [%v] recovery timestamp changed, previous [%v], new [%v]",
+				upf.NodeID, upf.RecoveryTimeStamp.RecoveryTimeStamp, recoveryTimestamp)
+			// Lawful Interception: as in the request handler above.
 			POIRestarted(upf.NodeID, upf.NodeID.ResolveNodeIdToIp().String())
+			if smf_context.OnRestart != nil {
+				smf_context.OnRestart(upf.NodeID, recoveryTimestamp)
+			}
 		}
 
 		upf.RecoveryTimeStamp = smf_context.RecoveryTimeStamp{
@@ -616,6 +616,10 @@ func HandlePfcpSessionEstablishmentResponse(msg *udp.Message) {
 			logger.PfcpLog.Errorf("failed to parse Cause IE: %+v", err)
 			return
 		}
+		// Gated on the state, like the modification and release handlers below. Restoration issues
+		// an establishment without waiting on this channel, so an unconditional send here would leave
+		// a stale value for whichever unrelated modification or release next waits on it.
+		awaited := smContext.SMContextState == smf_context.SmStatePfcpCreatePending
 		if causeValue == ie.CauseRequestAccepted {
 			// Lawful Interception IRI-POI: the session now exists on the UPF, so its
 			// F-SEID (the X2 correlation identifier) and F-TEID are known — both were
@@ -630,10 +634,14 @@ func HandlePfcpSessionEstablishmentResponse(msg *udp.Message) {
 			// describing the session with nothing to join it to.
 			lawfulintercept.ReportEstablishment(smContext)
 
-			smContext.SBIPFCPCommunicationChan <- smf_context.SessionEstablishSuccess
+			if awaited {
+				smContext.SBIPFCPCommunicationChan <- smf_context.SessionEstablishSuccess
+			}
 			smContext.SubPfcpLog.Infoln("PFCP Session Establishment accepted")
 		} else {
-			smContext.SBIPFCPCommunicationChan <- smf_context.SessionEstablishFailed
+			if awaited {
+				smContext.SBIPFCPCommunicationChan <- smf_context.SessionEstablishFailed
+			}
 			smContext.SubPfcpLog.Errorf("PFCP Session Establishment rejected with cause [%v]", causeValue)
 			if causeValue == ie.CauseNoEstablishedPFCPAssociation {
 				SetUpfInactive(*rspNodeID, msg.PfcpMessage.MessageTypeName())
@@ -872,94 +880,105 @@ func HandlePfcpSessionReportRequest(msg *udp.Message) {
 	smContext.SMLock.Lock()
 	defer smContext.SMLock.Unlock()
 
-	if smContext.UpCnxState == models.UPCNXSTATE_DEACTIVATED {
-		if req.ReportType.HasDLDR() {
-			downlinkServiceInfo, err := req.DownlinkDataReport.DownlinkDataServiceInformation()
-			if err != nil {
-				logger.PfcpLog.Warnln("DownlinkDataServiceInformation not found in DownlinkDataReport")
-			}
-
-			if downlinkServiceInfo != nil {
-				smContext.SubPfcpLog.Warnln("PFCP Session Report Request DownlinkDataServiceInformation handling is not implemented")
-			}
-
-			n1n2Request := models.NewN1N2MessageTransferRequest()
-			defer util.CleanupMultipartTempFiles(n1n2Request)
-			cause = ie.CauseRequestRejected
-			pfcpSRflag.Drobu = true
-
-			// TS 23.502 4.2.3.3 3a. Send Namf_Communication_N1N2MessageTransfer Request, SMF->AMF
-			n2SmBuf, err := smf_context.BuildPDUSessionResourceSetupRequestTransfer(smContext)
-			if err != nil {
-				smContext.SubPduSessLog.Errorln("build PDU Session Resource Setup Request Transfer failed:", err)
-			} else {
-				tmpFile, fileErr := util.CreatePayloadTempFile(n2SmBuf)
-				if fileErr != nil {
-					smContext.SubPduSessLog.Errorf("failed to create temp file: %v", fileErr)
-				} else {
-					n1n2Request.SetBinaryDataN2Information(tmpFile)
-				}
-			}
-
-			if n1n2Request.GetBinaryDataN2Information() != nil {
-				// n1n2FailureTxfNotifURI to be added in n1n2 request transfer.
-				// It is used as path by AMF to send failure notification message towards SMF
-				n1n2FailureTxfNotifURI := "/nsmf-callback/sm-n1n2failnotify/"
-				n1n2FailureTxfNotifURI += smContext.Ref
-
-				n2InfoContent := models.NewN2InfoContent(models.RefToBinaryData{ContentId: "N2SmInformation"})
-				n2InfoContent.SetNgapIeType(models.NGAPIETYPE_PDU_RES_SETUP_REQ)
-				smInfo := models.NewN2SmInformation(smContext.PDUSessionID)
-				smInfo.SetN2InfoContent(*n2InfoContent)
-				if smContext.Snssai != nil {
-					smInfo.SetSNssai(*smContext.Snssai)
-				}
-				n2InfoContainer := models.NewN2InfoContainer(models.N2INFORMATIONCLASS_SM)
-				n2InfoContainer.SetSmInfo(*smInfo)
-
-				// Temporarily assign SMF itself, TODO: TS 23.502 4.2.3.3 5. Namf_Communication_N1N2TransferFailureNotification
-				jsonData := models.NewN1N2MessageTransferReqData()
-				jsonData.SetPduSessionId(smContext.PDUSessionID)
-				jsonData.SetSkipInd(false)
-				jsonData.SetN1n2FailureTxfNotifURI(fmt.Sprintf("%s://%s:%d%s",
-					smf_context.SMF_Self().URIScheme,
-					smf_context.SMF_Self().RegisterIPv4,
-					smf_context.SMF_Self().SBIPort,
-					n1n2FailureTxfNotifURI))
-				jsonData.SetN2InfoContainer(*n2InfoContainer)
-				n1n2Request.SetJsonData(*jsonData)
-
-				rspData, n1n2Err := consumer.SendN1N2TransferWithRediscovery(context.Background(), smContext, n1n2Request)
-				if n1n2Err != nil {
-					smContext.SubPfcpLog.Warnf("send N1N2Transfer failed: %v", n1n2Err)
-				}
-				if n1n2Err == nil && rspData != nil && rspData.GetCause() == models.N1N2MESSAGETRANSFERCAUSE_ATTEMPTING_TO_REACH_UE {
-					smContext.SubPfcpLog.Infof("receive %v, AMF is able to page the UE", rspData.GetCause())
-
-					pfcpSRflag.Drobu = false
-					cause = ie.CauseRequestAccepted
-				}
-				if n1n2Err == nil && rspData != nil && rspData.GetCause() == models.N1N2MESSAGETRANSFERCAUSE_UE_NOT_RESPONDING {
-					smContext.SubPfcpLog.Infof("receive %v, UE is not responding to N1N2 transfer message", rspData.GetCause())
-					// TODO: TS 23.502 4.2.3.3 3c. Failure indication
-				}
-			} else {
-				smContext.SubPfcpLog.Warnln("skipping N1N2 transfer because N2 SM information is unavailable")
-			}
-
-			// Sending Session Report Response to UPF.
-			smContext.SubPfcpLog.Infof("sending Session Report to UPF with Cause %v", cause)
-			err = pfcp_message.SendPfcpSessionReportResponse(msg.RemoteAddr, cause, pfcpSRflag, seqFromUPF, SEID)
-			if err != nil {
-				logger.PfcpLog.Errorf("failed to send PFCP Session Report Response: %+v", err)
-			}
-		}
+	// Answer under the SEID the user plane assigned, not the one it addressed us by.
+	// See SMContext.RemoteSEIDByLocalSEID. The no-context branch above cannot do this --
+	// with no context there is nothing to look the value up in -- so it still echoes.
+	responseSEID := SEID
+	if remoteSEID, found := smContext.RemoteSEIDByLocalSEID(SEID); found {
+		responseSEID = remoteSEID
+	} else {
+		smContext.SubPfcpLog.Warnf("no PFCP context for local SEID[%d], answering the report under it", SEID)
 	}
 
-	// TS 23.502 4.2.3.3 2b. Send Data Notification Ack, SMF->UPF
-	//	cause.CauseValue = ie.CauseRequestAccepted
-	// TODO fix: SEID should be the value sent by UPF but now the SEID value is from sm context
-	// pfcp_message.SendPfcpSessionReportResponse(msg.RemoteAddr, cause, seqFromUPF, SEID)
+	// Default to a rejection carrying DROBU: any path that cannot act on this report
+	// still answers it. TS 29.244 expects a response to every request, and silence left
+	// the UPF retransmitting into nothing while holding traffic it should have released.
+	cause = ie.CauseRequestRejected
+	pfcpSRflag.Drobu = true
+
+	if smContext.UpCnxState == models.UPCNXSTATE_DEACTIVATED && req.ReportType.HasDLDR() {
+		downlinkServiceInfo, err := req.DownlinkDataReport.DownlinkDataServiceInformation()
+		if err != nil {
+			logger.PfcpLog.Warnln("DownlinkDataServiceInformation not found in DownlinkDataReport")
+		}
+
+		if downlinkServiceInfo != nil {
+			smContext.SubPfcpLog.Warnln("PFCP Session Report Request DownlinkDataServiceInformation handling is not implemented")
+		}
+
+		n1n2Request := models.NewN1N2MessageTransferRequest()
+		defer util.CleanupMultipartTempFiles(n1n2Request)
+
+		// TS 23.502 4.2.3.3 3a. Send Namf_Communication_N1N2MessageTransfer Request, SMF->AMF
+		n2SmBuf, err := smf_context.BuildPDUSessionResourceSetupRequestTransfer(smContext)
+		if err != nil {
+			smContext.SubPduSessLog.Errorln("build PDU Session Resource Setup Request Transfer failed:", err)
+		} else {
+			tmpFile, fileErr := util.CreatePayloadTempFile(n2SmBuf)
+			if fileErr != nil {
+				smContext.SubPduSessLog.Errorf("failed to create temp file: %v", fileErr)
+			} else {
+				n1n2Request.SetBinaryDataN2Information(tmpFile)
+			}
+		}
+
+		if n1n2Request.GetBinaryDataN2Information() != nil {
+			// n1n2FailureTxfNotifURI to be added in n1n2 request transfer.
+			// It is used as path by AMF to send failure notification message towards SMF
+			n1n2FailureTxfNotifURI := "/nsmf-callback/sm-n1n2failnotify/"
+			n1n2FailureTxfNotifURI += smContext.Ref
+
+			n2InfoContent := models.NewN2InfoContent(models.RefToBinaryData{ContentId: "N2SmInformation"})
+			n2InfoContent.SetNgapIeType(models.NGAPIETYPE_PDU_RES_SETUP_REQ)
+			smInfo := models.NewN2SmInformation(smContext.PDUSessionID)
+			smInfo.SetN2InfoContent(*n2InfoContent)
+			if smContext.Snssai != nil {
+				smInfo.SetSNssai(*smContext.Snssai)
+			}
+			n2InfoContainer := models.NewN2InfoContainer(models.N2INFORMATIONCLASS_SM)
+			n2InfoContainer.SetSmInfo(*smInfo)
+
+			// Temporarily assign SMF itself, TODO: TS 23.502 4.2.3.3 5. Namf_Communication_N1N2TransferFailureNotification
+			jsonData := models.NewN1N2MessageTransferReqData()
+			jsonData.SetPduSessionId(smContext.PDUSessionID)
+			jsonData.SetSkipInd(false)
+			jsonData.SetN1n2FailureTxfNotifURI(fmt.Sprintf("%s://%s:%d%s",
+				smf_context.SMF_Self().URIScheme,
+				smf_context.SMF_Self().RegisterIPv4,
+				smf_context.SMF_Self().SBIPort,
+				n1n2FailureTxfNotifURI))
+			jsonData.SetN2InfoContainer(*n2InfoContainer)
+			n1n2Request.SetJsonData(*jsonData)
+
+			rspData, n1n2Err := consumer.SendN1N2TransferWithRediscovery(context.Background(), smContext, n1n2Request)
+			if n1n2Err != nil {
+				smContext.SubPfcpLog.Warnf("send N1N2Transfer failed: %v", n1n2Err)
+			}
+			if n1n2Err == nil && rspData != nil && rspData.GetCause() == models.N1N2MESSAGETRANSFERCAUSE_ATTEMPTING_TO_REACH_UE {
+				smContext.SubPfcpLog.Infof("receive %v, AMF is able to page the UE", rspData.GetCause())
+
+				pfcpSRflag.Drobu = false
+				cause = ie.CauseRequestAccepted
+			}
+			if n1n2Err == nil && rspData != nil && rspData.GetCause() == models.N1N2MESSAGETRANSFERCAUSE_UE_NOT_RESPONDING {
+				smContext.SubPfcpLog.Infof("receive %v, UE is not responding to N1N2 transfer message", rspData.GetCause())
+				// TODO: TS 23.502 4.2.3.3 3c. Failure indication
+			}
+		} else {
+			smContext.SubPfcpLog.Warnln("skipping N1N2 transfer because N2 SM information is unavailable")
+		}
+	} else {
+		smContext.SubPfcpLog.Warnf("session report not actionable: UP connection state %v, report type %v",
+			smContext.UpCnxState, req.ReportType)
+	}
+
+	// TS 23.502 4.2.3.3 2b. Data Notification Ack, SMF->UPF. Sent on every path: the
+	// cause says whether the report was acted on, and a peer can interpret a cause.
+	smContext.SubPfcpLog.Infof("sending Session Report to UPF with Cause %v", cause)
+
+	if err := pfcp_message.SendPfcpSessionReportResponse(msg.RemoteAddr, cause, pfcpSRflag, seqFromUPF, responseSEID); err != nil {
+		logger.PfcpLog.Errorf("failed to send PFCP Session Report Response: %+v", err)
+	}
 }
 
 func HandlePfcpSessionReportResponse(msg *udp.Message) {

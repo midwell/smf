@@ -92,6 +92,10 @@ func TestHandlePfcpAssociationSetupResponse(t *testing.T) {
 	}
 	upNodeID := context.NewNodeID("1.1.1.1")
 	upf := context.NewUPF(upNodeID, nil)
+	// Left in the package-level UPF pool, a repeated -count run would accumulate a second entry
+	// under the same NodeID, and which one RetrieveUPFNodeByNodeID's map-ordered Range returns is
+	// then nondeterministic between iterations.
+	t.Cleanup(func() { context.RemoveUPFNodeByNodeID(*upNodeID) })
 	SnssaiInfos := make([]context.SnssaiUPFInfo, 0)
 	snssaiInfo := context.SnssaiUPFInfo{
 		DnnList: []context.DnnUPFInfoItem{
@@ -168,13 +172,28 @@ func TestHandlePfcpSessionEstablishmentResponse(t *testing.T) {
 		},
 	}
 	smContext.AllocateLocalSEIDForDataPath(datapath)
-	pfcp_message.InsertPfcpTxn(1, nodeID)
+
+	// AllocateLocalSEID draws from a package-level counter shared by every test in the binary, so
+	// the value it hands out here is not reliably 1 once other tests have run before it (as under
+	// go test -count=N, which reruns the whole binary's tests in the same process). Read back
+	// whatever it actually allocated instead of assuming it.
+	var localSEID uint64
+	for _, pfcpCtx := range smContext.PFCPContext {
+		if pfcpCtx.LocalSEID != 0 {
+			localSEID = pfcpCtx.LocalSEID
+		}
+	}
+	if localSEID == 0 {
+		t.Fatal("failed to allocate a local SEID for the test SMContext")
+	}
+	seq := uint32(localSEID)
+	pfcp_message.InsertPfcpTxn(seq, nodeID)
 
 	rsp := message.NewSessionEstablishmentResponse(
 		0,
 		0,
-		1,
-		1,
+		localSEID,
+		seq,
 		0,
 		ie.NewCause(ie.CauseRequestAccepted),
 		ie.NewNodeID("1.1.1.1", "", ""),
@@ -385,5 +404,169 @@ func TestOrdinaryModificationResponseStillCompletes(t *testing.T) {
 		}
 	default:
 		t.Error("an ordinary modification response did not complete the session's procedure")
+	}
+}
+
+// TestHandlePfcpSessionEstablishmentResponseChannelGatedByState covers the SMContextState gate on
+// SBIPFCPCommunicationChan: the normal establishment path waits in SmStatePfcpCreatePending and
+// must receive the signal, while restoration's reissue leaves the context in some other state and
+// must not receive it (an unconditional send would leave a stale value for the next unrelated
+// modification or release that waits on the channel).
+func TestHandlePfcpSessionEstablishmentResponseChannelGatedByState(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		imsi       string
+		state      context.SMContextState
+		wantSignal bool
+	}{
+		{
+			name:       "awaited establishment sends the signal",
+			imsi:       "imsi-100000000000001",
+			state:      context.SmStatePfcpCreatePending,
+			wantSignal: true,
+		},
+		{
+			name:       "unawaited response (e.g. restoration) withholds the signal",
+			imsi:       "imsi-100000000000002",
+			state:      context.SmStateActive,
+			wantSignal: false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// AllocateLocalSEID reads factory.SmfConfig.Configuration.EnableDbStore, so the config
+			// must be initialized for the SEID allocation path not to panic when this test runs in
+			// isolation.
+			if factory.SmfConfig.Configuration == nil {
+				factory.SmfConfig = factory.Config{
+					Configuration: &factory.Configuration{
+						KafkaInfo:        factory.KafkaInfo{EnableKafka: boolPointer(false)},
+						EnableUpfAdapter: false,
+					},
+				}
+			}
+
+			nodeID := context.NewNodeID("1.1.1.1")
+			smContext := context.NewSMContext(tc.imsi, 10)
+			smContext.SMContextState = tc.state
+
+			smContext.Tunnel = &context.UPTunnel{
+				DataPathPool: context.DataPathPool{
+					10: &context.DataPath{
+						IsDefaultPath: true,
+						FirstDPNode: &context.DataPathNode{
+							UPF: &context.UPF{NodeID: *nodeID},
+						},
+					},
+				},
+			}
+
+			datapath := &context.DataPath{
+				FirstDPNode: &context.DataPathNode{
+					UPF: &context.UPF{NodeID: *nodeID},
+				},
+			}
+			smContext.AllocateLocalSEIDForDataPath(datapath)
+
+			var localSEID uint64
+			for _, pfcpCtx := range smContext.PFCPContext {
+				if pfcpCtx.LocalSEID != 0 {
+					localSEID = pfcpCtx.LocalSEID
+				}
+			}
+			if localSEID == 0 {
+				t.Fatal("failed to allocate a local SEID for the test SMContext")
+			}
+
+			seq := uint32(localSEID)
+			pfcp_message.InsertPfcpTxn(seq, nodeID)
+
+			rsp := message.NewSessionEstablishmentResponse(
+				0,
+				0,
+				localSEID,
+				seq,
+				0,
+				ie.NewCause(ie.CauseRequestAccepted),
+				ie.NewNodeID("1.1.1.1", "", ""),
+				ie.NewRecoveryTimeStamp(time.Now()),
+			)
+
+			udpMessage := udp.Message{
+				RemoteAddr: &net.UDPAddr{
+					IP:   net.ParseIP("1.1.1.1"),
+					Port: 8809,
+				},
+				PfcpMessage: rsp,
+			}
+
+			handler.HandlePfcpSessionEstablishmentResponse(&udpMessage)
+
+			select {
+			case status := <-smContext.SBIPFCPCommunicationChan:
+				if !tc.wantSignal {
+					t.Errorf("expected no send to SBIPFCPCommunicationChan when SMContextState is %v, got signal %v", tc.state, status)
+				} else if status != context.SessionEstablishSuccess {
+					t.Errorf("expected SessionEstablishSuccess, got %v", status)
+				}
+			default:
+				if tc.wantSignal {
+					t.Error("expected a send to SBIPFCPCommunicationChan when SMContextState is SmStatePfcpCreatePending, got none")
+				}
+			}
+		})
+	}
+}
+
+// TestHandlePfcpSessionModificationResponseNoSMContext covers a Session
+// Modification Response that arrives after its session has been released, so
+// GetSMContextBySEID returns nil. Both the accepted and the rejected branch
+// dereference smContext unconditionally, and Dispatch runs each message on its
+// own goroutine with no recover, so an unguarded dereference here ends the
+// process rather than the request. The establishment and deletion handlers
+// already check; this one must too.
+func TestHandlePfcpSessionModificationResponseNoSMContext(t *testing.T) {
+	if factory.SmfConfig.Configuration == nil {
+		factory.SmfConfig = factory.Config{
+			Configuration: &factory.Configuration{
+				KafkaInfo:        factory.KafkaInfo{EnableKafka: boolPointer(false)},
+				EnableUpfAdapter: false,
+			},
+		}
+	}
+
+	// A SEID no session was ever registered under, so the lookup returns nil.
+	const unknownSEID uint64 = 0xDEADBEEF
+
+	cases := []struct {
+		name  string
+		cause uint8
+	}{
+		{"accepted", ie.CauseRequestAccepted},
+		{"rejected", ie.CauseRequestRejected},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rsp := message.NewSessionModificationResponse(
+				0, 0, unknownSEID, 1, 0,
+				ie.NewCause(tc.cause),
+			)
+
+			udpMessage := udp.Message{
+				RemoteAddr: &net.UDPAddr{
+					IP:   net.ParseIP("3.3.3.3"),
+					Port: 8805,
+				},
+				PfcpMessage: rsp,
+			}
+
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("handler panicked on a response for a released session: %v", r)
+				}
+			}()
+
+			handler.HandlePfcpSessionModificationResponse(&udpMessage)
+		})
 	}
 }

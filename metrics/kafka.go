@@ -49,6 +49,21 @@ func InitialiseKafkaStream(config *factory.Configuration) error {
 		AllowAutoTopicCreation: true,
 		Balancer:               &kafka.LeastBytes{},
 		BatchTimeout:           10 * time.Millisecond,
+		// Async keeps metric publishing off the request goroutine. Without it
+		// WriteMessages blocks the caller until the batch flushes (up to
+		// BatchTimeout), and PublishPduSessEvent is called inline from
+		// SMContext state changes — so every PDU-session transaction would pay
+		// a synchronous Kafka round trip. Metrics must never pace signalling.
+		Async: true,
+		// With Async, WriteMessages returns before the send completes, so
+		// delivery failures are not reported via its return value (it can
+		// still return pre-enqueue errors, e.g. a closed writer); they
+		// surface here instead.
+		Completion: func(msgs []kafka.Message, err error) {
+			if err != nil {
+				logger.KafkaLog.Errorf("kafka async delivery error for %d message(s): %v", len(msgs), err)
+			}
+		},
 	}
 
 	StatWriter = Writer{
@@ -91,31 +106,6 @@ func (writer Writer) PublishPduSessEvent(ctxt mi.CoreSubscriber, op mi.Subscribe
 		err := StatWriter.SendMessage(msg)
 		if err != nil {
 			logger.KafkaLog.Errorf("publishing pdu sess event error: %s", err.Error())
-		}
-	}
-	return nil
-}
-
-var nfInstanceId string
-
-// initialised by context package
-func SetNfInstanceId(s string) {
-	nfInstanceId = s
-}
-
-func PublishMsgEvent(msgType mi.SmfMsgType) error {
-	if !*factory.SmfConfig.Configuration.KafkaInfo.EnableKafka {
-		return nil
-	}
-	smKafkaMsgEvt := mi.MetricEvent{EventType: mi.CMsgTypeEvt, MsgType: mi.CoreMsgType{MsgType: msgType.String(), SourceNfId: nfInstanceId}}
-	if msg, err := json.Marshal(smKafkaMsgEvt); err != nil {
-		logger.KafkaLog.Errorf("publishing msg event marshal error: %s", err.Error())
-		return err
-	} else {
-		logger.KafkaLog.Debugf("publishing msg event: %s", string(msg))
-		err := StatWriter.SendMessage(msg)
-		if err != nil {
-			logger.KafkaLog.Errorf("publishing msg event error: %s", err.Error())
 		}
 	}
 	return nil

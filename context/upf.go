@@ -80,9 +80,13 @@ type UPF struct {
 	RecoveryTimeStamp RecoveryTimeStamp
 	NodeID            NodeID
 	UPFStatus         UPFStatus
-	uuid              uuid.UUID
-	Port              uint16
-	NHeartBeat        uint8
+	// AssociationSetupSentAt records when UPFStatus last became AssociatedSettingUp, so a
+	// lost or delayed response can be detected and the association retried instead of the
+	// UPF being stuck in that state forever.
+	AssociationSetupSentAt time.Time
+	uuid                   uuid.UUID
+	Port                   uint16
+	NHeartBeat             uint8
 
 	// lock
 	UpfLock sync.RWMutex
@@ -241,6 +245,54 @@ func NewUPF(nodeID *NodeID, ifaces []factory.InterfaceUpfInfoItem) (upf *UPF) {
 	}
 
 	return upf
+}
+
+// OnRestart is called when a UPF is observed to have restarted, with the node identity and the
+// recovery state that was observed.
+//
+// It is a hook rather than a direct call because the restoration lives in the producer package,
+// which reaches the PFCP adapter through pfcp/message; the adapter calling producer directly would
+// close that cycle. Both the native and the adapter datapath set it through this one variable so
+// that a restart is acted on the same way whichever of the two is in use.
+//
+// The recovery state is passed because several exchanges can carry the same restart -- a liveness
+// response and the re-association that follows it, seconds apart. It is what tells one restart from
+// the next; without it, a second observation cannot be distinguished from a node that has restarted
+// twice, and the two restorations displace each other.
+var OnRestart func(nodeID NodeID, recovery time.Time)
+
+// HasRestarted reports whether a recovery timestamp just received differs from the one already held
+// for this UPF, which is the only evidence that the UPF lost its state.
+//
+// A UPF that has merely stopped answering — a liveness timeout, an exhausted retry count, a
+// transition to NotAssociated — still holds every rule installed on it. Treating that as a restart
+// would re-install sessions over forwarding state that is working. A zero held value means this SMF
+// has not seen the UPF before, which is a first association rather than a restart.
+//
+// Compared at second granularity, and with Unix rather than !=. A PFCP recovery timestamp carries
+// whole seconds since the epoch and nothing finer, so anything below a second is not information
+// the peer sent. Comparing time.Time values with != also compares their monotonic reading and
+// location, which makes two timestamps describing the same second differ for reasons that have
+// nothing to do with the UPF.
+//
+// Which sites are restart evidence, and which are not, as of this change:
+//
+//	restart evidence -- a received recovery timestamp, compared before the held value is replaced
+//	  pfcp/handler/handler.go   heartbeat response, association setup request, association setup response
+//	  pfcp/adapter/adapter.go   heartbeat response, association setup response
+//
+//	NOT restart evidence -- the peer stopped answering, or this is a first association
+//	  pfcp/handler/handler.go   UPFStatus = NotAssociated on a heartbeat with no known UPF
+//	  pfcp/adapter/adapter.go   UPFStatus = NotAssociated on heartbeat failure
+//	  context/upf.go            UPFStatus = NotAssociated at construction
+//
+// Wiring restoration to the second group would re-install sessions on a node that never lost them.
+func (upf *UPF) HasRestarted(received time.Time) bool {
+	held := upf.RecoveryTimeStamp.RecoveryTimeStamp
+	if held.IsZero() {
+		return false
+	}
+	return received.Unix() != held.Unix()
 }
 
 // *** add unit test ***//
@@ -402,6 +454,15 @@ func (upf *UPF) qerID() (uint32, error) {
 func (upf *UPF) BuildCreatePdrFromPccRule(rule *models.PccRule) (*PDR, error) {
 	var pdr *PDR
 	var err error
+
+	// Flow information is optional in TS 29.512 table 5.6.2.6-1: a PCC rule may identify an
+	// application instead of a flow, and the PCF sends one with no flowInfos at all. Reading the
+	// first entry regardless took the SMF down while the tunnel was being built for such a rule.
+	// Refused before a PDR is allocated, so a rule this cannot describe costs no PDR ID and no
+	// FAR from the pools.
+	if len(rule.FlowInfos) == 0 {
+		return nil, fmt.Errorf("PCC rule %s carries no flow information", rule.PccRuleId)
+	}
 
 	// create empty PDR
 	if pdr, err = upf.AddPDR(); err != nil {

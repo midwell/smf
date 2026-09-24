@@ -159,6 +159,11 @@ func SendPfcpAssociationSetupRequest(upNodeID smf_context.NodeID, upfPort uint16
 			logger.PfcpLog.Errorf("send pfcp association msg to upf-adapter error [%v]", err.Error())
 			return err
 		} else {
+			defer func() {
+				if closeErr := rsp.Body.Close(); closeErr != nil {
+					logger.PfcpLog.Errorf("close response body failed: %v", closeErr)
+				}
+			}()
 			logger.PfcpLog.Debugf("send pfcp association response [%v]", rsp)
 			if rsp.StatusCode == http.StatusOK {
 				pfcpMsgBytes, err := io.ReadAll(rsp.Body)
@@ -263,6 +268,11 @@ func SendPfcpSessionEstablishmentRequest(
 			HandlePfcpSendError(pfcpMsg, err)
 			return err
 		} else {
+			defer func() {
+				if closeErr := rsp.Body.Close(); closeErr != nil {
+					logger.PfcpLog.Errorf("close response body failed: %v", closeErr)
+				}
+			}()
 			logger.PfcpLog.Debugf("send pfcp session establish response [%v]", rsp)
 			if rsp.StatusCode == http.StatusOK {
 				pfcpMsgBytes, err := io.ReadAll(rsp.Body)
@@ -407,6 +417,11 @@ func sendSessionModification(
 			logger.PfcpLog.Errorf("send pfcp session modify msg to upf-adapter error [%v]", err.Error())
 			return err
 		} else {
+			defer func() {
+				if closeErr := rsp.Body.Close(); closeErr != nil {
+					logger.PfcpLog.Errorf("close response body failed: %v", closeErr)
+				}
+			}()
 			logger.PfcpLog.Debugf("send pfcp session modify response [%v]", rsp)
 			if rsp.StatusCode == http.StatusOK {
 				pfcpMsgBytes, err := io.ReadAll(rsp.Body)
@@ -458,6 +473,11 @@ func SendPfcpSessionDeletionRequest(upNodeID smf_context.NodeID, ctx *smf_contex
 			logger.PfcpLog.Errorf("send pfcp session delete msg to upf-adapter error [%v]", err.Error())
 			return err
 		} else {
+			defer func() {
+				if closeErr := rsp.Body.Close(); closeErr != nil {
+					logger.PfcpLog.Errorf("close response body failed: %v", closeErr)
+				}
+			}()
 			logger.PfcpLog.Debugf("send pfcp session delete response [%v]", rsp)
 			if rsp.StatusCode == http.StatusOK {
 				pfcpMsgBytes, err := io.ReadAll(rsp.Body)

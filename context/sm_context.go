@@ -38,10 +38,11 @@ import (
 )
 
 const (
-	CONNECTED               = "Connected"
-	DISCONNECTED            = "Disconnected"
-	IDLE                    = "Idle"
-	PDU_SESS_REL_CMD string = "PDUSessionReleaseCommand"
+	CONNECTED                  = "Connected"
+	DISCONNECTED               = "Disconnected"
+	IDLE                       = "Idle"
+	PDU_SESS_REL_CMD    string = "PDUSessionReleaseCommand"
+	PDU_SESS_REL_REJECT string = "PDUSessionReleaseReject"
 )
 
 var (
@@ -72,13 +73,14 @@ func init() {
 }
 
 func incSMContextActive() uint64 {
-	atomic.AddUint64(&smContextActive, 1)
-	return smContextActive
+	// The add returns the new value. Reading the variable again is a plain load racing with every
+	// other caller's atomic store, and it can return a count from a different moment than the one
+	// this call produced.
+	return atomic.AddUint64(&smContextActive, 1)
 }
 
 func decSMContextActive() uint64 {
-	atomic.AddUint64(&smContextActive, ^uint64(0))
-	return smContextActive
+	return atomic.AddUint64(&smContextActive, ^uint64(0))
 }
 
 type UeIpAddr struct {
@@ -192,6 +194,22 @@ type SMContext struct {
 	// NAS
 	Pti                     uint8 `json:"pti,omitempty" yaml:"pti" bson:"pti,omitempty"` // ignore
 	EstAcceptCause5gSMValue uint8 `json:"estAcceptCause5gSMValue,omitempty" yaml:"estAcceptCause5gSMValue" bson:"estAcceptCause5gSMValue,omitempty"`
+
+	// activeIP, activeUpf and activeEnterprise are the ip/upf/enterprise labels the
+	// smf_pdu_session_profile series was published with on entering SmStateActive. Leaving
+	// Active must delete that exact series; re-deriving these labels at that later point can
+	// disagree with what was recorded on entry (e.g. the tunnel resolves differently, or
+	// PDUAddress.Ip has already been reset by ReleaseUeIpAddr) and leave the original series
+	// behind.
+	activeIP         string `json:"-" yaml:"-" bson:"-"`
+	activeUpf        string `json:"-" yaml:"-" bson:"-"`
+	activeEnterprise string `json:"-" yaml:"-" bson:"-"`
+
+	// lastUpfName and lastUpfIP are the UPF identity getSmCtxtUpf most recently resolved from
+	// the tunnel. releaseTunnel clears Tunnel before RemoveSMContext publishes the terminal
+	// disconnect event, so without this the final Kafka event would report an empty UPF.
+	lastUpfName string `json:"-" yaml:"-" bson:"-"`
+	lastUpfIP   string `json:"-" yaml:"-" bson:"-"`
 }
 
 func canonicalName(identifier string, pduSessID int32) (canonical string) {
@@ -214,8 +232,6 @@ func NewSMContext(identifier string, pduSessID int32) (smContext *SMContext) {
 	smContext = new(SMContext)
 	// Create Ref and identifier
 	smContext.Ref = uuid.New().URN()
-	smContextPool.Store(smContext.Ref, smContext)
-	canonicalRef.Store(canonicalName(identifier, pduSessID), smContext.Ref)
 
 	smContext.SMContextState = SmStateInit
 	smContext.Identifier = identifier
@@ -232,12 +248,21 @@ func NewSMContext(identifier string, pduSessID int32) (smContext *SMContext) {
 		DNSIPv6Request: false,
 	}
 
+	// initialise log tags
+	smContext.initLogTags()
+
+	// Published only once it is fully built, and this is the last thing built. Anything that finds
+	// the context -- by ref, by canonical name, or by ranging the pool -- would otherwise be able
+	// to observe one whose maps, channels or loggers have not been assigned yet: a data race on
+	// every field above, and a nil dereference on the Sub*Log fields, which every handler uses
+	// before it does anything else. Publishing after the maps but before initLogTags would close
+	// the first of those and leave the second.
+	smContextPool.Store(smContext.Ref, smContext)
+	canonicalRef.Store(canonicalName(identifier, pduSessID), smContext.Ref)
+
 	// Sess Stats
 	smContextActive := incSMContextActive()
 	metrics.SetSessStats(SMF_Self().NfInstanceID, smContextActive)
-
-	// initialise log tags
-	smContext.initLogTags()
 
 	return smContext
 }
@@ -253,44 +278,59 @@ func (smContext *SMContext) initLogTags() {
 }
 
 func (smContext *SMContext) ChangeState(nextState SMContextState) {
-	// Update Subscriber profile Metrics
-	if nextState == SmStateActive || smContext.SMContextState == SmStateActive {
-		var upf string
-		if smContext.Tunnel != nil {
-			// Set UPF FQDN name if provided else IP-address
-			if smContext.Tunnel.DataPathPool[1].FirstDPNode.UPF.NodeID.NodeIdType == NodeIdTypeFqdn {
-				upf = string(smContext.Tunnel.DataPathPool[1].FirstDPNode.UPF.NodeID.NodeIdValue)
-				upf = strings.Split(upf, ".")[0]
-			} else {
-				upf = smContext.Tunnel.DataPathPool[1].FirstDPNode.UPF.GetUPFIP()
-			}
-		}
-
-		// enterprise name
-		ent := "na"
-		if smfContext.EnterpriseList != nil {
-			entMap := *smfContext.EnterpriseList
-			smContext.SubCtxLog.Debugf("context state change, Enterprises configured = [%v], subscriber slice sst [%v], sd [%v]",
-				entMap, smContext.Snssai.Sst, smContext.Snssai.Sd)
-			ent = entMap[strconv.Itoa(int(smContext.Snssai.GetSst()))+smContext.Snssai.GetSd()]
-		} else {
-			smContext.SubCtxLog.Debug("context state change, enterprise info not available")
-		}
-
-		if nextState == SmStateActive {
-			metrics.SetSessProfileStats(smContext.Identifier, smContext.PDUAddress.Ip.String(), nextState.String(),
-				upf, ent, 1)
-		} else {
-			metrics.SetSessProfileStats(smContext.Identifier, smContext.PDUAddress.Ip.String(), smContext.SMContextState.String(),
-				upf, ent, 0)
-		}
+	if smContext.SMContextState == nextState {
+		// Not a real transition (e.g. a retry/no-op ChangeState call with the same target
+		// state): skip the metrics/Kafka publish below so callers that re-invoke ChangeState
+		// for logging purposes don't emit duplicate terminal events.
+		return
+	}
+	if smContext.SMContextState == SmStateRelease {
+		// RemoveSMContext already deleted this session from the pool. The FSM handler that
+		// triggered it still returns a "next" state of its own (e.g. SmStateInit) and
+		// HandleEvent applies it unconditionally, so without this guard a released session
+		// would keep mutating state and re-publishing Kafka events (potentially resurrecting
+		// it downstream) after it no longer exists. Release is terminal.
+		return
 	}
 
-	smContext.PublishSmCtxtInfo()
+	// Update Subscriber profile Metrics
+	if nextState == SmStateActive || smContext.SMContextState == SmStateActive {
+		if nextState == SmStateActive {
+			upf, _ := smContext.getSmCtxtUpf()
+
+			// enterprise name
+			ent := "na"
+			if smfContext.EnterpriseList != nil {
+				entMap := *smfContext.EnterpriseList
+				smContext.SubCtxLog.Debugf("context state change, Enterprises configured = [%v], subscriber slice sst [%v], sd [%v]",
+					entMap, smContext.Snssai.Sst, smContext.Snssai.Sd)
+				ent = entMap[strconv.Itoa(int(smContext.Snssai.GetSst()))+smContext.Snssai.GetSd()]
+			} else {
+				smContext.SubCtxLog.Debug("context state change, enterprise info not available")
+			}
+
+			smContext.activeIP = smContext.PDUAddress.Ip.String()
+			smContext.activeUpf = upf
+			smContext.activeEnterprise = ent
+			metrics.SetSessProfileStats(smContext.Identifier, smContext.activeIP, nextState.String(),
+				upf, ent, 1)
+		} else {
+			// Delete the exact series recorded on entry rather than setting a fresh one to 0:
+			// re-deriving the ip/upf/enterprise labels now can disagree with what was recorded
+			// then (e.g. ReleaseUeIpAddr has already reset PDUAddress.Ip to 0.0.0.0 by this point)
+			// and leave the original "active" series behind forever, showing the session twice.
+			metrics.DeleteSessProfileStats(smContext.Identifier, smContext.activeIP, smContext.SMContextState.String(),
+				smContext.activeUpf, smContext.activeEnterprise)
+		}
+	}
 
 	smContext.SubCtxLog.Infof("context state change, current state[%v] next state[%v]",
 		smContext.SMContextState.String(), nextState.String())
 	smContext.SMContextState = nextState
+
+	// Published after the state is updated so the Kafka event reports the state being entered,
+	// not the one being left.
+	smContext.PublishSmCtxtInfo()
 }
 
 // *** add unit test ***//
@@ -310,16 +350,136 @@ func RangeSMContexts(fn func(*SMContext) bool) {
 func GetSMContext(ref string) (smContext *SMContext) {
 	if value, ok := smContextPool.Load(ref); ok {
 		smContext = value.(*SMContext)
-	} else {
-		if factory.SmfConfig.Configuration.EnableDbStore {
-			smContext := GetSMContextByRefInDB(ref)
-			if smContext != nil {
-				smContextPool.Store(ref, smContext)
-			}
+	} else if factory.SmfConfig.Configuration.EnableDbStore && !IsSmContextDeleteFailed(ref) {
+		// IsSmContextDeleteFailed excludes refs whose by-ref document RemoveSMContextLocked
+		// could not delete: without that check, a pool miss right after a failed delete would
+		// read the still-present, released document back from Mongo and resurrect it here.
+		if dbContext := GetSMContextByRefInDB(ref); dbContext != nil {
+			smContextPool.Store(ref, dbContext)
+			smContext = dbContext
 		}
 	}
 
 	return
+}
+
+// SessionsAnchoredOn returns the SM contexts that hold a PFCP session on the given node.
+//
+// There is no index from a user-plane node to the sessions anchored on it, so this ranges the
+// pool. The PFCP context of each session is keyed by the node's address, which is the same key
+// the session establishment path uses, so membership is a lookup rather than a walk of the data
+// path.
+//
+// The result is a snapshot. Sessions established after it are already correct on a node that has
+// just restarted and must not be re-installed, and sessions released after it must not be
+// resurrected — so callers work from the list as taken and re-check liveness before acting on any
+// entry.
+// The second return names the sessions that could not be examined, rather than counting them.
+//
+// A session whose lock could not be taken cannot have its PFCPContext read, so there is no way to
+// tell whether it is anchored on this node or on another one -- and counting it against this node
+// makes a UPF with nothing on it report sessions it does not have. The references are returned so
+// the caller can decide which of them it has previously seen on this node; Ref is assigned before
+// the context is published to the pool and never changes, so reading it without the lock is safe.
+// The third return counts sessions anchored here whose first establishment is still outstanding.
+// They are excluded from restoration deliberately -- reissuing over an establishment in flight
+// overwrites it -- but a caller that sees no anchored sessions must not conclude the node is empty
+// when this is non-zero.
+func SessionsAnchoredOn(nodeID NodeID) (anchoredSessions []*SMContext, couldNotExamine []string, stillEstablishing int) {
+	nodeIP := nodeID.ResolveNodeIdToIp().String()
+
+	anchored := make([]*SMContext, 0)
+	unexaminable := make([]string, 0)
+	scanned, superseded, establishing := 0, 0, 0
+	otherKeys := make(map[string]int)
+	smContextPool.Range(func(_, value any) bool {
+		smContext, ok := value.(*SMContext)
+		if !ok || smContext == nil {
+			return true
+		}
+		scanned++
+
+		// TryLock, never Lock. This ranges every session in the pool, so blocking on one session's
+		// lock makes a global sweep wait on a single session's procedure. The codebase holds SMLock
+		// across network calls -- the N1N2 transfer to the AMF, among others -- so that wait is
+		// unbounded, and a sweep stuck behind it never returns. Observed on a cluster: one session
+		// held the lock and every subsequent restoration for that UPF stopped before its first log
+		// line.
+		//
+		// Skipping a session whose lock is held is the right answer rather than a concession. A
+		// session mid-procedure is being established, modified or torn down, and none of those is a
+		// session the restarted node was holding.
+		if !smContext.SMLock.TryLock() {
+			unexaminable = append(unexaminable, smContext.Ref)
+			return true
+		}
+		pfcpContext, onThisNode := smContext.PFCPContext[nodeIP]
+		// A session the node has never acknowledged is not a session it was holding. The entry is
+		// created when the rules are allocated and RemoteSEID is filled in only when the
+		// establishment response arrives, so a zero that restoration did not write means an
+		// establishment is still outstanding: a session being set up alongside the restart rather
+		// than one lost to it.
+		//
+		// Restoring one overwrites the establishment in flight. Seen on a cluster, three
+		// milliseconds either side of the race: the UE address was pinned to the SMF's placeholder
+		// before the UPF had chosen one, and the subscriber came up on an address outside the pool
+		// with no downlink -- a worse outcome than the stall this change exists to fix.
+		neverAcknowledged := onThisNode && pfcpContext.RemoteSEID == 0 && !pfcpContext.ClearedByRestoration
+		identifier, pduSessionID, ref := smContext.Identifier, smContext.PDUSessionID, smContext.Ref
+		if !onThisNode {
+			for key := range smContext.PFCPContext {
+				otherKeys[key]++
+			}
+		}
+		smContext.SMLock.Unlock()
+
+		if !onThisNode {
+			return true
+		}
+		if neverAcknowledged {
+			establishing++
+			return true
+		}
+		if !isCurrent(identifier, pduSessionID, ref) {
+			superseded++
+			return true
+		}
+		anchored = append(anchored, smContext)
+		return true
+	})
+
+	// Logged unconditionally. A sweep that reports only when it skipped something is silent in the
+	// case that matters most -- finding nothing at all -- and that silence cost a diagnosis round:
+	// "no sessions anchored" with no way to tell an empty pool from a mis-keyed lookup.
+	logger.CtxLog.Infof("sessions anchored on %s: %d of %d scanned (%d could not be examined and may be "+
+		"on any node, %d superseded by a later session for the same subscriber, %d still being established)",
+		nodeIP, len(anchored), scanned, len(unexaminable), superseded, establishing)
+	if len(anchored) == 0 && len(otherKeys) > 0 {
+		// Separates an empty pool from a lookup that did not match: if sessions are anchored under
+		// some other key, the node identity resolved differently here than when they were created.
+		logger.CtxLog.Warnf("no session matched %s, but the pool holds sessions anchored under %v",
+			nodeIP, otherKeys)
+	}
+	return anchored, unexaminable, establishing
+}
+
+// isCurrent reports whether this context is still the one the subscriber's PDU session resolves to.
+//
+// A context is superseded rather than released when a UE establishes the same PDU session again
+// without the old one being torn down -- a simulator restarted, a UE that re-attached after losing
+// the network. The canonical reference for that subscriber and session identifier is repointed at
+// the new context, and the old one stays in the pool describing a session nothing will ever use.
+//
+// Restoring one is worse than skipping it. It programs the recovered user plane with a rule for a UE
+// address that is gone, and it spends restoration effort the live session needed. Observed on a
+// cluster: the rule installed after a restart named a UE address two sessions out of date, while the
+// live session was never restored.
+func isCurrent(identifier string, pduSessionID int32, ref string) bool {
+	current, err := ResolveRef(identifier, pduSessionID)
+	if err != nil {
+		return false
+	}
+	return current == ref
 }
 
 // *** add unit test ***//
@@ -337,6 +497,21 @@ func RemoveSMContext(ref string) {
 		return
 	}
 
+	smContext.SMLock.Lock()
+	defer smContext.SMLock.Unlock()
+	RemoveSMContextLocked(smContext)
+}
+
+// RemoveSMContextLocked does the release transition, DB deletes, and pool/canonicalRef cleanup for
+// smContext. The caller must already hold smContext.SMLock: RemoveSMContext acquires it before
+// calling this; producer's restoration release path (markReleasedAndBuild) already holds it - to
+// keep the release atomic with the N1N2 release-command build that follows - and calls this
+// directly instead of RemoveSMContext to avoid relocking the same, non-reentrant mutex.
+//
+// Holding SMLock here also serializes this against AsyncStoreSmContextInDB, which takes the same
+// lock and checks for SmStateRelease before enqueueing: a write can never be enqueued after the DB
+// deletes below and resurrect the document.
+func RemoveSMContextLocked(smContext *SMContext) {
 	smContext.SubCtxLog.Infof("RemoveSMContext, SM context released ")
 	smContext.ChangeState(SmStateRelease)
 
@@ -347,21 +522,32 @@ func RemoveSMContext(ref string) {
 		}
 	}
 
+	if factory.SmfConfig.Configuration.EnableDbStore {
+		// The SEID loop above only reaches the main by-ref document via a SEID mapping, so a
+		// context released before any PFCP session was ever established (e.g. a create
+		// rollback) still needs this unconditional delete to remove its by-ref document -
+		// otherwise a stale, non-terminal document could be read back and resurrected into the
+		// pool by a later GetSMContext.
+		DeleteSmContextInDBByRef(smContext.Ref)
+	}
+
 	// Release UE IP-Address
 	err := smContext.ReleaseUeIpAddr()
 	if err != nil {
 		smContext.SubCtxLog.Errorf("release UE IP-Address failed, %v", err)
 	}
 
-	smContextPool.Delete(ref)
+	smContextPool.Delete(smContext.Ref)
 
-	canonicalRef.Delete(canonicalName(smContext.Supi, smContext.PDUSessionID))
+	// NewSMContext registers the canonical entry under Identifier, not Supi -- and Supi is still
+	// empty here for a context that never ran SetCreateData. Deleting by Supi in that case would
+	// leave the canonical entry behind, resolvable to a ref that no longer exists in the pool.
+	// Use CompareAndDelete so a replacement context (created after this one was superseded via
+	// restoration) is not accidentally unlinked from the canonical map.
+	canonicalRef.CompareAndDelete(canonicalName(smContext.Identifier, smContext.PDUSessionID), smContext.Ref)
 	// Sess Stats
 	smContextActive := decSMContextActive()
 	metrics.SetSessStats(SMF_Self().NfInstanceID, smContextActive)
-	if factory.SmfConfig.Configuration.EnableDbStore {
-		DeleteSmContextInDBByRef(smContext.Ref)
-	}
 }
 
 // *** add unit test ***//
@@ -426,36 +612,34 @@ func (smContext *SMContext) RebuildCommunicationClient() {
 	// Clear any existing client first so stale data does not linger if the
 	// (re-discovered) AMF profile has no namf-comm service.
 	smContext.CommunicationClient = nil
-	for _, service := range smContext.AMFProfile.GetNfServices() {
-		if service.GetServiceName() == models.SERVICENAME_NAMF_COMM {
-			communicationConf := Namf_Communication.NewConfiguration()
-			serverConfig := &communicationConf.Servers[0]
-			if apiRootVar, exists := serverConfig.Variables["apiRoot"]; exists {
-				apiRootVar.DefaultValue = service.GetApiPrefix()
-				serverConfig.Variables["apiRoot"] = apiRootVar
-			}
-			smContext.CommunicationClient = Namf_Communication.NewAPIClient(communicationConf)
-			return
-		}
+	service, ok := util.FindServiceByName(util.NFProfileDiscoveryServices(&smContext.AMFProfile), models.SERVICENAME_NAMF_COMM)
+	if !ok {
+		return
 	}
+	communicationConf := Namf_Communication.NewConfiguration()
+	serverConfig := &communicationConf.Servers[0]
+	if apiRootVar, exists := serverConfig.Variables["apiRoot"]; exists {
+		apiRootVar.DefaultValue = service.GetApiPrefix()
+		serverConfig.Variables["apiRoot"] = apiRootVar
+	}
+	smContext.CommunicationClient = Namf_Communication.NewAPIClient(communicationConf)
 }
 
 // RebuildSMPolicyClient reconstructs the Npcf_SMPolicyControl API client
 // from the stored SelectedPCFProfile after recovering an SMContext from MongoDB.
 func (smContext *SMContext) RebuildSMPolicyClient() {
 	smContext.SMPolicyClient = nil
-	for _, service := range smContext.SelectedPCFProfile.GetNfServices() {
-		if service.GetServiceName() == models.SERVICENAME_NPCF_SMPOLICYCONTROL {
-			cfg := Npcf_SMPolicyControl.NewConfiguration()
-			serverConfig := &cfg.Servers[0]
-			if apiRootVar, exists := serverConfig.Variables["apiRoot"]; exists {
-				apiRootVar.DefaultValue = service.GetApiPrefix()
-				serverConfig.Variables["apiRoot"] = apiRootVar
-			}
-			smContext.SMPolicyClient = Npcf_SMPolicyControl.NewAPIClient(cfg)
-			return
-		}
+	service, ok := util.FindServiceByName(util.NFProfileDiscoveryServices(&smContext.SelectedPCFProfile), models.SERVICENAME_NPCF_SMPOLICYCONTROL)
+	if !ok {
+		return
 	}
+	cfg := Npcf_SMPolicyControl.NewConfiguration()
+	serverConfig := &cfg.Servers[0]
+	if apiRootVar, exists := serverConfig.Variables["apiRoot"]; exists {
+		apiRootVar.DefaultValue = service.GetApiPrefix()
+		serverConfig.Variables["apiRoot"] = apiRootVar
+	}
+	smContext.SMPolicyClient = Npcf_SMPolicyControl.NewAPIClient(cfg)
 }
 
 func (smContext *SMContext) BuildCreatedData() (createdData *models.SmContextCreatedData) {
@@ -525,16 +709,14 @@ func (smContext *SMContext) PCFSelection() error {
 	smContext.SelectedPCFProfile = rep.NfInstances[0]
 
 	// Create SMPolicyControl Client for this SM Context
-	for _, service := range smContext.SelectedPCFProfile.GetNfServices() {
-		if service.GetServiceName() == models.SERVICENAME_NPCF_SMPOLICYCONTROL {
-			cfg := Npcf_SMPolicyControl.NewConfiguration()
-			serverConfig := &cfg.Servers[0]
-			if apiRootVar, exists := serverConfig.Variables["apiRoot"]; exists {
-				apiRootVar.DefaultValue = service.GetApiPrefix()
-				serverConfig.Variables["apiRoot"] = apiRootVar
-			}
-			smContext.SMPolicyClient = Npcf_SMPolicyControl.NewAPIClient(cfg)
+	if service, ok := util.FindServiceByName(util.NFProfileDiscoveryServices(&smContext.SelectedPCFProfile), models.SERVICENAME_NPCF_SMPOLICYCONTROL); ok {
+		cfg := Npcf_SMPolicyControl.NewConfiguration()
+		serverConfig := &cfg.Servers[0]
+		if apiRootVar, exists := serverConfig.Variables["apiRoot"]; exists {
+			apiRootVar.DefaultValue = service.GetApiPrefix()
+			serverConfig.Variables["apiRoot"] = apiRootVar
 		}
+		smContext.SMPolicyClient = Npcf_SMPolicyControl.NewAPIClient(cfg)
 	}
 
 	return nil
@@ -548,6 +730,24 @@ func (smContext *SMContext) GetNodeIDByLocalSEID(seid uint64) (nodeID NodeID) {
 	}
 
 	return
+}
+
+// RemoteSEIDByLocalSEID returns the SEID the user-plane function assigned to the session
+// this element knows by seid.
+//
+// A PFCP message carries the SEID assigned by whoever receives it, so a request the UPF
+// sends arrives under this element's own SEID and the response to it has to go back under
+// the UPF's. Echoing the request's value instead -- which is what this element did, with a
+// TODO admitting it -- is inert only for as long as no cause is sent that makes the peer
+// read the field.
+func (smContext *SMContext) RemoteSEIDByLocalSEID(seid uint64) (uint64, bool) {
+	for _, pfcpCtx := range smContext.PFCPContext {
+		if pfcpCtx.LocalSEID == seid {
+			return pfcpCtx.RemoteSEID, true
+		}
+	}
+
+	return 0, false
 }
 
 func (smContext *SMContext) AllocateLocalSEIDForDataPath(dataPath *DataPath) {
@@ -725,6 +925,8 @@ func (smContextState SMContextState) String() string {
 		return "SmStatePfcpModify"
 	case SmStatePfcpRelease:
 		return "SmStatePfcpRelease"
+	case SmStateRelease:
+		return "SmStateRelease"
 	case SmStateN1N2TransferPending:
 		return "SmStateN1N2TransferPending"
 
@@ -788,19 +990,46 @@ func (smContext *SMContext) CommitSmPolicyDecision(status bool) error {
 
 func (smContext *SMContext) getSmCtxtUpf() (name, ip string) {
 	var upfName, upfIP string
-	if smContext.SMContextState == SmStateActive {
-		if smContext.Tunnel != nil {
-			// Set UPF FQDN name if provided else IP-address
-			if smContext.Tunnel.DataPathPool[1].FirstDPNode.UPF.NodeID.NodeIdType == NodeIdTypeFqdn {
-				upfName = string(smContext.Tunnel.DataPathPool[1].FirstDPNode.UPF.NodeID.NodeIdValue)
-				upfName = strings.Split(upfName, ".")[0]
-				upfIP = smContext.Tunnel.DataPathPool[1].FirstDPNode.UPF.NodeID.ResolveNodeIdToIp().String()
-			} else {
-				upfName = smContext.Tunnel.DataPathPool[1].FirstDPNode.UPF.GetUPFIP()
-				upfIP = smContext.Tunnel.DataPathPool[1].FirstDPNode.UPF.GetUPFIP()
-			}
-		}
+	// Keyed on Tunnel/data-path presence rather than SMContextState: the state field already
+	// reflects whichever side of the transition PublishSmCtxtInfo is called on, so gating on
+	// SmStateActive here would drop the UPF the session is leaving on every disconnect event.
+	// The default path is resolved by lookup rather than assuming pool key 1, since a tunnel
+	// can exist with no data path yet (e.g. the no-available-path failure in
+	// PDUSessionSMContextCreate), in which case there's nothing to report.
+	if smContext.Tunnel == nil {
+		// releaseTunnel already cleared the tunnel by the time RemoveSMContext publishes the
+		// terminal disconnect event; fall back to the UPF this last resolved to rather than
+		// reporting none.
+		return smContext.lastUpfName, smContext.lastUpfIP
 	}
+	defaultPath := smContext.Tunnel.DataPathPool.GetDefaultPath()
+	if defaultPath == nil || defaultPath.FirstDPNode == nil || defaultPath.FirstDPNode.UPF == nil {
+		return smContext.lastUpfName, smContext.lastUpfIP
+	}
+	upf := defaultPath.FirstDPNode.UPF
+
+	// Set UPF FQDN name if provided else IP-address
+	if upf.NodeID.NodeIdType == NodeIdTypeFqdn {
+		upfName = string(upf.NodeID.NodeIdValue)
+		upfName = strings.Split(upfName, ".")[0]
+		// Cache-only lookup: this runs under SMLock on every state transition, so a
+		// synchronous DNS resolution here (as ResolveNodeIdToIp would do on a cache miss)
+		// could block release/modify/create request goroutines on a slow/unresponsive resolver.
+		if ip := upf.NodeID.ResolveNodeIdToIpCached(); ip != nil {
+			upfIP = ip.String()
+		}
+	} else {
+		upfName = upf.GetUPFIP()
+		upfIP = upf.GetUPFIP()
+	}
+	if upfIP == "" {
+		// A transient FQDN cache miss with the tunnel still present (e.g. HandlePduSessionContextReplacement
+		// calls RemoveSMContext, which publishes the terminal event, before releaseTunnel runs): fall
+		// back to the last resolved UPF instead of reporting none for this event.
+		return smContext.lastUpfName, smContext.lastUpfIP
+	}
+	// Not updated on a miss (handled above): the snapshot must only ever hold a fully resolved UPF.
+	smContext.lastUpfName, smContext.lastUpfIP = upfName, upfIP
 	return upfName, upfIP
 }
 
@@ -825,16 +1054,27 @@ func (smContext *SMContext) PublishSmCtxtInfo() {
 	kafkaSmCtxt.SmfIp = SMF_Self().PodIp
 
 	// Send to stream
-	err := metrics.GetWriter().PublishPduSessEvent(kafkaSmCtxt, op)
+	err := publishPduSessEvent(kafkaSmCtxt, op)
 	if err != nil {
 		smContext.SubCtxLog.Errorf("failed to publish sm ctxt info on kafka stream: %v", err)
 	}
 }
 
+// publishPduSessEvent is a seam over metrics.GetWriter().PublishPduSessEvent so tests can
+// capture published Kafka events without a real broker.
+var publishPduSessEvent = func(ctxt mi.CoreSubscriber, op mi.SubscriberOp) error {
+	return metrics.GetWriter().PublishPduSessEvent(ctxt, op)
+}
+
 func mapPduSessStateToMetricStateAndOp(state SMContextState) (string, mi.SubscriberOp) {
 	switch state {
 	case SmStateInit:
-		return IDLE, mi.SubsOpAdd
+		// Never the terminal transition: teardown paths (a PFCP send failure while
+		// SmStatePfcpCreatePending, the UE-driven release complete, the duplicate-PDU-ID
+		// path) all call ChangeState(SmStateInit) immediately before RemoveSMContext enters
+		// SmStateRelease, which is what actually removes the session and reports Del.
+		// Reporting Del here too would double it; report the in-progress Mod instead.
+		return IDLE, mi.SubsOpMod
 	case SmStateActivePending:
 		return IDLE, mi.SubsOpMod
 	case SmStateActive:
@@ -844,11 +1084,20 @@ func mapPduSessStateToMetricStateAndOp(state SMContextState) (string, mi.Subscri
 	case SmStateModify:
 		return CONNECTED, mi.SubsOpMod
 	case SmStatePfcpCreatePending:
-		return IDLE, mi.SubsOpMod
+		// Only reachable from SmStateInit (a brand-new PDU session waiting on its first
+		// PFCP session establishment), so this is always the subscriber's initial create.
+		return IDLE, mi.SubsOpAdd
 	case SmStatePfcpModify:
 		return CONNECTED, mi.SubsOpMod
 	case SmStatePfcpRelease:
-		return DISCONNECTED, mi.SubsOpDel
+		// Releasing the PFCP session is the start of teardown, not its completion: this can
+		// still roll back to SmStateActive (PFCP release timeout/failure) or continue on to
+		// SmStateInActivePending without the session ever being removed. Reporting a Del here
+		// as well as on the SmStateRelease transition that follows would tell downstream
+		// consumers about a deletion that may not happen, and doubles the one that does.
+		// SmStateRelease - reached only via RemoveSMContext, which also deletes the pool
+		// entry - is the sole terminal transition that reports Del.
+		return IDLE, mi.SubsOpMod
 	case SmStateRelease:
 		return DISCONNECTED, mi.SubsOpDel
 	case SmStateN1N2TransferPending:

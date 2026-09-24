@@ -37,6 +37,9 @@ const (
 	upfAssociationRetryInterval = 50 * time.Millisecond
 )
 
+// n2SmInformationContentID names the N2 SM information part of a multipart N1N2 transfer.
+const n2SmInformationContentID = "N2SmInformation"
+
 func ensureDataPathUpfAssociated(dataPath *smf_context.DataPath) error {
 	for node := dataPath.FirstDPNode; node != nil; node = node.Next() {
 		if node.UPF == nil {
@@ -139,9 +142,11 @@ func HandlePduSessionContextReplacement(smCtxtRef string) error {
 		reportAndUntask(smCtxt)
 
 		// Disassociate ctxt from any look-ups(Report-Req from UPF shouldn't get this context)
-		smf_context.RemoveSMContext(smCtxt.Ref)
+		// RemoveSMContextLocked already transitions to SmStateRelease, which publishes the Kafka
+		// event; publishing again here would duplicate it. The Locked variant is used, not
+		// RemoveSMContext, because SMLock is already held above and it is not reentrant.
+		smf_context.RemoveSMContextLocked(smCtxt)
 
-		smCtxt.PublishSmCtxtInfo()
 		// check if PCF session set, send release(Npcf_SMPolicyControl_Delete)
 		// TODO: not done as part of ctxt release
 
@@ -185,6 +190,13 @@ func HandlePDUSessionSMContextCreate(eventData interface{}) error {
 		txn.Rsp = formContextCreateErrRsp(http.StatusForbidden, smferrors.N1SmError)
 		return fmt.Errorf("GsmMsgDecodeError")
 	}
+
+	// Record the procedure transaction identity as soon as the request is decoded, because the
+	// reject builders read it from the SM context and several refusals below are raised before
+	// HandlePDUSessionEstablishmentRequest, which is otherwise the only place it is stored. A
+	// rejection carrying an unassigned PTI is one the UE must ignore per TS 24.501 clause 7.3.1,
+	// UE procedures item e), so those refusals would reach the UE and be discarded.
+	smContext.Pti = m.PDUSessionEstablishmentRequest.GetPTI()
 
 	createData, _ := request.GetJsonDataOk()
 
@@ -373,9 +385,23 @@ func HandlePDUSessionSMContextCreate(eventData interface{}) error {
 		if defaultPath == nil {
 			smContext.SubPduSessLog.Warnf("no default path found for SUPI[%s]", createData.Supi)
 		} else if err := ensureDataPathUpfAssociated(defaultPath); err != nil {
+			// Refused for the same reason as the activation below: a session whose user plane was
+			// never associated has nothing to accept with, and carrying on builds an accept for a
+			// path that does not exist. The branch beside this one has always refused here.
 			smContext.SubPduSessLog.Errorf("ensureDataPathUpfAssociated error for SUPI[%s]: %v", createData.Supi, err)
+			txn.Rsp = smContext.GeneratePDUSessionEstablishmentReject("UPFDataPathError")
+
+			return fmt.Errorf("DataPathError")
 		} else if err := defaultPath.ActivateTunnelAndPDR(smContext, 255); err != nil {
+			// The failure is reported and the session refused, rather than reported and carried on
+			// as it was before. A session whose user plane could not be built has
+			// nothing to accept with: the establishment accept that follows reads the active
+			// session rule for the Session-AMBR, and the same absence that stopped the build stops
+			// that too -- one step later, as a panic, in a builder that cannot say what went wrong.
 			smContext.SubPduSessLog.Errorf("ActivateTunnelAndPDR error for SUPI[%s]: %v", createData.Supi, err)
+			txn.Rsp = smContext.GeneratePDUSessionEstablishmentReject("UPFDataPathError")
+
+			return fmt.Errorf("DataPathError")
 		}
 		smContext.BPManager = smf_context.NewBPManager(createData.GetSupi())
 	} else {
@@ -569,8 +595,11 @@ func HandlePDUSessionSMContextUpdate(eventData interface{}) error {
 			Status: http.StatusOK,
 			Body:   response,
 		}
-	case smf_context.SmStateInit, smf_context.SmStateInActivePending:
-		smContext.SubCtxLog.Debugln("PDUSessionSMContextUpdate, ctxt in SmStateInit, SmStateInActivePending")
+	case smf_context.SmStateInit, smf_context.SmStateInActivePending, smf_context.SmStateRelease:
+		// SmStateRelease here means the N1 PDUSessionReleaseComplete handler or the N2
+		// duplicate-session-ID handler above already removed the context
+		// (RemoveSMContextLocked); the AMF still gets its 200 OK for this request.
+		smContext.SubCtxLog.Debugln("PDUSessionSMContextUpdate, ctxt in SmStateInit, SmStateInActivePending, SmStateRelease")
 		httpResponse = &httpwrapper.Response{
 			Status: http.StatusOK,
 			Body:   response,
@@ -696,7 +725,9 @@ func HandlePDUSessionSMContextRelease(eventData interface{}) error {
 		}
 
 		txn.Rsp = httpResponse
-		smf_context.RemoveSMContext(smContext.Ref)
+		// RemoveSMContextLocked, not RemoveSMContext, since SMLock is already held by this
+		// function's deferred unlock above and the lock is not reentrant.
+		smf_context.RemoveSMContextLocked(smContext)
 		return nil
 	}
 
@@ -771,7 +802,7 @@ func HandlePDUSessionSMContextRelease(eventData interface{}) error {
 
 		if errResponse.HasBinaryDataN1SmMessage() {
 			jd := errResponse.GetJsonData()
-			jd.SetN1SmMsg(models.RefToBinaryData{ContentId: "PDUSessionReleaseReject"})
+			jd.SetN1SmMsg(models.RefToBinaryData{ContentId: smf_context.PDU_SESS_REL_REJECT})
 			errResponse.SetJsonData(jd)
 		}
 		httpResponse.Body = errResponse
@@ -807,14 +838,18 @@ func HandlePDUSessionSMContextRelease(eventData interface{}) error {
 
 		if errResponse.HasBinaryDataN1SmMessage() {
 			jd := errResponse.GetJsonData()
-			jd.SetN1SmMsg(models.RefToBinaryData{ContentId: "PDUSessionReleaseReject"})
+			jd.SetN1SmMsg(models.RefToBinaryData{ContentId: smf_context.PDU_SESS_REL_REJECT})
 			errResponse.SetJsonData(jd)
 		}
 		httpResponse.Body = errResponse
 	}
 
 	txn.Rsp = httpResponse
-	smf_context.RemoveSMContext(smContext.Ref)
+	if PFCPResponseStatus == smf_context.SessionReleaseSuccess {
+		// RemoveSMContextLocked, not RemoveSMContext, since SMLock is already held by this
+		// function's deferred unlock above and the lock is not reentrant.
+		smf_context.RemoveSMContextLocked(smContext)
+	}
 
 	return nil
 }
@@ -854,7 +889,7 @@ func SendPduSessN1N2Transfer(smContext *smf_context.SMContext, success bool) err
 	defer util.CleanupMultipartTempFiles(n1n2Request)
 
 	// N2 Container Info
-	n2InfoContent := models.NewN2InfoContent(models.RefToBinaryData{ContentId: "N2SmInformation"})
+	n2InfoContent := models.NewN2InfoContent(models.RefToBinaryData{ContentId: n2SmInformationContentID})
 	n2InfoContent.SetNgapIeType(models.NGAPIETYPE_PDU_RES_SETUP_REQ)
 	smInfo := models.NewN2SmInformation(smContext.PDUSessionID)
 	smInfo.SetN2InfoContent(*n2InfoContent)
@@ -957,13 +992,17 @@ func HandlePduSessN1N2TransFailInd(eventData interface{}) error {
 
 	var httpResponse *httpwrapper.Response
 
+	// Set only once a modification is actually on its way to the UPF: every path that
+	// does not send one must answer the notification instead of waiting for a response
+	// that cannot come.
+	awaitingModification := false
+
 	pdrList := []*smf_context.PDR{}
 	farList := []*smf_context.FAR{}
 	qerList := []*smf_context.QER{}
 	barList := []*smf_context.BAR{}
 
 	if smContext.Tunnel != nil {
-		smContext.PendingUPF = make(smf_context.PendingUPF)
 		for _, dataPath := range smContext.Tunnel.DataPathPool {
 			ANUPF := dataPath.FirstDPNode
 			for _, DLPDR := range ANUPF.DownLinkTunnel.PDR {
@@ -973,7 +1012,6 @@ func HandlePduSessN1N2TransFailInd(eventData interface{}) error {
 				} else {
 					DLPDR.FAR.ApplyAction = smf_context.ApplyAction{Buff: false, Drop: true, Dupl: false, Forw: false, Nocp: false}
 					DLPDR.FAR.State = smf_context.RULE_UPDATE
-					smContext.PendingUPF[ANUPF.GetNodeIP()] = true
 					farList = append(farList, DLPDR.FAR)
 				}
 			}
@@ -982,11 +1020,43 @@ func HandlePduSessN1N2TransFailInd(eventData interface{}) error {
 		defaultPath := smContext.Tunnel.DataPathPool.GetDefaultPath()
 		ANUPF := defaultPath.FirstDPNode
 
+		// Await only the UPF this actually sends to. Marking one entry per data path
+		// while sending a single modification means the response handlers -- which
+		// signal only once PendingUPF is empty -- never signal for a session with more
+		// than one path, and the wait below does not end. The rules of the other paths
+		// are still in farList, as they were before: that they go to one UPF is a
+		// separate defect, and pretending to await answers that were never asked for
+		// does not fix it.
+		smContext.PendingUPF = make(smf_context.PendingUPF)
+		smContext.PendingUPF[ANUPF.GetNodeIP()] = true
+
+		// The response handler only signals SBIPFCPCommunicationChan while the context
+		// is in this state. Without the transition the modification was answered, the
+		// signal was never sent, and the wait below never ended.
+		stateBeforeModify := smContext.SMContextState
+		smContext.ChangeState(smf_context.SmStatePfcpModify)
+
 		// Sending PFCP modification with flag set to DROP the packets.
 		err := pfcp_message.SendPfcpSessionModificationRequest(ANUPF.UPF.NodeID, smContext, pdrList, farList, barList, qerList, nil, nil, nil, ANUPF.UPF.Port)
 		if err != nil {
 			smContext.SubPduSessLog.Errorf("pfcp Session Modification Request failed: %v", err)
+
+			abandonPendingModify(smContext, stateBeforeModify)
+		} else {
+			awaitingModification = true
 		}
+	}
+
+	if !awaitingModification {
+		// Nothing was sent, so nothing will arrive. Waiting anyway left the AMF's
+		// notification unanswered until its client gave up after 30 s, and left a reader
+		// parked on a channel of depth one that belongs to this session: the next
+		// modification, release or activation for it would have its response consumed
+		// here and its own waiter would hang instead.
+		smContext.SubPduSessLog.Infoln("no PFCP modification was sent, answering the notification without waiting")
+		txn.Rsp = &httpwrapper.Response{Status: http.StatusNoContent}
+
+		return nil
 	}
 
 	// Listening PFCP modification response.
@@ -995,6 +1065,21 @@ func HandlePduSessN1N2TransFailInd(eventData interface{}) error {
 	httpResponse = HandlePFCPResponse(smContext, PFCPResponseStatus)
 	txn.Rsp = httpResponse
 	return nil
+}
+
+// abandonPendingModify undoes the bookkeeping for a modification that was never sent.
+//
+// Both halves matter and they have to stay together, which is why they are one function.
+// Leaving the state at PfcpModify strands the session for every later operation that expects
+// to find it settled. Leaving the pending entry is worse and less obvious: the handover path
+// merges into whatever PendingUPF already holds rather than replacing it
+// (collectHoFARsForPFCPModify in n1n2_data_handler.go), and the response handlers signal
+// SBIPFCPCommunicationChan only once the map is empty. An entry for a request that was never
+// sent is deleted by no answer, so the next operation to wait on that channel waits for good --
+// the indefinite wait this change exists to remove, reintroduced through its own failure path.
+func abandonPendingModify(smContext *smf_context.SMContext, previous smf_context.SMContextState) {
+	smContext.ChangeState(previous)
+	smContext.PendingUPF = make(smf_context.PendingUPF)
 }
 
 // Handles PFCP response depending upon response cause recevied.

@@ -8,11 +8,8 @@ import (
 	"fmt"
 
 	smf_context "github.com/omec-project/smf/context"
-	"github.com/omec-project/smf/logger"
-	stats "github.com/omec-project/smf/metrics"
 	"github.com/omec-project/smf/producer"
 	"github.com/omec-project/smf/transaction"
-	mi "github.com/omec-project/util/metricinfo"
 )
 
 // Define SM Context level Events
@@ -93,21 +90,11 @@ func EmptyEventHandler(event SmEvent, eventData *SmEventData) (smf_context.SMCon
 
 func HandleStateInitEventPduSessCreate(event SmEvent, eventData *SmEventData) (smf_context.SMContextState, error) {
 	if err := producer.HandlePDUSessionSMContextCreate(eventData.Txn); err != nil {
-		err := stats.PublishMsgEvent(mi.Smf_msg_type_pdu_sess_create_rsp_failure)
-		errorMessage := ""
-		if err != nil {
-			logger.FsmLog.Errorf("error while publishing pdu session create response failure, %v", err.Error())
-			errorMessage = err.Error()
-		}
 		txn := eventData.Txn.(*transaction.Transaction)
 		txn.Err = err
-		return smf_context.SmStateInit, fmt.Errorf("pdu session create: %v", errorMessage)
+		return smf_context.SmStateInit, fmt.Errorf("pdu session create: %v", err)
 	}
 
-	err := stats.PublishMsgEvent(mi.Smf_msg_type_pdu_sess_create_rsp_success)
-	if err != nil {
-		logger.FsmLog.Errorf("error while publishing pdu session create response success, %v", err.Error())
-	}
 	return smf_context.SmStatePfcpCreatePending, nil
 }
 
@@ -134,16 +121,8 @@ func HandleStateN1N2TransferPendingEventN1N2Transfer(event SmEvent, eventData *S
 	smCtxt := txn.Ctxt.(*smf_context.SMContext)
 
 	if err := producer.SendPduSessN1N2Transfer(smCtxt, true); err != nil {
-		err := stats.PublishMsgEvent(mi.Smf_msg_type_pdu_sess_modify_rsp_failure)
-		if err != nil {
-			smCtxt.SubFsmLog.Errorf("error while publishing pdu session modify response failure, %v ", err.Error())
-		}
 		smCtxt.SubFsmLog.Errorf("N1N2 transfer failure error, %v ", err.Error())
 		return smf_context.SmStateN1N2TransferPending, fmt.Errorf("N1N2 Transfer failure error, %v ", err.Error())
-	}
-	err := stats.PublishMsgEvent(mi.Smf_msg_type_pdu_sess_modify_rsp_success)
-	if err != nil {
-		smCtxt.SubFsmLog.Errorf("error while publishing pdu session modify response success, %v ", err.Error())
 	}
 	return smf_context.SmStateActive, nil
 }
@@ -151,6 +130,14 @@ func HandleStateN1N2TransferPendingEventN1N2Transfer(event SmEvent, eventData *S
 func HandleStatePfcpCreatePendingEventPfcpSessCreateFailure(event SmEvent, eventData *SmEventData) (smf_context.SMContextState, error) {
 	txn := eventData.Txn.(*transaction.Transaction)
 	smCtxt := txn.Ctxt.(*smf_context.SMContext)
+
+	// The create never finished establishing on the UPF, so nothing survives this rollback:
+	// remove the context instead of leaving it parked in SmStatePfcpCreatePending or
+	// SmStateN1N2TransferPending forever with no terminal Kafka event. Deferred so the
+	// removal runs whether the N1N2 transfer failure notification to the AMF succeeds or
+	// errors out; HandleEvent's follow-up ChangeState is a no-op once this has already moved
+	// the context to the terminal SmStateRelease.
+	defer smf_context.RemoveSMContext(smCtxt.Ref)
 
 	// sending n1n2 transfer failure to amf
 	if err := producer.SendPduSessN1N2Transfer(smCtxt, false); err != nil {
@@ -176,16 +163,8 @@ func HandleStateActiveEventPduSessRelease(event SmEvent, eventData *SmEventData)
 	smCtxt := txn.Ctxt.(*smf_context.SMContext)
 
 	if err := producer.HandlePDUSessionSMContextRelease(eventData.Txn); err != nil {
-		err := stats.PublishMsgEvent(mi.Smf_msg_type_pdu_sess_release_rsp_failure)
-		if err != nil {
-			smCtxt.SubFsmLog.Errorf("error while publishing pdu session release response failure, %v ", err.Error())
-		}
 		smCtxt.SubFsmLog.Errorf("sm context release error, %v ", err.Error())
 		return smf_context.SmStateInit, err
-	}
-	err := stats.PublishMsgEvent(mi.Smf_msg_type_pdu_sess_release_rsp_success)
-	if err != nil {
-		smCtxt.SubFsmLog.Errorf("error while publishing pdu session release response success, %v ", err.Error())
 	}
 	return smf_context.SmStateInit, nil
 }

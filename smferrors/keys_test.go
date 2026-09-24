@@ -478,15 +478,42 @@ func literal(e ast.Expr) (string, bool) {
 // what any test can enumerate, and the scan would go on reporting the literals it does find as
 // though the set were complete.
 //
-// The keys that reach a table through a discovered key-taker are the ones worth refusing: a
-// direct `ErrorCause[someVar]` inside `smferrors` or in a helper is how the indirection is
-// *built*, and those are the parameters the scan follows.
+// A key reaches a table by one of two routes, and both are refused here. It is either passed to a
+// discovered key-taker, or used to index a table directly. In each case the key is enumerable
+// only if it is a string literal, which TestEveryErrorKeyLiteralResolves checks against the
+// table, or a parameter of the enclosing function, which discoverKeyTakers follows out to that
+// function's own callers. Anything else — a local variable, a concatenation, a call — is neither,
+// and is exactly what this test exists to refuse.
 func TestNoErrorKeyIsComputed(t *testing.T) {
 	files := parseModule(t)
 	takers := discoverKeyTakers(t, files)
 
 	for name, file := range files {
 		ast.Inspect(file, func(n ast.Node) bool {
+			// Route one: a table indexed directly. Checked as well as the call route below,
+			// because a direct index with a computed key is the same hole reached one step
+			// earlier — TestEveryErrorKeyLiteralResolves skips it for not being a literal and
+			// discoverKeyTakers skips it for not being a parameter, so without this nothing
+			// looks at it at all.
+			if isType, isCause := tableIndexed(n); isType || isCause {
+				idx, _ := n.(*ast.IndexExpr)
+				if !keyIsEnumerable(file, idx.Index, idx) {
+					table := "ErrorCause"
+					if isType {
+						table = "ErrorType"
+					}
+					t.Errorf("%s:%d indexes %s with a computed error key. Every key in this "+
+						"module is a literal or a parameter, which is what lets a test check "+
+						"them all; a computed one is outside what "+
+						"TestEveryErrorKeyLiteralResolves can enumerate, so it would report the "+
+						"remaining literals as though the set were still complete",
+						name, fileLines.Position(idx.Pos()).Line, table)
+				}
+
+				return true
+			}
+
+			// Route two: a key handed to a function that indexes a table with it.
 			call, ok := n.(*ast.CallExpr)
 			if !ok {
 				return true
@@ -495,25 +522,35 @@ func TestNoErrorKeyIsComputed(t *testing.T) {
 			if !ok || callee.param >= len(call.Args) {
 				return true
 			}
-			arg := call.Args[callee.param]
-			if _, isLiteral := literal(arg); isLiteral {
+			if keyIsEnumerable(file, call.Args[callee.param], call) {
 				return true
 			}
-			// A parameter passed straight through is the indirection itself, already followed.
-			if ident, isIdent := arg.(*ast.Ident); isIdent {
-				if _, isParam := paramNames(enclosingFunc(file, call))[ident.Name]; isParam {
-					return true
-				}
-			}
-			t.Errorf("%s:%d passes a non-literal error key to %s. Every key in this module is a "+
-				"literal, which is what lets a test check them all; a computed one is outside "+
-				"what TestEveryErrorKeyLiteralResolves can enumerate, so it would report the "+
-				"remaining literals as though the set were still complete",
+			t.Errorf("%s:%d passes a computed error key to %s. Every key in this module is a "+
+				"literal or a parameter, which is what lets a test check them all; a computed "+
+				"one is outside what TestEveryErrorKeyLiteralResolves can enumerate, so it "+
+				"would report the remaining literals as though the set were still complete",
 				name, fileLines.Position(call.Pos()).Line, calleeName(call))
 
 			return true
 		})
 	}
+}
+
+// keyIsEnumerable reports whether a key expression is one the scan can account for: a string
+// literal, which TestEveryErrorKeyLiteralResolves checks against the tables, or a parameter of
+// the function containing it, which discoverKeyTakers follows out to that function's callers. A
+// parameter passed straight through is the indirection itself, already followed.
+func keyIsEnumerable(file *ast.File, key ast.Expr, at ast.Node) bool {
+	if _, isLiteral := literal(key); isLiteral {
+		return true
+	}
+	ident, isIdent := key.(*ast.Ident)
+	if !isIdent {
+		return false
+	}
+	_, isParam := paramNames(enclosingFunc(file, at))[ident.Name]
+
+	return isParam
 }
 
 // enclosingFunc returns the function declaration containing pos, or a stub if there is none.

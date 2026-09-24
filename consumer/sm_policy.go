@@ -61,11 +61,19 @@ func SendSMPolicyAssociationCreate(smContext *smf_context.SMContext) (*models.Sm
 	if smPolicyDecisionFromPCF, httpRsp, err := smContext.SMPolicyClient.SMPoliciesCollectionAPI.CreateSMPolicyExecute(apiCreateSMPolicyRequest); err != nil {
 		if httpRsp != nil {
 			httpRspStatusCode = httpRsp.StatusCode
+			if rspCloseErr := httpRsp.Body.Close(); rspCloseErr != nil {
+				logger.ConsumerLog.Errorf("CreateSMPolicy response body cannot close: %+v", rspCloseErr)
+			}
 		}
 		return nil, httpRspStatusCode, fmt.Errorf("setup sm policy association failed: %s", err.Error())
 	} else {
 		httpRspStatusCode = http.StatusCreated
 		smPolicyDecision = smPolicyDecisionFromPCF
+		if httpRsp != nil {
+			if rspCloseErr := httpRsp.Body.Close(); rspCloseErr != nil {
+				logger.ConsumerLog.Errorf("CreateSMPolicy response body cannot close: %+v", rspCloseErr)
+			}
+		}
 	}
 
 	if err := validateSmPolicyDecision(smPolicyDecision); err != nil {
@@ -76,6 +84,14 @@ func SendSMPolicyAssociationCreate(smContext *smf_context.SMContext) (*models.Sm
 }
 
 func SendSMPolicyAssociationDelete(smContext *smf_context.SMContext, smDelReq *models.ReleaseSmContextRequest) (int, error) {
+	// A session released before ever getting a PCF policy client (e.g. caught mid-establishment)
+	// has nothing to tear down. This is a successful no-op, not an error: callers such as
+	// releaseUnrestorableSession must not report the session as failed to release just because
+	// it never had a PCF association to delete.
+	if smContext.SMPolicyClient == nil {
+		return http.StatusNoContent, nil
+	}
+
 	smPolicyDelData := models.SmPolicyDeleteData{
 		ServingNetwork: models.NewPlmnIdNid(smContext.ServingNetwork.Mcc, smContext.ServingNetwork.Mnc),
 	}
@@ -109,8 +125,18 @@ func SendSMPolicyAssociationDelete(smContext *smf_context.SMContext, smDelReq *m
 	apiDeleteSMPolicyRequest = apiDeleteSMPolicyRequest.SmPolicyDeleteData(smPolicyDelData)
 	if httpRsp, err := smContext.SMPolicyClient.IndividualSMPolicyDocumentAPI.DeleteSMPolicyExecute(apiDeleteSMPolicyRequest); err != nil {
 		logger.ConsumerLog.Warnf("smf policy delete failed, [%v] ", err.Error())
+		if httpRsp != nil {
+			if rspCloseErr := httpRsp.Body.Close(); rspCloseErr != nil {
+				logger.ConsumerLog.Errorf("DeleteSMPolicy response body cannot close: %+v", rspCloseErr)
+			}
+		}
 		return 0, err
 	} else {
+		defer func() {
+			if rspCloseErr := httpRsp.Body.Close(); rspCloseErr != nil {
+				logger.ConsumerLog.Errorf("DeleteSMPolicy response body cannot close: %+v", rspCloseErr)
+			}
+		}()
 		return httpRsp.StatusCode, nil
 	}
 }
