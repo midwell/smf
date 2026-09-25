@@ -181,7 +181,7 @@ func TestSessionsAnchoredOnStillReturnsASessionRestorationCleared(t *testing.T) 
 // A session the restarted node itself acknowledged is not one it lost. The UE can re-attach while
 // the restart is still being detected, and its new session is established on the restarted node
 // before restoration enumerates; restoring it re-establishes a live session, the node answers with
-// a second SEID, and the first is left behind on it. Observed on a cluster at 130 ms.
+// a second SEID, and the first is left behind on it. Observed on a cluster at 133 ms.
 //
 // Identified by the incarnation that acknowledged it rather than by time: a node refuses an
 // establishment until it is associated, and association is where the held recovery timestamp is
