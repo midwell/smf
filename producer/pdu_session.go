@@ -574,6 +574,13 @@ func HandlePDUSessionSMContextUpdate(eventData any) error {
 				// Modify failure
 				smContext.SubCtxLog.Errorf("pfcp session modify error: %v ", err.Error())
 
+				// Lawful Interception IRI-POI: the counterpart to the modification record emitted
+				// above, before the send. Reported here, where that record was emitted, so the two
+				// pair by construction: a refusal and a timeout both return an error, and no other
+				// send -- this element's own interception updates, restoration, a modification
+				// nothing recorded -- can draw a failure record for a modification never reported.
+				liReportModificationReject(smContext, nasMessage.Cause5GSMRequestRejectedUnspecified)
+
 				// Back to active: the error answer below carries a PDU Session Release Command,
 				// and the UE's Release Complete arrives as an update, which only SmStateActive
 				// handles. Left in SmStatePfcpModify, the session could not complete the release

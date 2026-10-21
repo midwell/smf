@@ -4,6 +4,7 @@
 package producer
 
 import (
+	"github.com/omec-project/nas/v2/nasMessage"
 	smf_context "github.com/omec-project/smf/context"
 	"github.com/omec-project/smf/lawfulintercept"
 )
@@ -25,11 +26,47 @@ import (
 // Production behaviour is unchanged: these are the same two functions, and both
 // remain silent no-ops when LI is not configured.
 var (
-	liReportRelease       = lawfulintercept.ReportRelease
-	liUntriggerCC         = lawfulintercept.UntriggerCC
-	liRestoreInterception = lawfulintercept.RestoreInterception
-	liReportReleaseReject = lawfulintercept.ReportReleaseReject
+	liReportRelease             = lawfulintercept.ReportRelease
+	liUntriggerCC               = lawfulintercept.UntriggerCC
+	liRestoreInterception       = lawfulintercept.RestoreInterception
+	liReportReleaseReject       = lawfulintercept.ReportReleaseReject
+	liReportEstablishmentReject = lawfulintercept.ReportEstablishmentReject
+	liReportModificationReject  = lawfulintercept.ReportModificationReject
 )
+
+// ReportEstablishmentFailure ends the interception state of a PDU session whose PFCP
+// establishment failed, at the one point every such failure reaches: the state machine's
+// create-failure handler, which rejects the UE and removes the context. A UPF that refused, a
+// request that timed out, an adapter error and a verdict collected across several UPFs all
+// arrive there, and none of them reaches the producer's rejectEstablishment.
+//
+// **What the agency already holds decides the record.** The establishment record is emitted
+// when the anchor UPF accepts, before the verdict from the other UPFs is in, because only the
+// anchor's response carries the F-TEID the record describes. So a create can fail after its
+// establishment was reported. That session is reported released, which is what happened to
+// it: a failed-establishment record after an establishment record would leave the agency
+// holding both. A session whose establishment was never reported gets the failed-establishment
+// record, with the cause the reject to the UE carries.
+//
+// **The triggers are withdrawn either way.** The CC trigger is installed at every UPF that
+// accepted, the anchor or not, so a create that failed can hold one whether or not its
+// establishment was reported, and the context removed after this is the last thing that could
+// have withdrawn it. Withdrawing from a session that holds none does nothing.
+//
+// Takes smContext.SMLock.
+func ReportEstablishmentFailure(smContext *smf_context.SMContext) {
+	smContext.SMLock.Lock()
+	defer smContext.SMLock.Unlock()
+
+	if smContext.LiEstablishmentReported {
+		reportAndUntask(smContext)
+
+		return
+	}
+
+	liReportEstablishmentReject(smContext, nasMessage.Cause5GSMRequestRejectedUnspecified)
+	liUntriggerCC(smContext)
+}
 
 // reportAndUntask ends a session's interception state: the release record for the
 // mediation function, and the withdrawal of the triggers that session held.

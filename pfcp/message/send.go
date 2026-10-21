@@ -1046,35 +1046,6 @@ func handlePfcpSendError(msg message.Message, pfcpErr error, localSEID uint64, s
 	}
 }
 
-// ReportEstablishmentReject and ReportModificationReject are the Lawful Interception hooks this
-// package raises when a PDU session procedure fails on a PFCP send. They are assigned by the
-// service wiring, because this package may not import lawfulintercept — its tests import this one.
-//
-// **They exist because these paths build their own reject and never reach the producer's.** The
-// producer funnels its refusals through one helper precisely so a new rejection path cannot be
-// added without the record; these two are older, sit below it, and were never joined to it. For a
-// tasked subject that means a PDU session that failed because the user plane was unreachable
-// produced no record at all — the agency sees nothing, which is what it also sees for a subject
-// who never tried.
-var (
-	ReportEstablishmentReject func(sc *smf_context.SMContext, cause uint8)
-	ReportModificationReject  func(sc *smf_context.SMContext, cause uint8)
-)
-
-// notifyEstablishmentReject calls the hook if one is wired.
-func notifyEstablishmentReject(sc *smf_context.SMContext, cause uint8) {
-	if ReportEstablishmentReject != nil {
-		ReportEstablishmentReject(sc, cause)
-	}
-}
-
-// notifyModificationReject calls the hook if one is wired.
-func notifyModificationReject(sc *smf_context.SMContext, cause uint8) {
-	if ReportModificationReject != nil {
-		ReportModificationReject(sc, cause)
-	}
-}
-
 func handleSendPfcpSessEstReqError(msg message.Message, pfcpErr error) {
 	// Lets decode the PDU request
 	pfcpEstReq, ok := msg.(*message.SessionEstablishmentRequest)
@@ -1090,12 +1061,6 @@ func handleSendPfcpSessEstReqError(msg message.Message, pfcpErr error) {
 		return
 	}
 	smContext.SubPfcpLog.Errorf("PFCP Session Establishment send failure, %v", pfcpErr.Error())
-
-	// Lawful Interception IRI-POI: the establishment has failed and every exit below removes the
-	// SM context, so this is the point at which the outcome is decided — before the branches,
-	// because two of them abandon the reject they were building and the procedure has failed on
-	// all of them alike. The cause is the one the reject carries.
-	notifyEstablishmentReject(smContext, nasMessage.Cause5GSMRequestRejectedUnspecified)
 	// N1N2 Request towards AMF
 	n1n2Request := models.NewN1N2MessageTransferRequest()
 
@@ -1221,12 +1186,6 @@ func handleSendPfcpSessModReqError(msg message.Message, pfcpErr error, localSEID
 	}
 
 	smContext.SubPfcpLog.Errorf("PFCP Session Modification send failure, %v", pfcpErr.Error())
-
-	// Lawful Interception IRI-POI: the counterpart to the modification record the producer
-	// already emitted before this send was attempted. Without it the agency holds a record
-	// asserting a modification that never took effect and nothing saying so — the same shape the
-	// release path has handled on all three of its failure branches since it was written.
-	notifyModificationReject(smContext, nasMessage.Cause5GSMRequestRejectedUnspecified)
 
 	// Only for a request its sender waits on, and only while the session still waits: the state
 	// alone is shared by every modification in flight on the session, awaited or not.
