@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/omec-project/li/types"
 	smfctx "github.com/omec-project/smf/context"
+	"github.com/omec-project/util/li/types"
 )
 
 // TestARestoredReleaseIsReportableAgainAndRetasksNothing is the effect the producer's

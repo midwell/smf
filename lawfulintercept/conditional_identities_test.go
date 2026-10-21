@@ -6,12 +6,12 @@ package lawfulintercept
 import (
 	"testing"
 
-	"github.com/omec-project/li/iri"
 	"github.com/omec-project/nas/v2/nasMessage"
 	"github.com/omec-project/openapi/v2/models"
 	smfctx "github.com/omec-project/smf/context"
 	"github.com/omec-project/smf/factory"
 	"github.com/omec-project/smf/logger"
+	"github.com/omec-project/util/li/iri"
 )
 
 // The conditional members of TS 33.128 the SMF holds and did not report —

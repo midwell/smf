@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/omec-project/li/types"
+	"github.com/omec-project/util/li/types"
 )
 
 // noGoroutineIn fails unless no goroutine is running any of the named functions.

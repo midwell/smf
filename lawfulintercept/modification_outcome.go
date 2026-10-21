@@ -6,9 +6,9 @@ package lawfulintercept
 import (
 	"time"
 
-	"github.com/omec-project/li/x1"
 	smfctx "github.com/omec-project/smf/context"
 	"github.com/omec-project/smf/pfcp/lisequence"
+	"github.com/omec-project/util/li/x1"
 	"github.com/wmnsk/go-pfcp/ie"
 )
 

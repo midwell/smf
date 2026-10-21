@@ -257,7 +257,7 @@ func scanIRIConversions(t *testing.T) []conversionSite {
 func iriImportAlias(file *ast.File) string {
 	for _, imp := range file.Imports {
 		path, err := strconv.Unquote(imp.Path.Value)
-		if err != nil || path != "github.com/omec-project/li/iri" {
+		if err != nil || path != "github.com/omec-project/util/li/iri" {
 			continue
 		}
 		if imp.Name != nil {

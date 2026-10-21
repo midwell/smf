@@ -6,7 +6,7 @@ package lawfulintercept
 import (
 	"testing"
 
-	"github.com/omec-project/li/store"
+	"github.com/omec-project/util/li/store"
 )
 
 // TestTheX1AnswerCarriesThisElementsOwnDeliveryFault asserts the wiring, not the mechanism.

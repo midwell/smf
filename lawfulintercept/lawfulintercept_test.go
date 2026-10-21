@@ -12,17 +12,17 @@ import (
 	"testing"
 	"time"
 
-	"github.com/omec-project/li/iri"
-	"github.com/omec-project/li/store"
-	"github.com/omec-project/li/types"
-	"github.com/omec-project/li/x1"
-	"github.com/omec-project/li/x2x3"
 	"github.com/omec-project/nas/v2/nasMessage"
 	"github.com/omec-project/openapi/v2/models"
 	smfctx "github.com/omec-project/smf/context"
 	"github.com/omec-project/smf/factory"
 	"github.com/omec-project/smf/pfcp/message"
 	"github.com/omec-project/smf/smferrors"
+	"github.com/omec-project/util/li/iri"
+	"github.com/omec-project/util/li/store"
+	"github.com/omec-project/util/li/types"
+	"github.com/omec-project/util/li/x1"
+	"github.com/omec-project/util/li/x2x3"
 )
 
 // captureSender records the xIRI PDUs delivered, standing in for the X2 client

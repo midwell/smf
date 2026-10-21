@@ -21,8 +21,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/omec-project/li/x1"
-	"github.com/omec-project/li/x2x3"
+	"github.com/omec-project/util/li/x1"
+	"github.com/omec-project/util/li/x2x3"
 )
 
 // loopbackPKI is liPKI with an IP SAN, so a stub mediation function on the loopback

@@ -10,10 +10,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/omec-project/li/store"
-	"github.com/omec-project/li/types"
-	"github.com/omec-project/li/x1"
 	smfctx "github.com/omec-project/smf/context"
+	"github.com/omec-project/util/li/store"
+	"github.com/omec-project/util/li/types"
+	"github.com/omec-project/util/li/x1"
 )
 
 // unansweringADMF accepts the report and never answers it, which is the state a task

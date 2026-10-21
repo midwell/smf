@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/omec-project/li/types"
-	"github.com/omec-project/li/x1"
+	"github.com/omec-project/util/li/types"
+	"github.com/omec-project/util/li/x1"
 )
 
 // hangingPOI accepts the connection and never answers, so a keepalive to it costs the

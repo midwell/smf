@@ -6,8 +6,8 @@ package lawfulintercept
 import (
 	"testing"
 
-	"github.com/omec-project/li/types"
 	smfctx "github.com/omec-project/smf/context"
+	"github.com/omec-project/util/li/types"
 )
 
 // TestARetargetMidScanStopsDeliveringForThePreviousSubject is the subject half of

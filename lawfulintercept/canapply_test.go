@@ -15,8 +15,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/omec-project/li/store"
-	"github.com/omec-project/li/types"
+	"github.com/omec-project/util/li/store"
+	"github.com/omec-project/util/li/types"
 )
 
 // oidUID is the UID relative distinguished name (RFC 4519 section 2.39), which is

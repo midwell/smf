@@ -6,7 +6,7 @@ package lawfulintercept
 import (
 	"testing"
 
-	"github.com/omec-project/li/types"
+	"github.com/omec-project/util/li/types"
 )
 
 // TestTheConfiguredEndpointServesAnUnnamedDestinationOnly is the decision the three
