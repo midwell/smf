@@ -111,7 +111,7 @@ func TestAFailedModificationSendIsReported(t *testing.T) {
 
 	handleSendPfcpSessModReqError(
 		message.NewSessionModificationRequest(0, 0, seid, 1, 0),
-		errors.New("no response from UPF"))
+		errors.New("no response from UPF"), 0, false, true)
 
 	if reported == nil {
 		t.Fatal("a PDU session modification that failed because the user plane did not answer " +

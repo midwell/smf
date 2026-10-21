@@ -10,6 +10,8 @@ import (
 	"github.com/omec-project/nas/v2/nasMessage"
 	"github.com/omec-project/openapi/v2/models"
 	smfctx "github.com/omec-project/smf/context"
+	"github.com/omec-project/smf/factory"
+	"github.com/omec-project/smf/logger"
 )
 
 // The conditional members of TS 33.128 the SMF holds and did not report —
@@ -202,7 +204,14 @@ func TestTheN11RequestSuppliesTheAMFIdentityAndAuthenticationStatus(t *testing.T
 		RatType:             &rat,
 	}
 
-	sc := &smfctx.SMContext{PDUSessionID: 5}
+	// SetCreateData resolves the session's T3591 from the configuration and logs the
+	// result, so both have to exist for a bare context.
+	if factory.SmfConfig.Configuration == nil {
+		factory.SmfConfig.Configuration = &factory.Configuration{}
+		t.Cleanup(func() { factory.SmfConfig.Configuration = nil })
+	}
+
+	sc := &smfctx.SMContext{PDUSessionID: 5, SubCtxLog: logger.CtxLog}
 	sc.SetCreateData(create)
 
 	est := smfEstablishment(sc)

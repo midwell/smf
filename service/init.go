@@ -287,7 +287,7 @@ func (smf *SMF) Start() {
 					logger.PollConfigLog.Errorf("SMF context update failed: %v", err)
 					continue
 				}
-				logger.PollConfigLog.Debugln("SMF context updated from WebConsole config")
+				logger.PollConfigLog.Infof("SMF context updated from WebConsole config with %d slice(s)", len(cfg))
 				smfContext.AllocateUPFID()
 				logger.AppLog.Debugf("UserPlaneInformation: %+v", smfSelf.UserPlaneInformation)
 				if smfSelf.UserPlaneInformation != nil && smfSelf.UserPlaneInformation.UPFs != nil {
@@ -379,7 +379,8 @@ func (smf *SMF) Start() {
 	time.Sleep(1000 * time.Millisecond)
 
 	HTTPAddr := fmt.Sprintf("%s:%d", smfSelf.BindingIPv4, smfSelf.SBIPort)
-	sslLog := filepath.Dir(factory.SmfConfig.CfgLocation) + "/sslkey.log"
+	// TLS key logging is a debugging aid: off unless the operator sets SSLKEYLOGFILE.
+	sslLog := os.Getenv("SSLKEYLOGFILE")
 	server, err := http2_util.NewServer(HTTPAddr, sslLog, router)
 	if server == nil || err != nil {
 		logger.InitLog.Errorf("initialize HTTP server failed: %v", err)
@@ -391,6 +392,10 @@ func (smf *SMF) Start() {
 	case "http":
 		err = server.ListenAndServe()
 	case "https":
+		if server.TLSConfig != nil && server.TLSConfig.KeyLogWriter != nil {
+			logger.InitLog.Warnf("TLS key logging is enabled (SSLKEYLOGFILE=%s): SBI traffic is "+
+				"decryptable by anyone who can read this file", sslLog)
+		}
 		err = server.ListenAndServeTLS(smfSelf.PEM, smfSelf.Key)
 	default:
 		logger.InitLog.Fatalf("HTTP server setup failed: invalid server scheme %+v", serverScheme)

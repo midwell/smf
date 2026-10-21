@@ -18,6 +18,7 @@ import (
 	"github.com/omec-project/nas/v2/nasType"
 	"github.com/omec-project/openapi/v2/models"
 	"github.com/omec-project/smf/factory"
+	"github.com/omec-project/smf/nasconv"
 	"github.com/omec-project/smf/qos"
 	errors "github.com/omec-project/smf/smferrors"
 )
@@ -26,7 +27,7 @@ const (
 	PTI uint8 = 0 // indicates that the request is initiated by the core network.
 )
 
-// sessionAmbrForNas encodes a session AMBR for the UE. nasConvert.ModelsToSessionAMBR reads each
+// sessionAmbrForNas encodes a session AMBR for the UE. nasconv.ModelsToSessionAMBR reads each
 // direction's unit from the second token without looking, so a rate with no unit -- "10", which a
 // policy can carry -- indexed past the end and took the SMF down building the UE's establishment
 // accept or modification command: the defect this change fixed in the user plane's converter and
@@ -47,7 +48,7 @@ func sessionAmbrForNas(ambr *models.Ambr) nasType.SessionAMBR {
 		readable.Downlink = "0 Kbps"
 	}
 
-	return nasConvert.ModelsToSessionAMBR(&readable)
+	return nasconv.ModelsToSessionAMBR(&readable)
 }
 
 func BuildGSMPDUSessionEstablishmentAccept(smContext *SMContext) ([]byte, error) {
@@ -209,7 +210,16 @@ func BuildGSMPDUSessionEstablishmentReject(smContext *SMContext, cause uint8) ([
 	return m.PlainNasEncode()
 }
 
-/*func BuildGSMPDUSessionModificationReject(smContext *SMContext, cause uint8) ([]byte, error) {
+// BuildGSMPDUSessionModificationRejectWithCause builds a PDU SESSION MODIFICATION REJECT for a
+// modification the network will not perform.
+//
+// 3GPP Reference: TS 24.501 subclause 8.3.8.
+//
+// The PDU session identity and the PTI are taken from the request rather than from the SM context.
+// The identity may not match the context at all — that is one of the reasons for refusing — and
+// the PTI identifies the UE's procedure, so echoing the context's value would leave the UE unable
+// to match the reject to what it asked for.
+func BuildGSMPDUSessionModificationRejectWithCause(pduSessionID int32, pti uint8, cause string) ([]byte, error) {
 	m := nas.NewMessage()
 	m.GsmMessage = nas.NewGsmMessage()
 	m.GsmHeader.SetMessageType(nas.MsgTypePDUSessionModificationReject)
@@ -219,11 +229,16 @@ func BuildGSMPDUSessionEstablishmentReject(smContext *SMContext, cause uint8) ([
 
 	pDUSessionModificationReject.SetMessageType(nas.MsgTypePDUSessionModificationReject)
 	pDUSessionModificationReject.SetExtendedProtocolDiscriminator(nasMessage.Epd5GSSessionManagementMessage)
-	pDUSessionModificationReject.SetPDUSessionID(uint8(smContext.PDUSessionID))
-	pDUSessionModificationReject.SetCauseValue(cause)
+	pDUSessionModificationReject.SetPDUSessionID(uint8(pduSessionID))
+	pDUSessionModificationReject.SetPTI(pti)
+	pDUSessionModificationReject.SetCauseValue(errors.ErrorCause[cause])
 
+	// No Back-off timer value IE. TS 24.501 subclause 6.4.2.4.3 item a has the UE fall back to its
+	// configured SM Retry Timer, or 12 minutes, when the network sends #32 without one — which is
+	// the behaviour wanted here. Sending the IE would also require the Re-attempt indicator to be
+	// meaningful, and neither is mandatory.
 	return m.PlainNasEncode()
-}*/
+}
 
 func BuildGSMPDUSessionReleaseCommand(smContext *SMContext) ([]byte, error) {
 	m := nas.NewMessage()

@@ -15,7 +15,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/mohae/deepcopy"
+	gojson "github.com/goccy/go-json"
 	"github.com/omec-project/openapi/v2"
 	"github.com/omec-project/openapi/v2/Nnrf_NFDiscovery"
 	"github.com/omec-project/openapi/v2/Nnrf_NFManagement"
@@ -119,20 +119,20 @@ func getNfProfile(smfCtx *smfContext.SMFContext, sessionCfgs []nfConfigApi.Sessi
 		}
 	}
 	nfServiceList := make(map[string]models.NFService, len(serviceNames))
+	apiPrefix := fmt.Sprintf("%s://%s:%d", smfCtx.URIScheme, advertisedRegisterIPv4, smfCtx.SBIPort)
+	var svc models.NFService
+	svc.SetScheme(smfCtx.URIScheme)
+	svc.SetNfServiceStatus(models.NFSERVICESTATUS_REGISTERED)
+	svc.SetApiPrefix(apiPrefix)
+	svc.SetAllowedPlmns(plmnList)
 	for _, serviceName := range serviceNames {
-		svc := models.NFService{
-			ServiceInstanceId: smfCtx.NfInstanceID + "-" + serviceName,
-			ServiceName:       models.ServiceName(serviceName),
-			Scheme:            smfCtx.URIScheme,
-			NfServiceStatus:   models.NFSERVICESTATUS_REGISTERED,
-			ApiPrefix:         openapi.PtrString(fmt.Sprintf("%s://%s:%d", smfCtx.URIScheme, advertisedRegisterIPv4, smfCtx.SBIPort)),
-			Versions: []models.NFServiceVersion{{
-				ApiVersionInUri: "v1",
-				ApiFullVersion:  fmt.Sprintf("%s://%s:%d/nsmf-pdusession/v1", smfCtx.URIScheme, advertisedRegisterIPv4, smfCtx.SBIPort),
-			}},
-			AllowedPlmns: plmnList,
-		}
-		nfServiceList[svc.ServiceInstanceId] = svc
+		var nfServiceVersion models.NFServiceVersion
+		nfServiceVersion.SetApiVersionInUri("v1")
+		nfServiceVersion.SetApiFullVersion(fmt.Sprintf("%s/nsmf-pdusession/v1", apiPrefix))
+		svc.SetVersions([]models.NFServiceVersion{nfServiceVersion})
+		svc.SetServiceInstanceId(smfCtx.NfInstanceID + "-" + serviceName)
+		svc.SetServiceName(models.ServiceName(serviceName))
+		nfServiceList[svc.GetServiceInstanceId()] = svc
 	}
 
 	profile.SetNfInstanceId(smfCtx.NfInstanceID)
@@ -149,7 +149,7 @@ func getNfProfile(smfCtx *smfContext.SMFContext, sessionCfgs []nfConfigApi.Sessi
 }
 
 func buildSmfInfo(sessionCfgs []nfConfigApi.SessionManagement) models.SmfInfo {
-	snssaiSmfInfoList := []models.SnssaiSmfInfoItem{}
+	var snssaiSmfInfoList []models.SnssaiSmfInfoItem
 	for _, sessionCfg := range sessionCfgs {
 		snssai := models.Snssai{
 			Sst: sessionCfg.Snssai.GetSst(),
@@ -160,24 +160,26 @@ func buildSmfInfo(sessionCfgs []nfConfigApi.SessionManagement) models.SmfInfo {
 		item := models.SnssaiSmfInfoItem{
 			SNssai: snssai,
 		}
-		dnnList := []models.DnnSmfInfoItem{}
-		for _, ipdomain := range sessionCfg.IpDomain {
-			if ipdomain.DnnName != "" {
-				dnnList = append(dnnList, models.DnnSmfInfoItem{Dnn: ipdomain.DnnName})
+		var dnnList []models.DnnSmfInfoItem
+		for _, ipdomain := range sessionCfg.GetIpDomain() {
+			if ipdomain.GetDnnName() != "" {
+				dnnList = append(dnnList, models.DnnSmfInfoItem{Dnn: ipdomain.GetDnnName()})
 			}
 		}
 
 		if len(dnnList) > 0 {
-			item.DnnSmfInfoList = dnnList
+			item.SetDnnSmfInfoList(dnnList)
 		}
 		snssaiSmfInfoList = append(snssaiSmfInfoList, item)
 	}
 
-	return models.SmfInfo{SNssaiSmfInfoList: snssaiSmfInfoList}
+	var smfInfo models.SmfInfo
+	smfInfo.SetSNssaiSmfInfoList(snssaiSmfInfoList)
+	return smfInfo
 }
 
 func buildPlmnList(sessionCfgs []nfConfigApi.SessionManagement) []models.PlmnId {
-	plmns := []models.PlmnId{}
+	var plmns []models.PlmnId
 	for _, sessionCfg := range sessionCfgs {
 		plmns = append(plmns, models.PlmnId{
 			Mcc: sessionCfg.PlmnId.GetMcc(),
@@ -188,7 +190,7 @@ func buildPlmnList(sessionCfgs []nfConfigApi.SessionManagement) []models.PlmnId 
 }
 
 func buildSNssais(sessionCfgs []nfConfigApi.SessionManagement) []models.Snssai {
-	snssais := []models.Snssai{}
+	var snssais []models.Snssai
 	for _, sessionCfg := range sessionCfgs {
 		snssai := models.Snssai{
 			Sst: sessionCfg.Snssai.GetSst(),
@@ -406,7 +408,7 @@ func SendNrfForNfInstance(ctx context.Context, nrfUri string, targetNfType, requ
 }
 
 func SendNFDiscoveryUDM() (*models.ProblemDetails, error) {
-	localVarOptionals := Nnrf_NFDiscovery.ApiSearchNFInstancesRequest{}
+	var localVarOptionals Nnrf_NFDiscovery.ApiSearchNFInstancesRequest
 
 	var result *models.SearchResult
 	var localErr error
@@ -458,7 +460,7 @@ func SendNFDiscoveryUDM() (*models.ProblemDetails, error) {
 }
 
 func SendNFDiscoveryServingAMF(smContext *smfContext.SMContext) (*models.ProblemDetails, error) {
-	localVarOptionals := Nnrf_NFDiscovery.ApiSearchNFInstancesRequest{}
+	var localVarOptionals Nnrf_NFDiscovery.ApiSearchNFInstancesRequest
 
 	localVarOptionals = localVarOptionals.TargetNfInstanceId(smContext.ServingNfId)
 
@@ -473,11 +475,20 @@ func SendNFDiscoveryServingAMF(smContext *smfContext.SMContext) (*models.Problem
 	}
 
 	if localErr == nil {
-		if result.NfInstances == nil {
-			return nil, openapi.ReportError("NfInstances is nil")
+		instances, ok := result.GetNfInstancesOk()
+		if !ok || len(instances) == 0 {
+			return nil, openapi.ReportError("NfInstances is empty")
 		}
 		smContext.SubConsumerLog.Info("send NF Discovery Serving AMF Successful")
-		smContext.AMFProfile = deepcopy.Copy(result.NfInstances[0]).(models.NFProfileDiscovery)
+		data, err := gojson.Marshal(instances[0])
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal AMF profile: %w", err)
+		}
+		var profile models.NFProfileDiscovery
+		if err := gojson.Unmarshal(data, &profile); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal AMF profile: %w", err)
+		}
+		smContext.AMFProfile = profile
 	} else {
 		if problem, handledErr := util.HandleOpenAPIError(localErr); problem != nil {
 			return problem, nil
@@ -498,6 +509,17 @@ func SendNFDiscoveryServingAMF(smContext *smfContext.SMContext) (*models.Problem
 func SendN1N2TransferWithRediscovery(ctx context.Context, smContext *smfContext.SMContext,
 	n1n2Request *models.N1N2MessageTransferRequest,
 ) (*models.N1N2MessageTransferRspData, error) {
+	rspData, _, err := SendN1N2TransferCountingSends(ctx, smContext, n1n2Request)
+	return rspData, err
+}
+
+// SendN1N2TransferCountingSends is SendN1N2TransferWithRediscovery, reporting as well how many
+// transfers it sent. More than one means a transfer that got no HTTP answer was retried against
+// another AMF, and the one that got no answer may still have been delivered: the UE can then hold
+// two copies of the same message.
+func SendN1N2TransferCountingSends(ctx context.Context, smContext *smfContext.SMContext,
+	n1n2Request *models.N1N2MessageTransferRequest,
+) (*models.N1N2MessageTransferRspData, int, error) {
 	// Re-discovery mutates AMFProfile/ServingNfId/CommunicationClient while trying
 	// candidates. Snapshot them so a failed or aborted re-discovery leaves the session
 	// pointing at its original serving AMF rather than the last (failed) candidate —
@@ -522,7 +544,7 @@ func SendN1N2TransferWithRediscovery(ctx context.Context, smContext *smfContext.
 		smContext.RebuildCommunicationClient()
 		if smContext.CommunicationClient == nil {
 			if err := selectAmfFromNrf(ctx, smContext); err != nil {
-				return nil, fmt.Errorf("AMF discovery failed: %w", err)
+				return nil, 0, fmt.Errorf("AMF discovery failed: %w", err)
 			}
 		}
 	}
@@ -531,13 +553,13 @@ func SendN1N2TransferWithRediscovery(ctx context.Context, smContext *smfContext.
 	rspData, err := tryN1N2Transfer(ctx, smContext, n1n2Request)
 	if err == nil {
 		committed = true
-		return rspData, nil
+		return rspData, 1, nil
 	}
 	// Only re-discover on transport-level failures (no HTTP response). An HTTP error
 	// from a reachable AMF, or a cancelled caller context, must not trigger retries
 	// against other AMFs (would risk duplicate N1/N2 delivery / ignore cancellation).
 	if !shouldRediscoverAMF(ctx, err) {
-		return rspData, err
+		return rspData, 1, err
 	}
 	smContext.SubPduSessLog.Warnf("N1N2Transfer failed (%v), attempting AMF re-discovery", err)
 
@@ -550,13 +572,13 @@ func SendN1N2TransferWithRediscovery(ctx context.Context, smContext *smfContext.
 	// with the same id but a new endpoint).
 	candidates, discErr := fetchAmfCandidates(ctx)
 	if discErr != nil {
-		return nil, fmt.Errorf("N1N2Transfer failed and AMF re-discovery failed: %w", errors.Join(err, discErr))
+		return nil, 1, fmt.Errorf("N1N2Transfer failed and AMF re-discovery failed: %w", errors.Join(err, discErr))
 	}
 
 	attempted := 0
 	for _, candidate := range orderAmfCandidates(candidates, smContext.ServingNfId) {
 		if ctx.Err() != nil {
-			return nil, fmt.Errorf("N1N2Transfer aborted during AMF re-discovery: %w", ctx.Err())
+			return nil, 1 + attempted, fmt.Errorf("N1N2Transfer aborted during AMF re-discovery: %w", ctx.Err())
 		}
 		if useErr := useAmfProfile(smContext, candidate); useErr != nil {
 			smContext.SubPduSessLog.Warnf("AMF candidate %s unusable: %v", candidate.GetNfInstanceId(), useErr)
@@ -568,15 +590,15 @@ func SendN1N2TransferWithRediscovery(ctx context.Context, smContext *smfContext.
 		if err == nil {
 			smContext.SubPduSessLog.Infof("AMF re-discovery succeeded on attempt %d with NfInstanceId %s", attempted, candidate.GetNfInstanceId())
 			committed = true
-			return rspData, nil
+			return rspData, 1 + attempted, nil
 		}
 		smContext.SubPduSessLog.Warnf("AMF re-discovery retry %d failed: %v", attempted, err)
 	}
 
 	if attempted == 0 {
-		return nil, fmt.Errorf("N1N2Transfer failed (%w) and no alternative AMF candidates available", err)
+		return nil, 1, fmt.Errorf("N1N2Transfer failed (%w) and no alternative AMF candidates available", err)
 	}
-	return nil, fmt.Errorf("N1N2Transfer failed after %d AMF candidates; last error: %w", attempted, err)
+	return nil, 1 + attempted, fmt.Errorf("N1N2Transfer failed after %d AMF candidates; last error: %w", attempted, err)
 }
 
 // shouldRediscoverAMF reports whether an N1N2MessageTransfer error warrants AMF
@@ -691,7 +713,15 @@ func fetchAmfCandidates(ctx context.Context) ([]models.NFProfileDiscovery, error
 
 // useAmfProfile selects the given AMF profile on the SMContext and rebuilds the CommunicationClient.
 func useAmfProfile(smContext *smfContext.SMContext, profile models.NFProfileDiscovery) error {
-	smContext.AMFProfile = deepcopy.Copy(profile).(models.NFProfileDiscovery)
+	data, err := gojson.Marshal(profile)
+	if err != nil {
+		return fmt.Errorf("failed to marshal AMF profile: %w", err)
+	}
+	var profileCopy models.NFProfileDiscovery
+	if err := gojson.Unmarshal(data, &profileCopy); err != nil {
+		return fmt.Errorf("failed to unmarshal AMF profile: %w", err)
+	}
+	smContext.AMFProfile = profileCopy
 	smContext.ServingNfId = smContext.AMFProfile.GetNfInstanceId()
 	smContext.RebuildCommunicationClient()
 	if smContext.CommunicationClient == nil {

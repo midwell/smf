@@ -123,3 +123,75 @@ func TestProbeUpfMarksSettingUpAfterSuccessfulSend(t *testing.T) {
 		t.Errorf("AssociationSetupSentAt was not refreshed for the new send: got %v, want at/after %v", upf.AssociationSetupSentAt, before)
 	}
 }
+
+// A heartbeat that could not be delivered is one the user plane has not answered, and it counts
+// toward declaring the user plane lost. Only sends that succeeded were counted, so a user plane
+// behind an adapter that was down or refusing never reached the limit: it stayed associated for
+// as long as it was unreachable, and new sessions went on being placed on it.
+func TestAHeartbeatThatCouldNotBeSentCountsAsUnanswered(t *testing.T) {
+	configureForNativeDatapath(t)
+	// No SMF socket, so every send fails with "PFCP server is not initialized".
+
+	upf := context.NewUPF(context.NewNodeID("127.0.0.1"), nil)
+	upf.UPFStatus = context.AssociatedSetUpSuccess
+	upf.Port = 1234
+
+	heartbeatUpf(upf)
+
+	if upf.NHeartBeat != 1 {
+		t.Errorf("NHeartBeat = %d after a heartbeat that could not be sent, want 1", upf.NHeartBeat)
+	}
+}
+
+// And a user plane that cannot be reached at all is, in the end, declared lost -- which is what
+// the count exists for.
+func TestAUserPlaneThatCannotBeHeartbeatedIsEventuallyDeclaredLost(t *testing.T) {
+	configureForNativeDatapath(t)
+
+	upf := context.NewUPF(context.NewNodeID("127.0.0.1"), nil)
+	upf.UPFStatus = context.AssociatedSetUpSuccess
+	upf.Port = 1234
+
+	for range maxHeartbeatRetry + 1 {
+		heartbeatUpf(upf)
+	}
+
+	if upf.UPFStatus != context.NotAssociated {
+		t.Errorf("UPFStatus = %v after %d undeliverable heartbeats, want NotAssociated", upf.UPFStatus, maxHeartbeatRetry+1)
+	}
+}
+
+// TS 29.244 clause 5.8.2: while an association is established the CP function checks the UP
+// function's responsiveness with heartbeats. That does not stop when the UPF leaves the
+// configuration -- an empty configuration, or one that omits it -- because the association does
+// not end there. A UPF that hears nothing from the SMF drops the association after its own read
+// timeout, along with every session on it, so going quiet loses state the configuration may be
+// about to use again.
+func TestAnAssociatedUPFOutsideTheConfigurationIsStillHeartbeated(t *testing.T) {
+	configureForNativeDatapath(t)
+	// No SMF socket, so the send fails; a failed send is still counted, which is what shows the
+	// heartbeat was attempted.
+
+	upf := context.NewUPF(context.NewNodeID("192.0.2.21"), nil)
+	upf.UPFStatus = context.AssociatedSetUpSuccess
+	t.Cleanup(func() { context.RemoveUPFNodeByNodeID(upf.NodeID) })
+
+	idle := context.NewUPF(context.NewNodeID("192.0.2.22"), nil)
+	idle.UPFStatus = context.NotAssociated
+	t.Cleanup(func() { context.RemoveUPFNodeByNodeID(idle.NodeID) })
+
+	saved := context.SMF_Self().UserPlaneInformation
+	context.SMF_Self().UserPlaneInformation = &context.UserPlaneInformation{
+		UPFs: map[string]*context.UPNode{},
+	}
+	t.Cleanup(func() { context.SMF_Self().UserPlaneInformation = saved })
+
+	heartbeatAll()
+
+	if upf.NHeartBeat != 1 {
+		t.Errorf("NHeartBeat = %d for an associated UPF outside the configuration, want 1", upf.NHeartBeat)
+	}
+	if idle.NHeartBeat != 0 {
+		t.Errorf("NHeartBeat = %d for a UPF that is not associated, want 0", idle.NHeartBeat)
+	}
+}

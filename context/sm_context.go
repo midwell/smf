@@ -18,7 +18,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/omec-project/nas/v2/nasConvert"
 	"github.com/omec-project/nas/v2/nasMessage"
 	"github.com/omec-project/openapi/v2/Namf_Communication"
 	"github.com/omec-project/openapi/v2/Nnrf_NFDiscovery"
@@ -29,6 +28,7 @@ import (
 	"github.com/omec-project/smf/logger"
 	"github.com/omec-project/smf/metrics"
 	"github.com/omec-project/smf/msgtypes/svcmsgtypes"
+	"github.com/omec-project/smf/nasconv"
 	"github.com/omec-project/smf/qos"
 	errors "github.com/omec-project/smf/smferrors"
 	"github.com/omec-project/smf/transaction"
@@ -115,11 +115,93 @@ type SMContext struct {
 	// and whether it was an emergency request. It is a mandatory field of the
 	// Lawful Interception establishment record, which previously reported every
 	// session as an initial request because nothing retained the real value.
-	RequestType      models.RequestType      `json:"requestType,omitempty" yaml:"requestType" bson:"requestType,omitempty"`
-	RatType          models.RatType          `json:"ratType,omitempty" yaml:"ratType" bson:"ratType,omitempty"`
-	PresenceInLadn   models.PresenceState    `json:"presenceInLadn,omitempty" yaml:"presenceInLadn" bson:"presenceInLadn,omitempty"` // ignore
-	HoState          models.HoState          `json:"hoState,omitempty" yaml:"hoState" bson:"hoState,omitempty"`
-	DnnConfiguration models.DnnConfiguration `json:"dnnConfiguration,omitempty" yaml:"dnnConfiguration" bson:"dnnConfiguration,omitempty"` // ?
+	RequestType models.RequestType `json:"requestType,omitempty" yaml:"requestType" bson:"requestType,omitempty"`
+	RatType     models.RatType     `json:"ratType,omitempty" yaml:"ratType" bson:"ratType,omitempty"`
+
+	// ExtendedNasSmTimer is the AMF's indication that the extended NAS timer values for access
+	// via a satellite NG-RAN cell apply to this session (TS 24.501 subclause 4.23.4).
+	ExtendedNasSmTimer bool `json:"extendedNasSmTimer,omitempty" yaml:"extendedNasSmTimer" bson:"extendedNasSmTimer,omitempty"`
+
+	// T3591Value and T3591Source are resolved once per session, as subclause 4.23.4 requires the
+	// value to be calculated at the start of a procedure and not recalculated until it completes,
+	// restarts or aborts. Ordinarily that is at creation, in SetCreateData. A session restored
+	// from a record written before this field existed carries zero, and startT3591Locked resolves
+	// it there rather than arming a timer with an interval time.NewTicker refuses.
+	T3591Value time.Duration `json:"t3591Value,omitempty" yaml:"t3591Value" bson:"t3591Value,omitempty"`
+
+	// T3591 is the live retransmission timer for a modification awaiting the UE's answer. It is
+	// a goroutine handle, so it is neither serialised nor restored with the session.
+	// NwModificationPending is true from the moment the network commits to modifying this session
+	// until the procedure ends, however it ends. It is what makes a colliding UE request
+	// recognisable, per TS 24.501 subclause 6.3.2.5 item d.
+	//
+	// T3591 alone will not do. It is armed only once the Command has gone out, and the procedure
+	// starts a PFCP round trip earlier — a UE request arriving in that window is just as much a
+	// collision as one arriving later, and would otherwise be refused instead of disregarded.
+	//
+	// Read and written under SMLock.
+	// Not persisted, for the same reason T3591 and Realign are not: it describes a procedure that
+	// is in flight right now. Restoring it from the database would leave a session with a
+	// modification permanently pending — no timer, no procedure, and every UE modification request
+	// for that session disregarded from then on.
+	NwModificationPending bool `json:"-" yaml:"-" bson:"-"`
+
+	// NwModificationGen counts the network-requested modifications started on this session, so
+	// that a procedure finishing late can tell whether the session has moved on to a later one.
+	// Read and written under SMLock; not persisted, for the reason NwModificationPending is not.
+	NwModificationGen uint64 `json:"-" yaml:"-" bson:"-"`
+
+	// DeferredPolicyDecisions holds the policy decisions that arrived while a network-requested
+	// modification was pending, oldest first. Each is applied as a procedure of its own once the one
+	// before it ends. TS 24.501 subclause 6.3.2.5 gives the network no way to run two at once: the
+	// UE's answer to a Command carries no procedure transaction identity, so it cannot say which
+	// Command it answers. Read and written under SMLock. Not persisted: like NwModificationPending,
+	// it belongs to a procedure in flight, and a session restored without that procedure would
+	// never start the next one.
+	DeferredPolicyDecisions []*models.SmPolicyDecision `json:"-" yaml:"-" bson:"-"`
+
+	// NwModificationQuietFor is the T3591 interval of the pending modification once its Command has
+	// been retransmitted, and zero before; NwModificationQuietUntil is when the session may start the next
+	// network-requested modification after one that was. The UE answers every copy of a Command it
+	// receives, and a network-requested Command carries no procedure transaction identity, so a late
+	// answer to a retransmission is indistinguishable from an answer to the next Command; for one
+	// T3591 interval after such a procedure ends, decisions are held as if it were still pending.
+	// TS 24.501 subclause 6.3.2.3 NOTE 5 has the UE keep a PTI it assigned for at least the default
+	// T3591 for the same reason; this is the network-side counterpart for the unassigned one. Read
+	// and written under SMLock; not persisted, for the reason NwModificationPending is not.
+	NwModificationQuietFor   time.Duration `json:"-" yaml:"-" bson:"-"`
+	NwModificationQuietUntil time.Time     `json:"-" yaml:"-" bson:"-"`
+
+	// NwModificationUnsent is true from the moment a network-requested modification starts until its
+	// Command has been handed to the AMF. An answer arriving while it is set cannot be this
+	// procedure's -- the UE has nothing of it to answer -- so it is a late answer to an earlier
+	// Command, and is ignored. Read and written under SMLock; not persisted.
+	NwModificationUnsent bool `json:"-" yaml:"-" bson:"-"`
+
+	// RanAnswerPending is true from the moment a modification is sent towards the radio until its
+	// response or failure is acted on, or until the modification is abandoned. It is what tells a
+	// stale answer from the one this session is waiting for; NwModificationPending cannot, because
+	// it tracks the UE's half and the UE can answer before the radio does.
+	RanAnswerPending bool `json:"-" yaml:"-" bson:"-"`
+
+	T3591 *Timer `json:"-" yaml:"-" bson:"-"`
+
+	// Realign is set when the radio access network established only part of a modification. It is
+	// acted on once the UE acknowledges that modification, not before.
+	Realign *PendingRealignment `json:"-" yaml:"-" bson:"-"`
+
+	// CommittedBeforeRanAnswer holds the update a UE completion committed while the radio's answer
+	// was still outstanding. The two answers can arrive in either order, and the realignment is
+	// normally built by the completion, by pruning the still-pending update to what the radio
+	// established. When the UE is first there is no longer a pending update to prune -- it has been
+	// committed whole, refused flows and all -- so the answer that follows has to build the
+	// correction itself, and this is what it builds it from. Cleared as soon as that answer is
+	// acted on, when the modification is abandoned, and when the next one replaces it.
+	CommittedBeforeRanAnswer *qos.PolicyUpdate       `json:"-" yaml:"-" bson:"-"`
+	T3591Source              NasTimerSource          `json:"t3591Source,omitempty" yaml:"t3591Source" bson:"t3591Source,omitempty"`
+	PresenceInLadn           models.PresenceState    `json:"presenceInLadn,omitempty" yaml:"presenceInLadn" bson:"presenceInLadn,omitempty"` // ignore
+	HoState                  models.HoState          `json:"hoState,omitempty" yaml:"hoState" bson:"hoState,omitempty"`
+	DnnConfiguration         models.DnnConfiguration `json:"dnnConfiguration,omitempty" yaml:"dnnConfiguration" bson:"dnnConfiguration,omitempty"` // ?
 
 	Snssai         *models.Snssai       `json:"snssai" yaml:"snssai" bson:"snssai"`
 	HplmnSnssai    *models.Snssai       `json:"hplmnSnssai,omitempty" yaml:"hplmnSnssai" bson:"hplmnSnssai,omitempty"`
@@ -129,6 +211,13 @@ type SMContext struct {
 
 	// PDUAddress             net.IP `json:"pduAddress,omitempty" yaml:"pduAddress" bson:"pduAddress,omitempty"`
 	PDUAddress *UeIpAddr `json:"pduAddress,omitempty" yaml:"pduAddress" bson:"pduAddress,omitempty"`
+
+	// PolicyReportedIpv4 is the UE IPv4 address the PCF currently believes this session has. It is
+	// not always PDUAddress: the policy association is created before the N4 session, so the PCF is
+	// told the address the SMF allocated, and a UPF that allocates its own replaces it afterwards.
+	// Keeping what was sent is what makes the report idempotent -- the establishment response can
+	// arrive once per UPF in the path, and a session whose address never moved must send nothing.
+	PolicyReportedIpv4 string `json:"policyReportedIpv4,omitempty" yaml:"policyReportedIpv4" bson:"policyReportedIpv4,omitempty"`
 
 	// Client
 	SMPolicyClient      *Npcf_SMPolicyControl.APIClient `json:"smPolicyClient,omitempty" yaml:"smPolicyClient" bson:"smPolicyClient,omitempty"`                // ?
@@ -174,9 +263,42 @@ type SMContext struct {
 	// unsupported structure - madatory!
 	SBIPFCPCommunicationChan chan PFCPSessionResponseStatus `json:"-" yaml:"sbiPFCPCommunicationChan" bson:"-"` // ignore
 
-	PendingUPF PendingUPF `json:"pendingUPF,omitempty" yaml:"pendingUPF" bson:"pendingUPF,omitempty"` // ignore
+	// PendingUPF is excluded from JSON/BSON: it only tracks PFCP requests in flight for the
+	// current process, so a DB/API snapshot of it would be stale the instant it is read, and
+	// MarshalJSON/ToBsonM encode this field outside of PendingUPFLock (see below), so including
+	// it would race the PFCP response handlers that mutate it concurrently.
+	PendingUPF PendingUPF `json:"-" yaml:"-" bson:"-"` // ignore
+	// PendingUPFLock guards PendingUPF against the same unlocked-handler/SMLock-holder conflict
+	// LocalPurged has: releaseTunnel rebuilds PendingUPF under SMLock (both on the normal release
+	// path and from HandlePduSessionContextReplacement), while the PFCP modification/deletion
+	// response handlers delete from it without SMLock. A plain map under that pattern is a
+	// concurrent read/write, which for Go maps is not just a race but a potential process-crashing
+	// fatal error - unlike a scalar field, it cannot be made safe with atomic.Bool-style typing, so a
+	// dedicated mutex (distinct from SMLock, and never held across a blocking channel op) guards it
+	// instead.
+	// Every read or write of PendingUPF, anywhere in the codebase, must go through the
+	// ResetPendingUPF/AddPendingUPF/MergePendingUPF/DeletePendingUPF/HasPendingUPF/PendingUPFIsEmpty
+	// methods below rather than the field directly - a lock only some accessors take does not
+	// prevent the concurrent map access the others still cause.
+	PendingUPFLock sync.Mutex `json:"-" yaml:"-" bson:"-"` // ignore
+	// EstablishmentFailed latches a rejection seen from any UPF while PendingUPF is drained, so the
+	// verdict queued once it empties reflects every response gathered, not only the last one.
+	EstablishmentFailed bool `json:"-" yaml:"-" bson:"-"` // ignore
 	// NodeID(string form) to PFCP Session Context
 	PFCPContext map[string]*PFCPSessionContext `json:"-" yaml:"pfcpContext" bson:"-"`
+	// seidToPFCPCtx indexes PFCPContext by each entry's local SEID, giving the entry's stable key
+	// (the UPF address resolved when it was allocated) and NodeID without iterating PFCPContext.
+	// GetPFCPContextKeyByLocalSEID/GetNodeIDByLocalSEID read it, and they run from handlers that do
+	// NOT hold SMLock -- the establishment send-error handler on the transaction goroutine, and the
+	// modification/deletion response handlers -- while AllocateLocalSEIDForDataPath inserts
+	// PFCPContext entries under SMLock (e.g. a PSA/ULCL branch activation reached from a response
+	// handler). Iterating the live PFCPContext map concurrently with that insertion is not just a
+	// race but a process-crashing fatal error ("concurrent map iteration and map write"), so those
+	// lookups read this index under seidToPFCPCtxLock instead. Taking SMLock in them would deadlock
+	// the establishment response handler, which already holds it. Rebuilt wherever PFCPContext is
+	// (AllocateLocalSEIDForDataPath and the DB restore path), exactly as PendingUPF is.
+	seidToPFCPCtx     map[uint64]seidPFCPRef `json:"-" yaml:"-" bson:"-"`
+	seidToPFCPCtxLock sync.RWMutex           `json:"-" yaml:"-" bson:"-"`
 	// TxnBus per subscriber
 	TxnBus transaction.TxnBus `json:"-" yaml:"txnBus" bson:"-"` // ignore
 	// SMTxnBusLock sync.Mutex         `json:"smTxnBusLock,omitempty" yaml:"smTxnBusLock" bson:"smTxnBusLock,omitempty"` // ignore
@@ -191,7 +313,11 @@ type SMContext struct {
 	SelectedPDUSessionType              uint8          `json:"selectedPDUSessionType,omitempty" yaml:"selectedPDUSessionType" bson:"selectedPDUSessionType,omitempty"`
 	UnauthenticatedSupi                 bool           `json:"unauthenticatedSupi,omitempty" yaml:"unauthenticatedSupi" bson:"unauthenticatedSupi,omitempty"`                                                 // sUPIUnauthenticated, TS 33.128 table 6.2.3-1
 	PDUSessionRelease_DUE_TO_DUP_PDU_ID bool           `json:"pduSessionRelease_DUE_TO_DUP_PDU_ID,omitempty" yaml:"pduSessionRelease_DUE_TO_DUP_PDU_ID" bson:"pduSessionRelease_DUE_TO_DUP_PDU_ID,omitempty"` // ignore
-	LocalPurged                         bool           `json:"localPurged,omitempty" yaml:"localPurged" bson:"localPurged,omitempty"`                                                                         // ignore
+	// atomic because the PFCP modification/deletion response handlers read it without SMLock:
+	// the producer side holds SMLock across its blocking wait on SBIPFCPCommunicationChan, so a
+	// handler that took SMLock to send on that channel would deadlock against itself.
+	// JSON and BSON exclude this runtime synchronization flag.
+	LocalPurged atomic.Bool `json:"-" yaml:"localPurged" bson:"-"`
 	// NAS
 	Pti                     uint8 `json:"pti,omitempty" yaml:"pti" bson:"pti,omitempty"` // ignore
 	EstAcceptCause5gSMValue uint8 `json:"estAcceptCause5gSMValue,omitempty" yaml:"estAcceptCause5gSMValue" bson:"estAcceptCause5gSMValue,omitempty"`
@@ -276,6 +402,113 @@ func (smContext *SMContext) initLogTags() {
 	smContext.SubConsumerLog = logger.ConsumerLog.With("uuid", smContext.Ref, "id", smContext.Identifier, "pduid", smContext.PDUSessionID)
 	smContext.SubFsmLog = logger.FsmLog.With("uuid", smContext.Ref, "id", smContext.Identifier, "pduid", smContext.PDUSessionID)
 	smContext.SubQosLog = logger.QosLog.With("uuid", smContext.Ref, "id", smContext.Identifier, "pduid", smContext.PDUSessionID)
+}
+
+// ResetPendingUPF replaces PendingUPF with entries (an empty map if entries is nil).
+func (smContext *SMContext) ResetPendingUPF(entries PendingUPF) {
+	if entries == nil {
+		entries = make(PendingUPF)
+	}
+	smContext.PendingUPFLock.Lock()
+	defer smContext.PendingUPFLock.Unlock()
+	smContext.PendingUPF = entries
+	// A fresh batch starts clean. AggregateEstablishmentResponse clears EstablishmentFailed only when
+	// it drains the batch to empty and produces a verdict; a batch abandoned before that (e.g. another
+	// request fails synchronously and wakes the create waiter, then a retry replaces PendingUPF) would
+	// otherwise carry a stale rejection into the new batch and report an all-accepted retry as failed.
+	// Reset under the same lock as the map so the latch and the batch it tracks never disagree.
+	smContext.EstablishmentFailed = false
+}
+
+// AddPendingUPF marks nodeIP as awaiting a PFCP response, creating PendingUPF first if nil.
+func (smContext *SMContext) AddPendingUPF(nodeIP string) {
+	smContext.PendingUPFLock.Lock()
+	defer smContext.PendingUPFLock.Unlock()
+	if smContext.PendingUPF == nil {
+		smContext.PendingUPF = make(PendingUPF)
+	}
+	smContext.PendingUPF[nodeIP] = true
+}
+
+// MergePendingUPF adds every entry of entries into PendingUPF without clearing what is already
+// there (unlike ResetPendingUPF), creating PendingUPF first if nil.
+func (smContext *SMContext) MergePendingUPF(entries PendingUPF) {
+	if len(entries) == 0 {
+		return
+	}
+	smContext.PendingUPFLock.Lock()
+	defer smContext.PendingUPFLock.Unlock()
+	if smContext.PendingUPF == nil {
+		smContext.PendingUPF = make(PendingUPF)
+	}
+	for nodeIP, v := range entries {
+		smContext.PendingUPF[nodeIP] = v
+	}
+}
+
+// DeletePendingUPF removes nodeIP and reports whether PendingUPF is now empty, as one atomic
+// operation: splitting the delete and the emptiness check across two lock acquisitions would let
+// a concurrent writer's entry land in between and be missed by the check.
+func (smContext *SMContext) DeletePendingUPF(nodeIP string) (empty bool) {
+	smContext.PendingUPFLock.Lock()
+	defer smContext.PendingUPFLock.Unlock()
+	delete(smContext.PendingUPF, nodeIP)
+	return smContext.PendingUPF.IsEmpty()
+}
+
+// HasPendingUPF reports whether nodeIP is already recorded in PendingUPF.
+func (smContext *SMContext) HasPendingUPF(nodeIP string) bool {
+	smContext.PendingUPFLock.Lock()
+	defer smContext.PendingUPFLock.Unlock()
+	_, exist := smContext.PendingUPF[nodeIP]
+	return exist
+}
+
+// PendingUPFIsEmpty reports whether PendingUPF currently has no entries.
+func (smContext *SMContext) PendingUPFIsEmpty() bool {
+	smContext.PendingUPFLock.Lock()
+	defer smContext.PendingUPFLock.Unlock()
+	return smContext.PendingUPF.IsEmpty()
+}
+
+// AggregateEstablishmentResponse folds one UPF's establishment verdict into the batch the create
+// procedure waits on, as a single atomic operation under PendingUPFLock. The establishment response
+// handlers hold SMLock, but the modification and deletion response handlers mutate PendingUPF
+// without it, so SMLock does not serialize all accesses -- only PendingUPFLock does. The map and the
+// EstablishmentFailed latch it drains alongside must therefore be touched only through this (and the
+// sibling PendingUPF helpers), never the field directly.
+//
+// upfIP is the UPF that just responded and accepted is its verdict. tracked reports whether that
+// UPF belonged to the pending batch; only those responses count toward the create verdict, so a
+// response from an unrelated PSA/ULCL branch addition (BPManager.PendingUPF, a separate map)
+// returns tracked=false and changes nothing. When the response was tracked and draining it empties
+// the batch, signal is true and verdict carries the aggregate: SessionEstablishFailed if any UPF in
+// the batch rejected, SessionEstablishSuccess otherwise. EstablishmentFailed latches a rejection
+// across responses and is cleared once the verdict is produced, so the next batch starts clean.
+//
+// The channel send that delivers the verdict is deliberately left to the caller: PendingUPFLock is
+// never held across a blocking channel operation, so the caller performs the (non-blocking) send
+// after this returns.
+func (smContext *SMContext) AggregateEstablishmentResponse(upfIP string, accepted bool) (tracked, signal bool, verdict PFCPSessionResponseStatus) {
+	smContext.PendingUPFLock.Lock()
+	defer smContext.PendingUPFLock.Unlock()
+
+	if _, pending := smContext.PendingUPF[upfIP]; !pending {
+		return false, false, verdict
+	}
+	delete(smContext.PendingUPF, upfIP)
+	if !accepted {
+		smContext.EstablishmentFailed = true
+	}
+	if !smContext.PendingUPF.IsEmpty() {
+		return true, false, verdict
+	}
+	verdict = SessionEstablishSuccess
+	if smContext.EstablishmentFailed {
+		verdict = SessionEstablishFailed
+	}
+	smContext.EstablishmentFailed = false
+	return true, true, verdict
 }
 
 func (smContext *SMContext) ChangeState(nextState SMContextState) {
@@ -534,6 +767,14 @@ func RemoveSMContextLocked(smContext *SMContext) {
 	smContext.SubCtxLog.Infof("RemoveSMContext, SM context released ")
 	smContext.ChangeState(SmStateRelease)
 
+	// A network-requested modification of a removed session ends here. Left running, T3591 went on
+	// retransmitting its Command for the removed context -- after a replacement establishment, to
+	// the UE's new session with the same PDU session ID -- and later abandoned it; cancelling it and
+	// dropping the handle makes both callbacks find their timer superseded. Decisions held for the
+	// session go with it.
+	smContext.StopT3591()
+	smContext.DeferredPolicyDecisions = nil
+
 	for _, pfcpSessionContext := range smContext.PFCPContext {
 		seidSMContextMap.Delete(pfcpSessionContext.LocalSEID)
 		if factory.SmfConfig.Configuration.EnableDbStore {
@@ -586,11 +827,17 @@ func (smContext *SMContext) ReleaseUeIpAddr() error {
 		logger.CtxLog.Warnf("ReleaseUeIpAddr: PduSessionUeAddress is nil, skipping release")
 		return nil
 	}
-	if ip := smContext.PDUAddress.Ip; ip != nil && !smContext.PDUAddress.UpfProvided {
-		smContext.SubPduSessLog.Infof("Release IP[%s]", smContext.PDUAddress.Ip.String())
-		smContext.DNNInfo.UeIPAllocator.Release(smContext.Supi, ip)
-		smContext.PDUAddress.Ip = net.IPv4(0, 0, 0, 0)
+	// net.IPv4zero is the sentinel this function itself writes back below once an address has
+	// been released: callers on independent cleanup paths (NAS release, PFCP session report,
+	// ReleaseSmContext) can each reach this function for the same context, and without this guard
+	// a second call would release the sentinel into the allocator instead of being a no-op.
+	ip := smContext.PDUAddress.Ip
+	if ip == nil || ip.Equal(net.IPv4zero) || smContext.PDUAddress.UpfProvided {
+		return nil
 	}
+	smContext.SubPduSessLog.Infof("Release IP[%s]", ip.String())
+	smContext.DNNInfo.UeIPAllocator.Release(smContext.Supi, ip)
+	smContext.PDUAddress.Ip = net.IPv4(0, 0, 0, 0)
 	return nil
 }
 
@@ -605,6 +852,12 @@ func (smContext *SMContext) SetCreateData(createData *models.SmContextCreateData
 	smContext.AnType = createData.GetAnType()
 	smContext.RequestType = createData.GetRequestType()
 	smContext.RatType = createData.GetRatType()
+	smContext.ExtendedNasSmTimer = createData.GetExtendedNasSmTimerInd()
+	smContext.T3591Value, smContext.T3591Source = ResolveT3591(
+		factory.SmfConfig.Configuration.T3591, smContext.ExtendedNasSmTimer)
+	smContext.SubCtxLog.Infof("T3591 for this session is %s, decided by %s",
+		smContext.T3591Value, smContext.T3591Source)
+	metrics.IncrementNasTimerStats("T3591", string(smContext.T3591Source), smContext.T3591Value.String())
 	smContext.PresenceInLadn = createData.GetPresenceInLadn()
 	smContext.UeLocation = createData.UeLocation
 	smContext.UeTimeZone = createData.GetUeTimeZone()
@@ -741,14 +994,50 @@ func (smContext *SMContext) PCFSelection() error {
 	return nil
 }
 
-func (smContext *SMContext) GetNodeIDByLocalSEID(seid uint64) (nodeID NodeID) {
-	for _, pfcpCtx := range smContext.PFCPContext {
-		if pfcpCtx.LocalSEID == seid {
-			nodeID = pfcpCtx.NodeID
-		}
-	}
+// seidPFCPRef is a PFCPContext entry's stable identity: its map key (the UPF address resolved when
+// the entry was allocated) and NodeID. Held in SMContext.seidToPFCPCtx so a local SEID can be
+// resolved to either without iterating PFCPContext. See that field's comment.
+type seidPFCPRef struct {
+	key    string
+	nodeID NodeID
+}
 
-	return
+// recordPFCPCtxRef indexes the PFCPContext entry at key (local SEID localSEID, UPF nodeID) so the
+// SEID-keyed lookups below find it without iterating PFCPContext. Called wherever a PFCPContext entry
+// is created (AllocateLocalSEIDForDataPath and the DB restore path), under seidToPFCPCtxLock so it is
+// safe against the unlocked response/send-error handlers that read the index.
+func (smContext *SMContext) recordPFCPCtxRef(localSEID uint64, key string, nodeID NodeID) {
+	smContext.seidToPFCPCtxLock.Lock()
+	defer smContext.seidToPFCPCtxLock.Unlock()
+	if smContext.seidToPFCPCtx == nil {
+		smContext.seidToPFCPCtx = make(map[uint64]seidPFCPRef)
+	}
+	smContext.seidToPFCPCtx[localSEID] = seidPFCPRef{key: key, nodeID: nodeID}
+}
+
+func (smContext *SMContext) GetNodeIDByLocalSEID(seid uint64) (nodeID NodeID) {
+	smContext.seidToPFCPCtxLock.RLock()
+	defer smContext.seidToPFCPCtxLock.RUnlock()
+	return smContext.seidToPFCPCtx[seid].nodeID
+}
+
+// GetPFCPContextKeyByLocalSEID returns the PFCPContext map key for the session whose local SEID is
+// seid, and whether such an entry exists. The key is the UPF address resolved once when the session
+// was allocated (AllocateLocalSEIDForDataPath) -- the same string the send paths look the PFCPContext
+// entry up by and that SendPFCPRules/AddPendingUPF record in PendingUPF. A PFCP response or send
+// failure must correlate back to PendingUPF through this stored key rather than by re-resolving the
+// NodeID: for an FQDN UPF the periodic DNS refresh (see ResolveNodeIdToIp) can move the address while
+// a request is in flight, and a re-resolved key would miss PendingUPF, leaving the awaited batch
+// pending forever and the create/modify/release FSM blocked on SBIPFCPCommunicationChan.
+//
+// Reads the seidToPFCPCtx index under seidToPFCPCtxLock rather than iterating PFCPContext: it is
+// called from handlers that do not hold SMLock, and a concurrent insert into PFCPContext would make
+// a live iteration a process-crashing fatal error. See seidToPFCPCtx's declaration.
+func (smContext *SMContext) GetPFCPContextKeyByLocalSEID(seid uint64) (key string, ok bool) {
+	smContext.seidToPFCPCtxLock.RLock()
+	defer smContext.seidToPFCPCtxLock.RUnlock()
+	ref, ok := smContext.seidToPFCPCtx[seid]
+	return ref.key, ok
 }
 
 // RemoteSEIDByLocalSEID returns the SEID the user-plane function assigned to the session
@@ -784,6 +1073,9 @@ func (smContext *SMContext) AllocateLocalSEIDForDataPath(dataPath *DataPath) {
 				NodeID:    curDataPathNode.UPF.NodeID,
 				LocalSEID: allocatedSEID,
 			}
+			// Index the new entry by its local SEID so the SEID-keyed lookups need not iterate
+			// PFCPContext (seidToPFCPCtx's declaration explains why that iteration is unsafe).
+			smContext.recordPFCPCtxRef(allocatedSEID, NodeIDtoIP, curDataPathNode.UPF.NodeID)
 
 			seidSMContextMap.Store(allocatedSEID, smContext)
 
@@ -859,39 +1151,39 @@ func (smContext *SMContext) isAllowedPDUSessionType(requestedPDUSessionType uint
 	}
 
 	smContext.EstAcceptCause5gSMValue = 0
-	switch nasConvert.PDUSessionTypeToModels(requestedPDUSessionType) {
+	switch nasconv.PDUSessionTypeToModels(requestedPDUSessionType) {
 	case models.PDUSESSIONTYPE_IPV4:
 		if allowIPv4 {
-			smContext.SelectedPDUSessionType = nasConvert.ModelsToPDUSessionType(models.PDUSESSIONTYPE_IPV4)
+			smContext.SelectedPDUSessionType = nasconv.ModelsToPDUSessionType(models.PDUSESSIONTYPE_IPV4)
 		} else {
 			return fmt.Errorf("PduSessionType_IPV4 is not allowed in DNN[%s] configuration", smContext.Dnn)
 		}
 	case models.PDUSESSIONTYPE_IPV6:
 		if allowIPv6 {
-			smContext.SelectedPDUSessionType = nasConvert.ModelsToPDUSessionType(models.PDUSESSIONTYPE_IPV6)
+			smContext.SelectedPDUSessionType = nasconv.ModelsToPDUSessionType(models.PDUSESSIONTYPE_IPV6)
 		} else {
 			return fmt.Errorf("PduSessionType_IPV6 is not allowed in DNN[%s] configuration", smContext.Dnn)
 		}
 	case models.PDUSESSIONTYPE_IPV4_V6:
 		if allowIPv4 && allowIPv6 {
-			smContext.SelectedPDUSessionType = nasConvert.ModelsToPDUSessionType(models.PDUSESSIONTYPE_IPV4_V6)
+			smContext.SelectedPDUSessionType = nasconv.ModelsToPDUSessionType(models.PDUSESSIONTYPE_IPV4_V6)
 		} else if allowIPv4 {
-			smContext.SelectedPDUSessionType = nasConvert.ModelsToPDUSessionType(models.PDUSESSIONTYPE_IPV4)
+			smContext.SelectedPDUSessionType = nasconv.ModelsToPDUSessionType(models.PDUSESSIONTYPE_IPV4)
 			smContext.EstAcceptCause5gSMValue = nasMessage.Cause5GSMPDUSessionTypeIPv4OnlyAllowed
 		} else if allowIPv6 {
-			smContext.SelectedPDUSessionType = nasConvert.ModelsToPDUSessionType(models.PDUSESSIONTYPE_IPV6)
+			smContext.SelectedPDUSessionType = nasconv.ModelsToPDUSessionType(models.PDUSESSIONTYPE_IPV6)
 			smContext.EstAcceptCause5gSMValue = nasMessage.Cause5GSMPDUSessionTypeIPv6OnlyAllowed
 		} else {
 			return fmt.Errorf("PduSessionType_IPV4_V6 is not allowed in DNN[%s] configuration", smContext.Dnn)
 		}
 	case models.PDUSESSIONTYPE_ETHERNET:
 		if allowEthernet {
-			smContext.SelectedPDUSessionType = nasConvert.ModelsToPDUSessionType(models.PDUSESSIONTYPE_ETHERNET)
+			smContext.SelectedPDUSessionType = nasconv.ModelsToPDUSessionType(models.PDUSESSIONTYPE_ETHERNET)
 		} else {
 			return fmt.Errorf("PduSessionType_ETHERNET is not allowed in DNN[%s] configuration", smContext.Dnn)
 		}
 	case models.PDUSESSIONTYPE_UNSTRUCTURED:
-		smContext.SelectedPDUSessionType = nasConvert.ModelsToPDUSessionType(models.PDUSESSIONTYPE_UNSTRUCTURED)
+		smContext.SelectedPDUSessionType = nasconv.ModelsToPDUSessionType(models.PDUSESSIONTYPE_UNSTRUCTURED)
 		return fmt.Errorf("unstructured PDU Session type")
 	default:
 		return fmt.Errorf("requested PDU Sesstion type[%d] is not supported", requestedPDUSessionType)
@@ -985,10 +1277,32 @@ func (smContext *SMContext) GeneratePDUSessionEstablishmentReject(cause string) 
 	return httpResponse
 }
 
+// CommitSmPolicyDecision applies or discards the pending policy update, taking SMLock itself.
+//
+// Callers that already hold SMLock must use CommitSmPolicyDecisionLocked instead. SMLock is a
+// plain mutex and is not reentrant, so calling this from under it deadlocks the session — and
+// because the update path holds the lock with a defer, the session stays wedged and its HTTP
+// handler never returns.
 func (smContext *SMContext) CommitSmPolicyDecision(status bool) error {
-	// Lock SM context
 	smContext.SMLock.Lock()
 	defer smContext.SMLock.Unlock()
+	return smContext.CommitSmPolicyDecisionLocked(status)
+}
+
+// CommitSmPolicyDecisionLocked is CommitSmPolicyDecision for a caller that already holds SMLock.
+func (smContext *SMContext) CommitSmPolicyDecisionLocked(status bool) error {
+	if len(smContext.SmPolicyUpdates) == 0 {
+		// Nothing pending. Reachable whenever a message that commits or discards arrives without
+		// a modification in flight — a retransmitted PDU SESSION MODIFICATION COMPLETE is the
+		// ordinary case — and indexing here would take the SMF down.
+		outcome := "discard"
+		if status {
+			outcome = "commit"
+		}
+
+		logger.CtxLog.Warnf("no pending SM policy update to %s", outcome)
+		return nil
+	}
 
 	if status {
 		err := qos.CommitSmPolicyDecision(&smContext.SmPolicyData, smContext.SmPolicyUpdates[0])
@@ -1124,4 +1438,31 @@ func mapPduSessStateToMetricStateAndOp(state SMContextState) (string, mi.Subscri
 	default:
 		return "unknown", mi.SubsOpDel
 	}
+}
+
+// StopT3591 stops the modification retransmission timer if one is running.
+//
+// The caller must hold SMLock. NwModificationPending and T3591 are session state like any other
+// here, and every current call site is already under it: the N1 and N2 update handlers run under
+// the lock HandlePDUSessionSMContextUpdate takes, and startT3591Locked is documented as requiring
+// it. There is deliberately no unlocked variant - SMLock is not reentrant, so one taken here would
+// wedge the session for its callers.
+//
+// It is idempotent, and safe to call when no modification is in flight, because both happen: an
+// acknowledgement can arrive after the timer has already abandoned the procedure, and a UE can
+// retransmit that acknowledgement.
+func (smContext *SMContext) StopT3591() {
+	// Cleared before the nil check, not after: the network's procedure is pending from the moment
+	// it commits, which is a PFCP round trip before T3591 is armed. A terminus reached inside that
+	// window still has to settle the session.
+	smContext.NwModificationPending = false
+	if smContext.T3591 == nil {
+		return
+	}
+	// Cancel, not Stop: the caller holds SMLock, which T3591's retransmission callback takes, and Stop
+	// would wait for that callback's goroutine -- which may be blocked on the lock -- until its
+	// timeout. A late callback instead checks, under SMLock, that its timer is still the session's
+	// T3591, and dropping the handle below is what makes a late one find it is not.
+	smContext.T3591.Cancel()
+	smContext.T3591 = nil
 }

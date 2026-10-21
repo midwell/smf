@@ -140,7 +140,7 @@ func HandlePduSessionContextReplacement(smCtxtRef string) error {
 		smCtxt.SubPduSessLog.Warn("PDUSessionSMContextCreate, old context exist, purging")
 		smCtxt.SMLock.Lock()
 
-		smCtxt.LocalPurged = true
+		smCtxt.LocalPurged.Store(true)
 
 		// Lawful Interception IRI-POI: this ends the session as surely as a release
 		// does, so it owes the same two things. The record, because an agency that
@@ -173,7 +173,7 @@ func HandlePduSessionContextReplacement(smCtxtRef string) error {
 	return nil
 }
 
-func HandlePDUSessionSMContextCreate(eventData interface{}) error {
+func HandlePDUSessionSMContextCreate(eventData any) error {
 	txn := eventData.(*transaction.Transaction)
 	request := txn.Req.(models.PostSmContextsRequest)
 	smContext := txn.Ctxt.(*smf_context.SMContext)
@@ -483,7 +483,7 @@ func HandlePDUSessionSMContextCreate(eventData interface{}) error {
 	// TODO: UECM registration
 }
 
-func HandlePDUSessionSMContextUpdate(eventData interface{}) error {
+func HandlePDUSessionSMContextUpdate(eventData any) error {
 	txn := eventData.(*transaction.Transaction)
 	smContext := txn.Ctxt.(*smf_context.SMContext)
 
@@ -574,6 +574,12 @@ func HandlePDUSessionSMContextUpdate(eventData interface{}) error {
 				// Modify failure
 				smContext.SubCtxLog.Errorf("pfcp session modify error: %v ", err.Error())
 
+				// Back to active: the error answer below carries a PDU Session Release Command,
+				// and the UE's Release Complete arrives as an update, which only SmStateActive
+				// handles. Left in SmStatePfcpModify, the session could not complete the release
+				// this asks for, nor anything else.
+				abandonPendingModify(smContext, smf_context.SmStateActive)
+
 				// Form Modify err rsp
 				httpResponse = makePduCtxtModifyErrRsp(smContext, err.Error())
 
@@ -596,6 +602,20 @@ func HandlePDUSessionSMContextUpdate(eventData interface{}) error {
 
 				smContext.ChangeState(smf_context.SmStateActive)
 				smContext.SubCtxLog.Debugln("SMContextState Change State:", smContext.SMContextState.String())
+			}
+		}
+
+		// Neither flag set means nothing on this path had PFCP work to do, and the message has
+		// already been handled where it belongs -- the UE's acknowledgement of a network-requested
+		// modification arriving while the transfer that carried it is still in flight is the case
+		// that brought this here. Without an answer built for it the transaction ends with no
+		// response at all, which the API layer turns into a 500: the SMF telling the AMF the
+		// opposite of what it just did.
+		if httpResponse == nil {
+			smContext.SubPduSessLog.Infoln("no PFCP work for this update while a modification is in flight; answering the AMF that it was accepted")
+			httpResponse = &httpwrapper.Response{
+				Status: http.StatusOK,
+				Body:   response,
 			}
 		}
 
@@ -690,7 +710,7 @@ func makePduCtxtModifyErrRsp(smContext *smf_context.SMContext, errStr string) *h
 		smf_context.RemoveSMContext(smContext.Ref)
 	}
 */
-func HandlePDUSessionSMContextRelease(eventData interface{}) error {
+func HandlePDUSessionSMContextRelease(eventData any) error {
 	txn := eventData.(*transaction.Transaction)
 	body := txn.Req.(models.ReleaseSmContextRequest)
 	smContext := txn.Ctxt.(*smf_context.SMContext)
@@ -866,13 +886,29 @@ func HandlePDUSessionSMContextRelease(eventData interface{}) error {
 	return nil
 }
 
+// deletionTarget is a UPF releaseTunnel has decided to send a PFCP Session Deletion Request to,
+// captured so the send can happen in a pass separate from deciding the full pending set.
+type deletionTarget struct {
+	nodeID smf_context.NodeID
+	port   uint16
+}
+
 func releaseTunnel(smContext *smf_context.SMContext) bool {
 	if smContext.Tunnel == nil {
 		smContext.SubPduSessLog.Warnln("releaseTunnel, pfcp tunnel already released")
 		return false
 	}
+
+	// Decide the complete set of UPFs to delete, and register all of them in PendingUPF, before
+	// sending any request. An immediate response (synchronous in adapter mode, or just a fast UDP
+	// round trip) can be dispatched before this function would otherwise have reached a later
+	// UPF's send; the response handler gates its verdict on PendingUPF.IsEmpty(), so registering
+	// an entry only after its own send returns lets that race find the map still missing entries
+	// this loop has not reached yet, signal success early, and leave the rest as stale,
+	// never-cleaned residue.
 	deletedPFCPNode := make(map[string]bool)
-	smContext.PendingUPF = make(smf_context.PendingUPF)
+	pendingUPF := make(smf_context.PendingUPF)
+	targets := make([]deletionTarget, 0)
 	for _, dataPath := range smContext.Tunnel.DataPathPool {
 		dataPath.DeactivateTunnelAndPDR(smContext)
 		for curDataPathNode := dataPath.FirstDPNode; curDataPathNode != nil; curDataPathNode = curDataPathNode.Next() {
@@ -882,15 +918,24 @@ func releaseTunnel(smContext *smf_context.SMContext) bool {
 				continue
 			}
 			if _, exist := deletedPFCPNode[curUPFID]; !exist {
-				err := pfcp_message.SendPfcpSessionDeletionRequest(curDataPathNode.UPF.NodeID, smContext, curDataPathNode.UPF.Port)
-				if err != nil {
-					smContext.SubPduSessLog.Errorf("releaseTunnel, send PFCP session deletion request failed: %v", err)
-				}
 				deletedPFCPNode[curUPFID] = true
-				smContext.PendingUPF[curDataPathNode.GetNodeIP()] = true
+				pendingUPF[curDataPathNode.GetNodeIP()] = true
+				targets = append(targets, deletionTarget{nodeID: curDataPathNode.UPF.NodeID, port: curDataPathNode.UPF.PFCPPort()})
 			}
 		}
 	}
+
+	// PendingUPFLock, not SMLock: the PFCP deletion response handlers delete entries from this
+	// same map without SMLock (see SMContext.PendingUPFLock's declaration), so this assignment
+	// goes through the locked helper rather than the field directly.
+	smContext.ResetPendingUPF(pendingUPF)
+
+	for _, target := range targets {
+		if err := pfcp_message.SendPfcpSessionDeletionRequest(target.nodeID, smContext, target.port); err != nil {
+			smContext.SubPduSessLog.Errorf("releaseTunnel, send PFCP session deletion request failed: %v", err)
+		}
+	}
+
 	smContext.Tunnel = nil
 	return true
 }
@@ -996,7 +1041,12 @@ func SendPduSessN1N2Transfer(smContext *smf_context.SMContext, success bool) err
 	return nil
 }
 
-func HandlePduSessN1N2TransFailInd(eventData interface{}) error {
+// HandlePduSessN1N2TransFailInd answers the AMF's report that a transfer could not reach the UE.
+//
+// The AMF reports only a transfer that asked for it, and the only one that does is the downlink data
+// paging transfer. A modification's Command does not, so this is never its delivery failure, even
+// when a modification is pending. A Command that never reaches the UE is left to T3591.
+func HandlePduSessN1N2TransFailInd(eventData any) error {
 	txn := eventData.(*transaction.Transaction)
 	smContext := txn.Ctxt.(*smf_context.SMContext)
 
@@ -1039,8 +1089,8 @@ func HandlePduSessN1N2TransFailInd(eventData interface{}) error {
 		// are still in farList, as they were before: that they go to one UPF is a
 		// separate defect, and pretending to await answers that were never asked for
 		// does not fix it.
-		smContext.PendingUPF = make(smf_context.PendingUPF)
-		smContext.PendingUPF[ANUPF.GetNodeIP()] = true
+		smContext.ResetPendingUPF(nil)
+		smContext.AddPendingUPF(ANUPF.GetNodeIP())
 
 		// The response handler only signals SBIPFCPCommunicationChan while the context
 		// is in this state. Without the transition the modification was answered, the
@@ -1049,7 +1099,7 @@ func HandlePduSessN1N2TransFailInd(eventData interface{}) error {
 		smContext.ChangeState(smf_context.SmStatePfcpModify)
 
 		// Sending PFCP modification with flag set to DROP the packets.
-		err := pfcp_message.SendPfcpSessionModificationRequest(ANUPF.UPF.NodeID, smContext, pdrList, farList, barList, qerList, nil, nil, nil, ANUPF.UPF.Port)
+		err := pfcp_message.SendAwaitedPfcpSessionModificationRequest(ANUPF.UPF.NodeID, smContext, pdrList, farList, barList, qerList, nil, nil, nil, ANUPF.UPF.PFCPPort())
 		if err != nil {
 			smContext.SubPduSessLog.Errorf("pfcp Session Modification Request failed: %v", err)
 
@@ -1079,7 +1129,8 @@ func HandlePduSessN1N2TransFailInd(eventData interface{}) error {
 	return nil
 }
 
-// abandonPendingModify undoes the bookkeeping for a modification that was never sent.
+// abandonPendingModify undoes the bookkeeping for a modification that failed, whatever the
+// reason: never sent, refused by the user plane, or unanswered.
 //
 // Both halves matter and they have to stay together, which is why they are one function.
 // Leaving the state at PfcpModify strands the session for every later operation that expects
@@ -1091,7 +1142,7 @@ func HandlePduSessN1N2TransFailInd(eventData interface{}) error {
 // the indefinite wait this change exists to remove, reintroduced through its own failure path.
 func abandonPendingModify(smContext *smf_context.SMContext, previous smf_context.SMContextState) {
 	smContext.ChangeState(previous)
-	smContext.PendingUPF = make(smf_context.PendingUPF)
+	smContext.ResetPendingUPF(nil)
 }
 
 // Handles PFCP response depending upon response cause recevied.
@@ -1136,7 +1187,12 @@ func HandlePFCPResponse(smContext *smf_context.SMContext,
 			smContext.SubPduSessLog.Errorf("PDUSessionSMContextUpdate, build PDUSessionResourceReleaseCommandTransfer failed: %+v", err)
 		}
 
-		smContext.ChangeState(smf_context.SmStatePfcpModify)
+		// The release state, not the modification state: this branch releases the session, and the
+		// deletion answers it waits on below are delivered only to a session in SmStatePfcpRelease.
+		// In SmStatePfcpModify every one of them was withheld, so the release waited for good, holding
+		// the lock of whoever reached it. The branch was unreachable while a modification timeout
+		// could not find its session; now that it can, the release it starts has to be answerable.
+		smContext.ChangeState(smf_context.SmStatePfcpRelease)
 		smContext.SubCtxLog.Debugln("PDUSessionSMContextUpdate, SMContextState Change State:", smContext.SMContextState.String())
 
 		tmpFile, err := util.CreatePayloadTempFile(n1buf)

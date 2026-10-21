@@ -8,7 +8,6 @@ import (
 	"net"
 	"testing"
 
-	"github.com/omec-project/openapi/v2"
 	"github.com/omec-project/openapi/v2/models"
 	"github.com/omec-project/smf/qos"
 	"github.com/omec-project/smf/util"
@@ -46,7 +45,7 @@ func TestAOneDirectionalGuaranteeIsHonoured(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			qos := &models.QosData{QosId: "2"}
+			qos := models.NewQosData("2")
 			if tc.gbrUl != "" {
 				qos.SetGbrUl(tc.gbrUl)
 			}
@@ -87,10 +86,10 @@ func qerCapableUPF() *UPF {
 // guarantee under test has no such fallback, but the fallback is read on the same path.
 func withSessionAmbr(smContext *SMContext) {
 	const sessionAmbr = "50 Mbps"
-
-	smContext.SmPolicyData.SmCtxtSessionRules.ActiveRule = &models.SessionRule{
-		AuthSessAmbr: &models.Ambr{Uplink: sessionAmbr, Downlink: sessionAmbr},
-	}
+	ambr := models.NewAmbr(sessionAmbr, sessionAmbr)
+	sessionRule := models.NewSessionRuleWithDefaults()
+	sessionRule.SetAuthSessAmbr(*ambr)
+	smContext.SmPolicyData.SmCtxtSessionRules.ActiveRule = sessionRule
 }
 
 // The establishment path has to program the guarantee too, and this is the test that says so.
@@ -103,18 +102,17 @@ func withSessionAmbr(smContext *SMContext) {
 func TestCreatePccRuleQerProgramsTheGuaranteedRate(t *testing.T) {
 	const qosID = "1"
 	node := &DataPathNode{UPF: qerCapableUPF()}
+	smPolicyDecision := models.NewSmPolicyDecision()
+	qosData := models.NewQosData(qosID)
+	qosData.SetMaxbrUl("100 Mbps")
+	qosData.SetMaxbrDl("200 Mbps")
+	qosData.SetGbrUl("10 Mbps")
+	qosData.SetGbrDl("20 Mbps")
+	smPolicyDecision.SetQosDecs(map[string]models.QosData{qosID: *qosData})
 	smContext := &SMContext{
 		Supi: "imsi-208930000000001",
 		SmPolicyUpdates: []*qos.PolicyUpdate{{
-			SmPolicyDecision: &models.SmPolicyDecision{
-				QosDecs: &map[string]models.QosData{qosID: {
-					QosId:   qosID,
-					MaxbrUl: *openapi.NewNullableString(openapi.PtrString("100 Mbps")),
-					MaxbrDl: *openapi.NewNullableString(openapi.PtrString("200 Mbps")),
-					GbrUl:   *openapi.NewNullableString(openapi.PtrString("10 Mbps")),
-					GbrDl:   *openapi.NewNullableString(openapi.PtrString("20 Mbps")),
-				}},
-			},
+			SmPolicyDecision: smPolicyDecision,
 		}},
 	}
 	// A committed session rule, because the maximum rate falls back to the session AMBR when the
@@ -151,16 +149,15 @@ func TestCreatePccRuleQerProgramsTheGuaranteedRate(t *testing.T) {
 func TestCreatePccRuleQerLeavesAnUnconfiguredGuaranteeUnset(t *testing.T) {
 	const qosID = "1"
 	node := &DataPathNode{UPF: qerCapableUPF()}
+	smPolicyDecision := models.NewSmPolicyDecision()
+	qosData := models.NewQosData(qosID)
+	qosData.SetMaxbrUl("100 Mbps")
+	qosData.SetMaxbrDl("200 Mbps")
+	smPolicyDecision.SetQosDecs(map[string]models.QosData{qosID: *qosData})
 	smContext := &SMContext{
 		Supi: "imsi-208930000000001",
 		SmPolicyUpdates: []*qos.PolicyUpdate{{
-			SmPolicyDecision: &models.SmPolicyDecision{
-				QosDecs: &map[string]models.QosData{qosID: {
-					QosId:   qosID,
-					MaxbrUl: *openapi.NewNullableString(openapi.PtrString("100 Mbps")),
-					MaxbrDl: *openapi.NewNullableString(openapi.PtrString("200 Mbps")),
-				}},
-			},
+			SmPolicyDecision: smPolicyDecision,
 		}},
 	}
 	withSessionAmbr(smContext)
@@ -196,9 +193,10 @@ func TestARateWithNoUnitDoesNotEndTheProcess(t *testing.T) {
 // spellings; this pins the two together.
 //
 // Two spellings still differ, and differed before: "100  Mbps" and "100 mbps", where the gNB's
-// parser takes an empty or unrecognised unit to be bits per second and this one reads no rate.
-// Settling those means both parsers reading one canonical string, which belongs where the rate
-// first arrives.
+// parser takes an empty or unrecognised unit to be bits per second and this one reads no rate. A
+// raw "bps" rate differs too, deliberately: see TestARawBpsRateIsNotRoundedForTheGNB. Settling the
+// first two means both parsers reading one canonical string, which belongs where the rate first
+// arrives.
 func TestTheUserPlaneIsToldTheRateTheRadioIsTold(t *testing.T) {
 	for _, rate := range []string{
 		"100 Mbps", "100 Mbps ", "100 Mbps junk", "100Mbps", " 100 Mbps", "100\tMbps", "2 Gbps", "10", "",
@@ -206,6 +204,80 @@ func TestTheUserPlaneIsToldTheRateTheRadioIsTold(t *testing.T) {
 		if upf, gnb := int64(util.BitRateTokbps(rate))*1000, sessionAmbrToBps(rate); upf != gnb {
 			t.Errorf("%q: the user plane enforces %d bps and the gNB is told %d", rate, upf, gnb)
 		}
+	}
+}
+
+// A raw "bps" rate is where the user plane and the gNB intentionally part. BitRateTokbps rounds
+// to whole kbps for the user plane's benefit, so "1500 bps" and "500 bps" cannot survive it; NGAP
+// carries the AMBR in bps and has no need of that rounding. Before sessionAmbrToBps parsed "bps"
+// directly, "1500 bps" reached the gNB as 1000 and "500 bps" reached it as 0.
+func TestARawBpsRateIsNotRoundedForTheGNB(t *testing.T) {
+	tests := []struct {
+		ambr    string
+		wantGnb int64
+		wantUpf uint64
+	}{
+		{"1500 bps", 1500, 1},
+		{"500 bps", 500, 0},
+		{"0 bps", 0, 0},
+	}
+	for _, tt := range tests {
+		if got := sessionAmbrToBps(tt.ambr); got != tt.wantGnb {
+			t.Errorf("sessionAmbrToBps(%q) = %d, want %d", tt.ambr, got, tt.wantGnb)
+		}
+		if got := util.BitRateTokbps(tt.ambr); got != tt.wantUpf {
+			t.Errorf("BitRateTokbps(%q) = %d, want %d", tt.ambr, got, tt.wantUpf)
+		}
+	}
+}
+
+// A magnitude between int64's range and uint64's is one BitRateToBps itself accepts -- it does not
+// overflow uint64 -- but NGAP's BitRate is signed, so casting it straight to int64 wrapped it to a
+// negative rate instead of the zero a value the gNB's IE cannot carry should produce.
+func TestANonNegativeBpsTooLargeForInt64IsZeroForTheGNB(t *testing.T) {
+	if got := sessionAmbrToBps("10000000 Tbps"); got != 0 {
+		t.Errorf("sessionAmbrToBps(10000000 Tbps) = %d, want 0: the bps value overflows int64", got)
+	}
+}
+
+// A negative magnitude is malformed input, not a rate going the other way. Rejected before the
+// uint64 cast, it must read as zero rather than wrap around to an enormous unsigned rate.
+func TestANegativeBitRateIsZeroNotAWrappedUnsignedRate(t *testing.T) {
+	for _, rate := range []string{"-500 bps", "-1 Mbps", "-100 Mbps"} {
+		if got := util.BitRateToBps(rate); got != 0 {
+			t.Errorf("BitRateToBps(%q) = %d, want 0", rate, got)
+		}
+		if got := util.BitRateTokbps(rate); got != 0 {
+			t.Errorf("BitRateTokbps(%q) = %d, want 0", rate, got)
+		}
+	}
+}
+
+// A magnitude that would overflow uint64 once scaled to the unit's multiplier is malformed input,
+// not an enormous rate. The multiplication used to run unchecked, so a value like "18446745
+// Tbps" wrapped around silently and reached both the user plane and the gNB as a small,
+// seemingly valid rate instead of the zero a value this size cannot represent.
+func TestAnOverflowingBitRateIsZeroNotAWrappedRate(t *testing.T) {
+	for _, rate := range []string{
+		"18446744073709552 kbps", // overflows at the kbps multiplier (1000)
+		"18446744073710 Mbps",    // overflows at the Mbps multiplier (1e6)
+		"18446744074 Gbps",       // overflows at the Gbps multiplier (1e9)
+		"18446745 Tbps",          // overflows at the Tbps multiplier (1e12), the PR's own example
+	} {
+		if got := util.BitRateToBps(rate); got != 0 {
+			t.Errorf("BitRateToBps(%q) = %d, want 0: an overflowing magnitude is not a rate", rate, got)
+		}
+		if got := util.BitRateTokbps(rate); got != 0 {
+			t.Errorf("BitRateTokbps(%q) = %d, want 0", rate, got)
+		}
+	}
+
+	// The largest magnitude that does not overflow at each multiplier must still convert exactly.
+	if got, want := util.BitRateToBps("9223372036854775807 bps"), uint64(9223372036854775807); got != want {
+		t.Errorf("BitRateToBps(max bps) = %d, want %d", got, want)
+	}
+	if got, want := util.BitRateToBps("18446744073 Gbps"), uint64(18446744073)*1000000000; got != want {
+		t.Errorf("BitRateToBps(max Gbps) = %d, want %d", got, want)
 	}
 }
 
@@ -223,9 +295,10 @@ func TestAUnitlessSessionAmbrTakesNoPathDown(t *testing.T) {
 			1: &DataPath{IsDefaultPath: true, FirstDPNode: node},
 		}},
 	}
-	smContext.SmPolicyData.SmCtxtSessionRules.ActiveRule = &models.SessionRule{
-		AuthSessAmbr: &models.Ambr{Uplink: "10", Downlink: "10"},
-	}
+	ambr := models.NewAmbr("10", "10")
+	sessionRule := models.NewSessionRuleWithDefaults()
+	sessionRule.SetAuthSessAmbr(*ambr)
+	smContext.SmPolicyData.SmCtxtSessionRules.ActiveRule = sessionRule
 
 	// The transfer is refused later for want of an N3 interface in this fixture; what is under
 	// test is that it gets past the AMBR at all.
@@ -234,7 +307,7 @@ func TestAUnitlessSessionAmbrTakesNoPathDown(t *testing.T) {
 	}
 
 	// And the modification transfer, which reads the same AMBR for the radio.
-	defQos := &models.QosData{QosId: "1"}
+	defQos := models.NewQosData("1")
 	defQos.SetDefQosFlowIndication(true)
 	smContext.SmPolicyData.SmCtxtQosData.QosData = map[string]*models.QosData{"1": defQos}
 	smContext.SubPduSessLog = zap.NewNop().Sugar()
@@ -247,7 +320,7 @@ func TestAUnitlessSessionAmbrTakesNoPathDown(t *testing.T) {
 	// session is accepted it has an address, which the accept reads after the AMBR.
 	smContext.SubGsmLog = zap.NewNop().Sugar()
 	smContext.PDUAddress = &UeIpAddr{Ip: net.ParseIP("10.1.0.12")}
-	smContext.Snssai = &models.Snssai{Sst: 1}
+	smContext.Snssai = models.NewSnssai(1)
 	smContext.ProtocolConfigurationOptions = &ProtocolConfigurationOptions{}
 	smContext.SmPolicyUpdates = []*qos.PolicyUpdate{{}}
 
@@ -269,7 +342,7 @@ func TestAUnitlessSessionAmbrTakesNoPathDown(t *testing.T) {
 // the gNB are given for the same string, and what the NAS converter already encodes for a rate it
 // cannot read.
 func TestAUnitlessDirectionIsEncodedForTheUeAsZero(t *testing.T) {
-	encoded := sessionAmbrForNas(&models.Ambr{Uplink: "10", Downlink: "20 Mbps"})
+	encoded := sessionAmbrForNas(models.NewAmbr("10", "20 Mbps"))
 
 	if got := encoded.GetSessionAMBRForUplink(); got != [2]byte{} {
 		t.Errorf("uplink encoded as %v, want zero: the user plane and the gNB are given zero for a rate with no unit", got)

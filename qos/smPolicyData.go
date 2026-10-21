@@ -4,7 +4,10 @@
 
 package qos
 
-import "github.com/omec-project/openapi/v2/models"
+import (
+	"github.com/omec-project/openapi/v2/models"
+	"github.com/omec-project/smf/util"
+)
 
 // Define SMF Session-Rule/PccRule/Rule-Qos-Data
 type PolicyUpdate struct {
@@ -16,6 +19,12 @@ type PolicyUpdate struct {
 
 	// relevant SM Policy Decision from PCF
 	SmPolicyDecision *models.SmPolicyDecision
+
+	// Corrective marks an update produced by RemoveFlows rather than by the PCF: the realignment
+	// that follows a partial rejection, withdrawing the flows the radio refused. The flows it
+	// deletes were never established at the radio, so unlike an ordinary deletion it has nothing
+	// to ask the radio to release.
+	Corrective bool
 }
 
 type SmCtxtPolicyData struct {
@@ -71,6 +80,8 @@ func BuildSmPolicyUpdate(smCtxtPolData *SmCtxtPolicyData, smPolicyDecision *mode
 	// Keep copy of SmPolicyDecision received from PCF
 	update.SmPolicyDecision = smPolicyDecision
 
+	normalizeSessionAmbrRates(smPolicyDecision)
+
 	// Qos Flows update
 	update.QosFlowUpdate = GetQosFlowDescUpdate(smPolicyDecision.GetQosDecs(), smCtxtPolData.SmCtxtQosData.QosData)
 
@@ -88,6 +99,25 @@ func BuildSmPolicyUpdate(smCtxtPolData *SmCtxtPolicyData, smPolicyDecision *mode
 	update.CondDataUpdate = GetConditionDataUpdate(smPolicyDecision.GetConds(), smCtxtPolData.SmCtxtCondData.CondData)
 
 	return update
+}
+
+// normalizeSessionAmbrRates canonicalizes the session AMBR on every decided session rule, in
+// place, before anything downstream reads it.
+//
+// The session AMBR reaches three converters as one raw string: the gNB's (sessionAmbrToBps), the
+// user plane's (util.BitRateTokbps) and the UE's (sessionAmbrForNas). They agree on most
+// spellings, but not on a double space or a lowercase unit -- one reads a rate the others read as
+// zero, which is a live mismatch between what the radio enforces and what the user plane does.
+// Normalizing separately in each converter would only move the mismatch around; done once here,
+// every reader of this decision sees the same canonical string.
+func normalizeSessionAmbrRates(smPolicyDecision *models.SmPolicyDecision) {
+	for _, rule := range smPolicyDecision.GetSessRules() {
+		if rule.AuthSessAmbr == nil {
+			continue
+		}
+		rule.AuthSessAmbr.Uplink = util.NormalizeBitRate(rule.AuthSessAmbr.Uplink)
+		rule.AuthSessAmbr.Downlink = util.NormalizeBitRate(rule.AuthSessAmbr.Downlink)
+	}
 }
 
 func CommitSmPolicyDecision(smCtxtPolData *SmCtxtPolicyData, smPolicyUpdate *PolicyUpdate) error {

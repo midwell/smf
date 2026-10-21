@@ -8,6 +8,7 @@ import (
 	"fmt"
 
 	smf_context "github.com/omec-project/smf/context"
+	"github.com/omec-project/smf/msgtypes/svcmsgtypes"
 	"github.com/omec-project/smf/producer"
 	"github.com/omec-project/smf/transaction"
 )
@@ -31,7 +32,7 @@ const (
 )
 
 type SmEventData struct {
-	Txn interface{}
+	Txn any
 }
 
 // Define FSM Func Point Struct here
@@ -49,6 +50,7 @@ func init() {
 
 	InitFsm()
 	transaction.InitTxnFsm(SmfTxnFsmHandle)
+	producer.SetSessionTaskQueue(queueSessionTask)
 }
 
 // Override with specific handler
@@ -58,7 +60,28 @@ func InitFsm() {
 	SmfFsmHandler[smf_context.SmStatePfcpCreatePending][SmEventPfcpSessCreateFailure] = HandleStatePfcpCreatePendingEventPfcpSessCreateFailure
 	SmfFsmHandler[smf_context.SmStateN1N2TransferPending][SmEventPduSessN1N2Transfer] = HandleStateN1N2TransferPendingEventN1N2Transfer
 	SmfFsmHandler[smf_context.SmStateActive][SmEventPduSessModify] = HandleStateActiveEventPduSessModify
+	// The UE's acknowledgement of a network-requested modification can arrive while the session is
+	// still in PfcpModify: the state changes only after the N1/N2 transfer call returns, and on a
+	// short link the UE can answer before the AMF has answered us. Without this the acknowledgement
+	// met EmptyEventHandler and was dropped, after which T3591 retransmitted a command the UE had
+	// already accepted and eventually abandoned a modification that had succeeded.
+	SmfFsmHandler[smf_context.SmStatePfcpModify][SmEventPduSessModify] = HandleStateActiveEventPduSessModify
+	// A UE-requested modification can also arrive for a context that was never established or is
+	// being torn down: TS 24.501 subclause 6.4.2.6 item b still requires the #43 reject. Before this,
+	// the event met EmptyEventHandler, HandleUpdateN1Msg's refusal was never reached, and the AMF got
+	// a bare 500 with no N1 answer. HandleStateActiveEventPduSessModify is not reused here because it
+	// returns SmStateActive on success, which would reactivate a session this refusal does not.
+	SmfFsmHandler[smf_context.SmStateInit][SmEventPduSessModify] = HandleInactiveStateEventPduSessModify
+	SmfFsmHandler[smf_context.SmStateInActivePending][SmEventPduSessModify] = HandleInactiveStateEventPduSessModify
 	SmfFsmHandler[smf_context.SmStateActive][SmEventPduSessRelease] = HandleStateActiveEventPduSessRelease
+	// The AMF can send ReleaseSmContext (TS 29.502 clause 5.2.2.3.2) before the UE's Release
+	// Complete arrives for a release the NAS path already started: HandleStateActiveEventPduSessModify
+	// above leaves such a context in SmStateInActivePending, not SmStateActive. Without this,
+	// SmEventPduSessRelease met EmptyEventHandler here, the API returned HTTP 500, and the context
+	// was never removed. producer.HandlePDUSessionSMContextRelease already tolerates this: it skips
+	// the PFCP delete for the Tunnel this path already released, and ReleaseUeIpAddr is idempotent,
+	// so the same handler is safe to reuse rather than needing a InActivePending-specific one.
+	SmfFsmHandler[smf_context.SmStateInActivePending][SmEventPduSessRelease] = HandleStateActiveEventPduSessRelease
 	SmfFsmHandler[smf_context.SmStateActive][SmEventPduSessN1N2TransferFailureIndication] = HandleStateActiveEventPduSessN1N2TransFailInd
 	SmfFsmHandler[smf_context.SmStateActive][SmEventPolicyUpdateNotify] = HandleStateActiveEventPolicyUpdateNotify
 }
@@ -147,15 +170,39 @@ func HandleStatePfcpCreatePendingEventPfcpSessCreateFailure(event SmEvent, event
 	return smf_context.SmStateInit, nil
 }
 
+// HandleStateActiveEventPduSessModify runs the update pipeline and returns the state
+// HandlePDUSessionSMContextUpdate's own dispatch already left the context in, rather than assuming
+// success always means SmStateActive: a UE-initiated release (TS 24.501 clause 6.3.3) moves the
+// context to SmStatePfcpRelease then SmStateInActivePending internally before returning, and a
+// hardcoded SmStateActive here would have HandleEvent's unconditional ChangeState stomp that back
+// to Active immediately after -- reactivating a session whose user plane was just torn down and
+// hiding the isSmContextInactive guards in n1n2_data_handler.go from ever seeing the real state on
+// a subsequent retransmission.
 func HandleStateActiveEventPduSessModify(event SmEvent, eventData *SmEventData) (smf_context.SMContextState, error) {
 	txn := eventData.Txn.(*transaction.Transaction)
 	smCtxt := txn.Ctxt.(*smf_context.SMContext)
 
 	if err := producer.HandlePDUSessionSMContextUpdate(eventData.Txn); err != nil {
 		smCtxt.SubFsmLog.Errorf("sm context update error, %v ", err.Error())
-		return smf_context.SmStateActive, err
+		return smCtxt.SMContextState, err
 	}
-	return smf_context.SmStateActive, nil
+	return smCtxt.SMContextState, nil
+}
+
+// HandleInactiveStateEventPduSessModify runs the update pipeline for a context that is not active,
+// without assuming it becomes active on success: HandlePDUSessionSMContextUpdate's own
+// SmStateInit/SmStateInActivePending/SmStateRelease branch already answers 200 OK without changing
+// state, and leaves the next state at whatever the call left it (e.g. SmStateRelease if the N1
+// message it answered was a PDUSessionReleaseComplete).
+func HandleInactiveStateEventPduSessModify(event SmEvent, eventData *SmEventData) (smf_context.SMContextState, error) {
+	txn := eventData.Txn.(*transaction.Transaction)
+	smCtxt := txn.Ctxt.(*smf_context.SMContext)
+
+	if err := producer.HandlePDUSessionSMContextUpdate(eventData.Txn); err != nil {
+		smCtxt.SubFsmLog.Errorf("sm context update error, %v ", err.Error())
+		return smCtxt.SMContextState, err
+	}
+	return smCtxt.SMContextState, nil
 }
 
 func HandleStateActiveEventPduSessRelease(event SmEvent, eventData *SmEventData) (smf_context.SMContextState, error) {
@@ -177,6 +224,24 @@ func HandleStateActiveEventPduSessN1N2TransFailInd(event SmEvent, eventData *SmE
 		smCtxt.SubFsmLog.Errorf("error while processing HandlePduSessN1N2TransferFailureIndication, %v ", err.Error())
 		return smf_context.SmStateInit, err
 	}
+
+	// A paging failure does not end a network-requested modification. The AMF reports it when its
+	// paging gives up, which says nothing about a Command already sent: T3591 retransmits it, and the
+	// UE's answer can still come. That answer is handled only in an update-capable state, so in
+	// SmStateInit it was dropped while T3591 ran on, and the modification was abandoned although the
+	// UE had applied it. The same holds once the UE has completed and the radio has not answered
+	// (RanAnswerPending): its answer comes on the same update path, and in SmStateInit a refusal would
+	// go uncorrected and a held decision be dropped. A paging failure that started a release
+	// (SmStatePfcpRelease), or one with no modification pending, still ends in SmStateInit, as it did
+	// before.
+	smCtxt.SMLock.Lock()
+	modifying := (smCtxt.NwModificationPending || smCtxt.RanAnswerPending) &&
+		smCtxt.SMContextState == smf_context.SmStateActive
+	smCtxt.SMLock.Unlock()
+	if modifying {
+		return smf_context.SmStateActive, nil
+	}
+
 	return smf_context.SmStateInit, nil
 }
 
@@ -191,4 +256,12 @@ func HandleStateActiveEventPolicyUpdateNotify(event SmEvent, eventData *SmEventD
 	}
 
 	return smf_context.SmStateActive, nil
+}
+
+// queueSessionTask runs task as a transaction in the session's queue: after whatever the session is
+// doing now, and before whatever arrives for it later.
+func queueSessionTask(smContext *smf_context.SMContext, task func()) {
+	txn := transaction.NewTransaction(task, nil, svcmsgtypes.SessionTask)
+	txn.Ctxt = smContext
+	go txn.StartTxnLifeCycle(SmfTxnFsmHandle)
 }

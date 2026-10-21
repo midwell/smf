@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"net/http"
 
-	"github.com/omec-project/openapi/v2"
 	"github.com/omec-project/openapi/v2/models"
 	smf_context "github.com/omec-project/smf/context"
 	"github.com/omec-project/smf/factory"
@@ -67,6 +66,8 @@ func (SmfTxnFsm) TxnLoadCtxt(txn *transaction.Transaction) (transaction.TxnEvent
 		// Pre-loaded- No action
 	case svcmsgtypes.N1N2MessageTransferFailureNotification:
 		txn.Ctxt = smf_context.GetSMContext(txn.CtxtKey)
+	case svcmsgtypes.SessionTask:
+		// Pre-loaded- No action
 	default:
 		txn.TxnFsmLog.Errorf("handle event[%v], next-event[%v], unknown msgtype [%v]",
 			transaction.TxnEventLoadCtxt.String(), transaction.TxnEventFailure.String(), txn.MsgType)
@@ -97,7 +98,10 @@ func (SmfTxnFsm) TxnCtxtPost(txn *transaction.Transaction) (transaction.TxnEvent
 		return transaction.TxnEventQueue, nil
 	}
 
-	// No other Txn running, lets proceed with current Txn
+	// No other Txn running, lets proceed with current Txn. It takes the slot here, in the same hold of
+	// the lock as the check: taken only in TxnCtxtRun, two transactions arriving together could both
+	// find it free and run at once.
+	smContext.ActiveTxn = txn
 
 	return transaction.TxnEventRun, nil
 }
@@ -110,7 +114,7 @@ func (SmfTxnFsm) TxnCtxtRun(txn *transaction.Transaction) (transaction.TxnEvent,
 	smContext.SMTxnBusLock.Lock()
 	defer smContext.SMTxnBusLock.Unlock()
 
-	if smContext.ActiveTxn != nil {
+	if smContext.ActiveTxn != nil && smContext.ActiveTxn != txn {
 		logger.TxnFsmLog.Errorf("active transaction [%v] not completed", smContext.ActiveTxn)
 	}
 
@@ -124,6 +128,13 @@ func (SmfTxnFsm) TxnProcess(txn *transaction.Transaction) (transaction.TxnEvent,
 	if smContext == nil {
 		txn.TxnFsmLog.Errorf("event[%v], next-event[%v], SM context invalid", transaction.TxnEventProcess.String(), transaction.TxnEventFailure.String())
 		return transaction.TxnEventFailure, fmt.Errorf("TxnProcess, invalid SM Ctxt")
+	}
+
+	// Work the SMF queued for the session itself: it runs here, in the session's slot, and needs no
+	// state machine -- what it does is decided by the session as it finds it.
+	if txn.MsgType == svcmsgtypes.SessionTask {
+		txn.Req.(func())()
+		return transaction.TxnEventSuccess, nil
 	}
 
 	var event SmEvent
@@ -228,17 +239,16 @@ func (SmfTxnFsm) TxnFailure(txn *transaction.Transaction) (transaction.TxnEvent,
 		if txn.Ctxt == nil {
 			logger.PduSessLog.Warnf("PDUSessionSMContextRelease [%s] is not found", txn.CtxtKey)
 
+			problemDetails := models.NewProblemDetails()
+			problemDetails.SetType("Resource Not Found")
+			problemDetails.SetTitle("SMContext Ref is not found")
+			problemDetails.SetStatus(int32(http.StatusNotFound))
 			// 4xx/5xx Error not defined in spec 29502 for Release SM ctxt error
 			// Send Not Found
 			httpResponse := &httpwrapper.Response{
 				Header: nil,
 				Status: http.StatusNotFound,
-
-				Body: &models.ProblemDetails{
-					Type:   openapi.PtrString("Resource Not Found"),
-					Title:  openapi.PtrString("SMContext Ref is not found"),
-					Status: openapi.PtrInt32(http.StatusNotFound),
-				},
+				Body:   problemDetails,
 			}
 			txn.Rsp = httpResponse
 		}
@@ -291,6 +301,9 @@ func (SmfTxnFsm) TxnEnd(txn *transaction.Transaction) (transaction.TxnEvent, err
 	// Active Txn is over, now Pull out head Txn and Run it
 	if len(smContext.TxnBus) > 0 {
 		nextTxn, smContext.TxnBus = smContext.TxnBus.PopTxn()
+		// The slot passes straight to it. Left free until it reaches TxnCtxtRun, a transaction
+		// arriving meanwhile would find it free and run alongside it.
+		smContext.ActiveTxn = nextTxn
 		txn.NextTxn = nextTxn
 		return transaction.TxnEventRun, nil
 	}

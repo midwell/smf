@@ -74,6 +74,7 @@ type Configuration struct {
 	ULCL                     bool              `yaml:"ulcl,omitempty"`
 	PCSCFInfo                PCSCFInfo         `yaml:"pcscfInfos,omitempty"`
 	Li                       *Li               `yaml:"li,omitempty"`
+	T3591                    *TimerValue       `yaml:"t3591,omitempty"`
 }
 
 // Li configures the Lawful Interception IRI-POI. It is opt-in: when absent, LI
@@ -156,6 +157,22 @@ type LiUPFTrigger struct {
 	NodeID string `yaml:"nodeId"` // the UPF's N4 node address
 	X1URL  string `yaml:"x1Url"`  // its LI_T3 endpoint, e.g. https://upf-1:8443/X1/NE
 	NEID   string `yaml:"neId"`   // the identifier its certificate is bound to
+}
+
+// TimerValue configures a NAS retransmission timer. It follows the shape the AMF uses for
+// its own NAS timers so that operators meet one convention rather than two.
+//
+// ExpireTime left unset means "resolve automatically": the extended NAS-SM timer indication
+// from the AMF if it arrives, and the terrestrial value from 3GPP TS 24.501 otherwise. Setting
+// it is a deliberate operator override of that resolution, for deployments whose RAN does not
+// advertise the information the indication is derived from.
+type TimerValue struct {
+	// Enable is a pointer so that an absent key means "on" rather than "off". With a plain bool
+	// a configuration that set only expireTime would silently disable the timer, which is the
+	// opposite of what writing a value expresses. This follows EnableKafka above.
+	Enable        *bool         `yaml:"enable,omitempty"`
+	ExpireTime    time.Duration `yaml:"expireTime"`
+	MaxRetryTimes int           `yaml:"maxRetryTimes,omitempty"`
 }
 
 type StaticIpInfo struct {

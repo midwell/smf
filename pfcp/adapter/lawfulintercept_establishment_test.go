@@ -81,11 +81,13 @@ func TestTheAdapterEstablishmentPathReportsAndTasks(t *testing.T) {
 		ie.NewCause(ie.CauseRequestAccepted),
 	)
 
-	adapter.HandlePfcpSessionEstablishmentResponse(&udp.Message{
+	if err := adapter.HandlePfcpSessionEstablishmentResponse(&udp.Message{
 		RemoteAddr:  &net.UDPAddr{IP: net.ParseIP("1.1.1.1"), Port: 8805},
 		PfcpMessage: rsp,
 		EventData:   udp.PfcpEventData{LSEID: seid},
-	})
+	}); err != nil {
+		t.Fatalf("the response was refused: %v", err)
+	}
 
 	if !reported {
 		t.Error("no establishment record was produced on the adapter path, so a tasked " +
@@ -131,11 +133,13 @@ func TestTheAdapterEstablishmentPathIsSilentWhenRejected(t *testing.T) {
 		ie.NewCause(ie.CauseRequestRejected),
 	)
 
-	adapter.HandlePfcpSessionEstablishmentResponse(&udp.Message{
+	if err := adapter.HandlePfcpSessionEstablishmentResponse(&udp.Message{
 		RemoteAddr:  &net.UDPAddr{IP: net.ParseIP("1.1.1.1"), Port: 8805},
 		PfcpMessage: rsp,
 		EventData:   udp.PfcpEventData{LSEID: seid},
-	})
+	}); err != nil {
+		t.Fatalf("the response was refused: %v", err)
+	}
 
 	if reported {
 		t.Error("an establishment record was produced for a session the UPF refused")

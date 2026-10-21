@@ -50,7 +50,7 @@ func associationConfig(t *testing.T) {
 
 	factory.SmfConfig = factory.Config{
 		Configuration: &factory.Configuration{
-			KafkaInfo:        factory.KafkaInfo{EnableKafka: boolPointer(false)},
+			KafkaInfo:        factory.KafkaInfo{EnableKafka: new(false)},
 			EnableUpfAdapter: false,
 		},
 	}

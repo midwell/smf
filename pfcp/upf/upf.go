@@ -12,9 +12,7 @@ import (
 	"github.com/omec-project/smf/context"
 	"github.com/omec-project/smf/lawfulintercept"
 	"github.com/omec-project/smf/logger"
-	"github.com/omec-project/smf/metrics"
 	"github.com/omec-project/smf/pfcp/message"
-	pfcp_message "github.com/wmnsk/go-pfcp/message"
 )
 
 const (
@@ -31,41 +29,63 @@ func InitPfcpHeartbeatRequest() {
 	// Iterate through all UPFs and send heartbeat to active UPFs
 	for {
 		time.Sleep(maxHeartbeatInterval * time.Second)
-		userplane := context.SMF_Self().UserPlaneInformation
-		if userplane == nil {
-			continue
-		}
-		for _, upf := range userplane.UPFs {
-			upf.UPF.UpfLock.Lock()
-			if (upf.UPF.UPFStatus == context.AssociatedSetUpSuccess) && upf.UPF.NHeartBeat < maxHeartbeatRetry {
-				err := message.SendHeartbeatRequest(upf.NodeID, upf.Port) // needs lock in sync rsp(adapter mode)
-				if err != nil {
-					logger.PfcpLog.Errorf("send pfcp heartbeat request failed: %v for UPF[%v, %v]: ", err, upf.NodeID, upf.NodeID.ResolveNodeIdToIp())
-				} else {
-					upf.UPF.NHeartBeat++
-				}
-			} else if upf.UPF.NHeartBeat == maxHeartbeatRetry {
-				logger.PfcpLog.Errorf("pfcp heartbeat failure for UPF: [%v]", upf.NodeID)
-				heartbeatRequest := pfcp_message.HeartbeatRequest{}
-				metrics.IncrementN4MsgStats(context.SMF_Self().NfInstanceID, heartbeatRequest.MessageTypeName(), "Out", "Failure", "Timeout")
-				upf.UPF.UPFStatus = context.NotAssociated
+		heartbeatAll()
+	}
+}
 
-				// Lawful Interception: this UPF has stopped answering, so what it holds is
-				// no longer knowable — and the claims this element keeps for it are worse
-				// than useless. They make `plan` skip every triple as already claimed, so
-				// nothing re-installs when the UPF comes back, and they keep
-				// `keepaliveDue` true, so this element goes on telling a POI it may not be
-				// reaching that its triggering function is present — which is precisely
-				// what disables that POI's own fail-safe.
-				//
-				// Discarding them is the same conclusion the heartbeat mismatch and the
-				// re-association paths reach, by the route that reaches it first: a claim
-				// that cannot be true must not be treated as one.
-				lawfulintercept.POIRestarted(upf.NodeID, upf.NodeID.ResolveNodeIdToIp().String())
-			}
+// heartbeatAll is one round of the heartbeat loop. It covers every UPF the SMF holds a record
+// for, not only the configured ones: TS 29.244 clause 5.8.2 has the CP function check a UP
+// function's responsiveness for as long as their association is established, and leaving the
+// configuration does not end the association. A UPF that hears nothing from the SMF drops the
+// association after its own read timeout, together with every session on it, so going quiet
+// while the configuration is empty, or omits the UPF, loses state it may be about to use again.
+// heartbeatUpf skips records that are not associated.
+func heartbeatAll() {
+	for _, upf := range context.RegisteredUPFs() {
+		heartbeatUpf(upf)
+	}
+}
 
-			upf.UPF.UpfLock.Unlock()
+// heartbeatUpf is one heartbeat for one user plane, split out of the loop as probeUpf is so that
+// what it counts can be tested.
+func heartbeatUpf(upf *context.UPF) {
+	upf.UpfLock.Lock()
+	defer upf.UpfLock.Unlock()
+
+	if (upf.UPFStatus == context.AssociatedSetUpSuccess) && upf.NHeartBeat < maxHeartbeatRetry {
+		err := message.SendHeartbeatRequest(upf.NodeID, upf.Port) // needs lock in sync rsp(adapter mode)
+		if err != nil {
+			logger.PfcpLog.Errorf("send pfcp heartbeat request failed: %v for UPF[%v, %v]: ", err, upf.NodeID, upf.NodeID.ResolveNodeIdToIp())
 		}
+
+		// Counted whether or not the send succeeded. NHeartBeat is the number of heartbeats this
+		// user plane has not answered -- each response resets it -- and a heartbeat that could not
+		// be delivered is one it has not answered. Counting only successful sends meant a user
+		// plane behind an adapter that was down, or refusing, never reached the limit, and was
+		// never declared lost however long it stayed unreachable.
+		upf.NHeartBeat++
+	} else if upf.NHeartBeat == maxHeartbeatRetry {
+		// No N4 "Out/Failure" is counted here: this branch sends nothing, and each heartbeat that
+		// actually failed to send -- synchronously (reportSendFailure) or asynchronously (the
+		// startTxLifeCycle fallback) -- is already counted once by the layer that sent it. Counting
+		// again here, for a send that did not happen, recorded one more failure than there were
+		// heartbeats. The UPF is still declared lost; that transition is an association-state change,
+		// not a send, so it is logged rather than booked against the send-failure metric.
+		logger.PfcpLog.Errorf("pfcp heartbeat failure for UPF: [%v]", upf.NodeID)
+		upf.UPFStatus = context.NotAssociated
+
+		// Lawful Interception: this UPF has stopped answering, so what it holds is
+		// no longer knowable — and the claims this element keeps for it are worse
+		// than useless. They make `plan` skip every triple as already claimed, so
+		// nothing re-installs when the UPF comes back, and they keep
+		// `keepaliveDue` true, so this element goes on telling a POI it may not be
+		// reaching that its triggering function is present — which is precisely
+		// what disables that POI's own fail-safe.
+		//
+		// Discarding them is the same conclusion the heartbeat mismatch and the
+		// re-association paths reach, by the route that reaches it first: a claim
+		// that cannot be true must not be treated as one.
+		lawfulintercept.POIRestarted(upf.NodeID, upf.NodeID.ResolveNodeIdToIp().String())
 	}
 }
 

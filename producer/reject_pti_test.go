@@ -11,7 +11,6 @@ import (
 
 	"github.com/omec-project/nas/v2"
 	"github.com/omec-project/nas/v2/nasMessage"
-	"github.com/omec-project/openapi/v2"
 	"github.com/omec-project/openapi/v2/models"
 	smf_context "github.com/omec-project/smf/context"
 	"github.com/omec-project/smf/msgtypes/svcmsgtypes"
@@ -146,16 +145,15 @@ func TestEstablishmentRejectEchoesRequestPti(t *testing.T) {
 	// A context that has never handled a request: Pti is the zero value, exactly as it is when an
 	// establishment is refused before HandlePDUSessionEstablishmentRequest runs.
 	smContext := smf_context.NewSMContext("imsi-208930100007488", pduSessionID)
-
+	snssai := models.NewSnssai(1)
+	snssai.SetSd("010203")
+	var smCtxCreateData models.SmContextCreateData
+	smCtxCreateData.SetSupi("imsi-208930100007488")
+	smCtxCreateData.SetPduSessionId(int32(pduSessionID))
+	smCtxCreateData.SetDnn(unservedDnn)
+	smCtxCreateData.SetSNssai(*snssai)
 	request := models.NewPostSmContextsRequest()
-	request.SetJsonData(models.SmContextCreateData{
-		Supi:         openapi.PtrString("imsi-208930100007488"),
-		PduSessionId: openapi.PtrInt32(pduSessionID),
-		Dnn:          openapi.PtrString(unservedDnn),
-		// SNssai must be set: the refusal logs createData.SNssai.Sst before building the
-		// rejection, so a nil S-NSSAI panics before the message under test exists.
-		SNssai: &models.Snssai{Sst: 1, Sd: openapi.PtrString("010203")},
-	})
+	request.SetJsonData(smCtxCreateData)
 	request.SetBinaryDataN1SmMessage(n1SmMessageFile(t, encodeEstablishmentRequest(t, pduSessionID, requestPti)))
 
 	txn := transaction.NewTransaction(*request, nil, svcmsgtypes.CreateSmContext)
@@ -202,7 +200,7 @@ func TestReleaseRejectEchoesRequestPti(t *testing.T) {
 	// either state is active, which a context with no allocated address cannot satisfy.
 	smContext := smf_context.NewSMContext("imsi-208930100007488", contextPduSessionID)
 
-	request := models.UpdateSmContextRequest{}
+	var request models.UpdateSmContextRequest
 	request.SetJsonData(models.SmContextUpdateData{})
 	request.SetBinaryDataN1SmMessage(n1SmMessageFile(t, encodeReleaseRequest(t, requestedPduSessionID, requestPti)))
 
@@ -224,6 +222,65 @@ func TestReleaseRejectEchoesRequestPti(t *testing.T) {
 	// clause 7.3.1 item b) makes the UE answer with cause 47 rather than ignore.
 	if pti != requestPti {
 		t.Errorf("rejection carries PTI %#02x, want the request's %#02x", pti, requestPti)
+	}
+}
+
+// TestReleaseRequestForNeverEstablishedSessionIsRejectedWithInvalidIdentity covers the SmStateInit
+// branch of the isSmContextInactive guard: a release request naming the session the context
+// actually holds, but before anything was ever established, still needs a NAS answer -- #43
+// invalid PDU session identity, TS 24.501 subclause 6.4.2.6 item b -- rather than a silent 200
+// with no N1 content, or the UE's own release procedure retransmits until its timer expires.
+func TestReleaseRequestForNeverEstablishedSessionIsRejectedWithInvalidIdentity(t *testing.T) {
+	const pduSessionID = 10
+
+	// NewSMContext's default state: nothing was ever established for this session.
+	smContext := smf_context.NewSMContext("imsi-208930100007488", pduSessionID)
+
+	var request models.UpdateSmContextRequest
+	request.SetJsonData(models.SmContextUpdateData{})
+	request.SetBinaryDataN1SmMessage(n1SmMessageFile(t, encodeReleaseRequest(t, pduSessionID, requestPti)))
+
+	txn := transaction.NewTransaction(request, nil, svcmsgtypes.UpdateSmContext)
+	txn.Ctxt = smContext
+
+	response := models.NewUpdateSmContext200Response()
+	if err := HandleUpdateN1Msg(txn, response, &pfcpAction{}); err != nil {
+		t.Fatalf("HandleUpdateN1Msg returned %v, want the release to be refused without error", err)
+	}
+
+	file := response.GetBinaryDataN1SmMessage()
+	if file == nil {
+		t.Fatal("no N1 SM message was attached to the response: a never-established session's release request was silently dropped")
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		t.Fatalf("could not rewind the response payload: %v", err)
+	}
+	payload, err := io.ReadAll(file)
+	if err != nil {
+		t.Fatalf("could not read the response's N1 SM message: %v", err)
+	}
+	m := nas.NewMessage()
+	if err := m.GsmMessageDecode(&payload); err != nil {
+		t.Fatalf("could not decode the response's N1 SM message: %v", err)
+	}
+
+	if got := m.GsmHeader.GetMessageType(); got != nas.MsgTypePDUSessionReleaseReject {
+		t.Fatalf("message type = %#02x, want PDU SESSION RELEASE REJECT (%#02x)", got, nas.MsgTypePDUSessionReleaseReject)
+	}
+	reject := m.PDUSessionReleaseReject
+	if got := reject.GetCauseValue(); got != nasMessage.Cause5GSMInvalidPDUSessionIdentity {
+		t.Errorf("5GSM cause = #%d, want #43 invalid PDU session identity", got)
+	}
+	if got := reject.GetPTI(); got != requestPti {
+		t.Errorf("PTI = %#02x, want the request's %#02x", got, requestPti)
+	}
+	if got := int32(reject.GetPDUSessionID()); got != pduSessionID {
+		t.Errorf("PDU session id = %d, want %d", got, pduSessionID)
+	}
+
+	if smContext.SMContextState != smf_context.SmStateInit {
+		t.Errorf("SM context state = %v, want it to remain SmStateInit: nothing was ever established to clean up",
+			smContext.SMContextState.String())
 	}
 }
 

@@ -7,7 +7,6 @@ package polling
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -15,7 +14,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/mohae/deepcopy"
+	gojson "github.com/goccy/go-json"
 	"github.com/omec-project/openapi/v2/nfConfigApi"
 	"github.com/omec-project/smf/logger"
 )
@@ -66,16 +65,30 @@ func StartPollingService(ctx context.Context, webuiUri string, registrationChan,
 		case <-pollingIntervalAfter(interval):
 			newSessionManagementConfig, err := fetchSessionManagementConfig(&poller, pollingEndpoint)
 			if err != nil {
-				interval = minDuration(interval*time.Duration(pollingBackoffFactor), pollingMaxBackoff)
+				interval = min(interval*time.Duration(pollingBackoffFactor), pollingMaxBackoff)
 				logger.PollConfigLog.Errorf("Polling error. Retrying in %v: %+v", interval, err)
 				continue
 			}
 			interval = initialPollingInterval
 
+			// Round-trip through JSON so the comparison and stored state always reflect the
+			// custom (Un)MarshalJSON behaviour of nfConfigApi types (e.g. AdditionalProperties
+			// defaulting to an empty map instead of nil), regardless of how the config was built.
+			data, err := gojson.Marshal(newSessionManagementConfig)
+			if err != nil {
+				logger.PollConfigLog.Errorf("failed to marshal SessionManagement config: %v", err)
+				continue
+			}
+			var normalizedConfig []nfConfigApi.SessionManagement
+			if err := gojson.Unmarshal(data, &normalizedConfig); err != nil {
+				logger.PollConfigLog.Errorf("failed to unmarshal SessionManagement config: %v", err)
+				continue
+			}
+
 			// only trigger callback if config changed
-			if !reflect.DeepEqual(newSessionManagementConfig, poller.currentSessionManagementConfig) {
+			if !reflect.DeepEqual(normalizedConfig, poller.currentSessionManagementConfig) {
 				logger.PollConfigLog.Infof("Session Management config changed. New Session Management Data: %+v", newSessionManagementConfig)
-				poller.currentSessionManagementConfig = deepcopy.Copy(newSessionManagementConfig).([]nfConfigApi.SessionManagement)
+				poller.currentSessionManagementConfig = normalizedConfig
 				handleUpdate(newSessionManagementConfig)
 			} else {
 				logger.PollConfigLog.Debugf("Session management config did not change %+v", newSessionManagementConfig)
@@ -119,7 +132,7 @@ func (p *nfConfigPoller) fetchSessionManagementConfig(pollingEndpoint string) ([
 		}
 
 		var config []nfConfigApi.SessionManagement
-		if err := json.Unmarshal(body, &config); err != nil {
+		if err := gojson.Unmarshal(body, &config); err != nil {
 			logger.PollConfigLog.Debugf("Session-management raw response: %s", body)
 			return nil, fmt.Errorf("failed to parse JSON response: %w", err)
 		}
@@ -130,11 +143,4 @@ func (p *nfConfigPoller) fetchSessionManagementConfig(pollingEndpoint string) ([
 	default:
 		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 	}
-}
-
-func minDuration(a, b time.Duration) time.Duration {
-	if a < b {
-		return a
-	}
-	return b
 }

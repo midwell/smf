@@ -4,12 +4,15 @@
 package adapter
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"sync"
 
+	"github.com/omec-project/smf/consumer"
 	"github.com/omec-project/smf/context"
 	"github.com/omec-project/smf/logger"
+	"github.com/omec-project/smf/pfcp/ies"
 	"github.com/omec-project/smf/pfcp/lisequence"
 	"github.com/omec-project/smf/pfcp/udp"
 	"github.com/wmnsk/go-pfcp/ie"
@@ -87,21 +90,6 @@ func notifyTriggerCC(sc *context.SMContext) {
 	}
 }
 
-// establishmentAccepted reports whether the response carries an accepted cause.
-//
-// A copy of pfcp/handler's helper rather than a shared one: this package cannot import that one
-// without a cycle, and the alternative — moving the shared response handling into a package both
-// can import — is a restructuring of upstream code on a fork that must stay readable as a diff.
-func establishmentAccepted(rsp *message.SessionEstablishmentResponse) bool {
-	if rsp.Cause == nil {
-		return false
-	}
-
-	cause, err := rsp.Cause.Cause()
-
-	return err == nil && cause == ie.CauseRequestAccepted
-}
-
 // notifyPOIRestarted calls the hook if one is wired. Written once so a new call site cannot
 // forget the nil check — a nil function value panics, and these are PFCP message handlers.
 func notifyPOIRestarted(node context.NodeID, addr string) {
@@ -144,17 +132,22 @@ func HandleAdapterPfcpRsp(pfcpMsg message.Message, evtData *udp.PfcpEventData) e
 	case message.MsgTypeHeartbeatResponse:
 		msg := udp.Message{PfcpMessage: pfcpMsg}
 		HandlePfcpHeartbeatResponse(&msg)
+	// The session handlers report a reply they could not use rather than dropping it. Here the reply
+	// is the only answer there will be -- the request was one HTTP call, with no transaction left to
+	// time out -- so a reply dropped in silence left the session waiting on its channel for good.
+	// What stays silent is what should: a reply for a session in no state that awaits it, and one
+	// that is one of several the session is still collecting.
 	case message.MsgTypeSessionEstablishmentResponse:
 		msg := udp.Message{PfcpMessage: pfcpMsg, EventData: *evtData}
-		HandlePfcpSessionEstablishmentResponse(&msg)
+		return HandlePfcpSessionEstablishmentResponse(&msg)
 	case message.MsgTypeSessionModificationResponse:
 		msg := udp.Message{PfcpMessage: pfcpMsg, EventData: *evtData}
-		HandlePfcpSessionModificationResponse(&msg)
+		return HandlePfcpSessionModificationResponse(&msg)
 	case message.MsgTypeSessionDeletionResponse:
 		msg := udp.Message{PfcpMessage: pfcpMsg, EventData: *evtData}
-		HandlePfcpSessionDeletionResponse(&msg)
+		return HandlePfcpSessionDeletionResponse(&msg)
 	default:
-		logger.PfcpLog.Errorf("upf adapter invalid msg type: %v", pfcpMsg)
+		return fmt.Errorf("upf adapter returned an unexpected message type: %v", pfcpMsg.MessageTypeName())
 	}
 	return nil
 }
@@ -314,27 +307,24 @@ func HandlePfcpHeartbeatResponse(msg *udp.Message) {
 	upf.NHeartBeat = 0 // reset Heartbeat attempt to 0
 }
 
-func HandlePfcpSessionEstablishmentResponse(msg *udp.Message) {
+func HandlePfcpSessionEstablishmentResponse(msg *udp.Message) error {
 	rsp, ok := msg.PfcpMessage.(*message.SessionEstablishmentResponse)
 	if !ok {
-		logger.PfcpLog.Errorln("invalid PFCP Session Establishment Response")
-		return
+		return errors.New("invalid PFCP Session Establishment Response")
 	}
 	logger.PfcpLog.Infoln("in HandlePfcpSessionEstablishmentResponse")
 
 	SEID := rsp.SEID()
 	if SEID == 0 {
 		if eventData, ok := msg.EventData.(udp.PfcpEventData); !ok {
-			logger.PfcpLog.Warnln("PFCP Session Establish Response found invalid event data, response discarded")
-			return
+			return errors.New("PFCP Session Establish Response found invalid event data, response discarded")
 		} else {
 			SEID = eventData.LSEID
 		}
 	}
 	smContext := context.GetSMContextBySEID(SEID)
 	if smContext == nil {
-		logger.PfcpLog.Warnln("PFCP Session Establish Response found SM context nil, response discarded")
-		return
+		return errors.New("PFCP Session Establish Response found SM context nil, response discarded")
 	}
 	smContext.SMLock.Lock()
 	defer smContext.SMLock.Unlock()
@@ -345,39 +335,61 @@ func HandlePfcpSessionEstablishmentResponse(msg *udp.Message) {
 	seq := rsp.Sequence()
 	nodeID := FetchPfcpTxn(seq)
 	if nodeID == nil {
-		logger.PfcpLog.Errorf("no pending pfcp session establishment response for sequence no: %v", seq)
-		return
+		return fmt.Errorf("no pending pfcp session establishment response for sequence no: %v", seq)
 	}
 
-	if rsp.UPFSEID != nil {
-		NodeIDtoIP := nodeID.ResolveNodeIdToIp().String()
-		pfcpSessionCtx := smContext.PFCPContext[NodeIDtoIP]
-		rspUPFseid, err := rsp.UPFSEID.FSEID()
-		if err != nil {
-			logger.PfcpLog.Errorf("pfcp session establishment response UPFSEID error: %v", err)
-			return
+	upfKey, _ := smContext.GetPFCPContextKeyByLocalSEID(SEID)
+
+	if rsp.Cause == nil {
+		return errors.New("pfcp session establishment response has no cause")
+	}
+	causeValue, causeErr := rsp.Cause.Cause()
+	if causeErr != nil {
+		return fmt.Errorf("pfcp session establishment response cause error: %v", causeErr)
+	}
+	var rspUPFseid *ie.FSEIDFields
+	if causeValue == ie.CauseRequestAccepted && rsp.UPFSEID != nil {
+		var fseidErr error
+		if rspUPFseid, fseidErr = rsp.UPFSEID.FSEID(); fseidErr != nil {
+			logger.PfcpLog.Errorf("failed to parse FSEID IE: %+v", fseidErr)
+			rspUPFseid = nil
 		}
-		pfcpSessionCtx.RemoteSEID = rspUPFseid.SEID
-		// Which incarnation of the node acknowledged it, so a restoration after a restart can tell a
-		// session the restarted node lost from one it already holds. See AcknowledgedAtRecovery.
+	}
+	accepted := causeValue == ie.CauseRequestAccepted
+
+	if accepted {
+		pfcpSessionCtx := smContext.PFCPContext[upfKey]
+		if pfcpSessionCtx == nil {
+			return fmt.Errorf("PFCP Session Establishment accepted but its PFCP context is gone for UPF[%s]", nodeID.ResolveNodeIdToIp().String())
+		}
+		if rspUPFseid != nil {
+			pfcpSessionCtx.RemoteSEID = rspUPFseid.SEID
+			smContext.SubPfcpLog.Infof("in HandlePfcpSessionEstablishmentResponse rsp.UPFSEID.Seid [%v] ", rspUPFseid.SEID)
+		}
 		if upf := context.RetrieveUPFNodeByNodeID(*nodeID); upf != nil {
 			pfcpSessionCtx.AcknowledgedAtRecovery = upf.HeldRecovery()
 		}
-		smContext.SubPfcpLog.Infof("in HandlePfcpSessionEstablishmentResponse rsp.UPFSEID.Seid [%v] ", rspUPFseid.SEID)
 	}
 
 	// Get N3 interface UPF
 	defaultPath := smContext.Tunnel.DataPathPool.GetDefaultPath()
 	if defaultPath == nil {
-		logger.PfcpLog.Errorln("failed to get default path")
-		return
+		return errors.New("failed to get default path")
 	}
 	ANUPF := smContext.Tunnel.DataPathPool.GetDefaultPath().FirstDPNode
 
-	if rsp.CreatedPDR != nil {
+	if accepted && rsp.CreatedPDR != nil {
 		ueIPAddress := FindUEIPAddress(rsp.CreatedPDR)
 		if ueIPAddress != nil {
 			smContext.SubPfcpLog.Infof("upf provided ue ip address [%v]", ueIPAddress)
+
+			// Before the release, not after. Releasing first puts the old address back in
+			// the pool, and another session can take it while this report is in flight --
+			// leaving the PCF holding that address as this session's binding key at the
+			// moment it becomes another subscriber's, which is the collision this reports
+			// to prevent.
+			consumer.ReportUeIpChange(smContext, ueIPAddress)
+
 			// Release previous locally allocated UE IP-Addr
 			err := smContext.ReleaseUeIpAddr()
 			if err != nil {
@@ -392,15 +404,18 @@ func HandlePfcpSessionEstablishmentResponse(msg *udp.Message) {
 		// Store F-TEID created by UPF
 		fteid, err := FindFTEID(rsp.CreatedPDR)
 		if err != nil {
-			logger.PfcpLog.Errorf("failed to parse TEID IE: %+v", err)
-			return
+			return fmt.Errorf("failed to parse TEID IE: %+v", err)
 		}
 		logger.PfcpLog.Infof("created PDR FTEID: %+v", fteid)
+		if err := ies.CheckOneFTEID(rsp.CreatedPDR); err != nil {
+			smContext.SubPfcpLog.Errorf("UPF[%s]: %v; the RAN is told TEID %#x",
+				nodeID.ResolveNodeIdToIp().String(), err, fteid.TEID)
+		}
+
 		ANUPF.UpLinkTunnel.TEID = fteid.TEID
 		upf := context.RetrieveUPFNodeByNodeID(*nodeID)
 		if upf == nil {
-			logger.PfcpLog.Errorf("can't find UPF[%s]", nodeID.ResolveNodeIdToIp().String())
-			return
+			return fmt.Errorf("can't find UPF[%s]", nodeID.ResolveNodeIdToIp().String())
 		}
 		upf.N3Interfaces = make([]context.UPFInterfaceInfo, 0)
 		n3Interface := context.UPFInterfaceInfo{}
@@ -409,59 +424,53 @@ func HandlePfcpSessionEstablishmentResponse(msg *udp.Message) {
 	}
 
 	if rsp.NodeID == nil {
-		logger.PfcpLog.Errorln("PFCP Session Establishment Response missing NodeID")
-		return
+		return errors.New("PFCP Session Establishment Response missing NodeID")
 	}
 	rspNodeIDStr, err := rsp.NodeID.NodeID()
 	if err != nil {
-		logger.PfcpLog.Errorf("failed to parse NodeID IE: %+v", err)
-		return
+		return fmt.Errorf("failed to parse NodeID IE: %+v", err)
 	}
 	rspNodeID := context.NewNodeID(rspNodeIDStr)
 
 	if ANUPF.UPF == nil {
-		logger.PfcpLog.Errorln("failed to get UPF from default path")
-		return
+		return errors.New("failed to get UPF from default path")
 	}
 
-	if ANUPF.UPF.NodeID.ResolveNodeIdToIp().Equal(nodeID.ResolveNodeIdToIp()) {
-		if rsp.Cause == nil {
-			logger.PfcpLog.Errorln("pfcp session establishment response has no cause")
-			return
-		}
-		causeValue, err := rsp.Cause.Cause()
-		if err != nil {
-			logger.PfcpLog.Errorf("pfcp session establishment response cause error: %v", err)
-			return
-		}
-		// Gated on the state, like the modification and release handlers. Restoration issues an
-		// establishment without waiting on this channel, so an unconditional send here would leave a
-		// stale value for whichever unrelated modification or release next waits on it.
-		awaited := smContext.SMContextState == context.SmStatePfcpCreatePending
-		// UPF Accept
-		if causeValue == ie.CauseRequestAccepted {
-			// Lawful Interception IRI-POI: the session now exists on the UPF, so its F-SEID
-			// (the X2 correlation identifier) and F-TEID are known — both were set above from
-			// this response. At most once per session; silent no-op unless LI is configured.
-			// SMLock is held for the whole handler.
-			//
-			// Inside the anchor branch, as in the native handler: the record's correlation
-			// identifier is the *default path's* F-SEID, so emitting it on some other UPF's
-			// response would produce the one record describing the session with nothing to
-			// join it to.
-			notifyReportEstablishment(smContext)
+	// Gated on the state, like the modification and release handlers. Restoration issues an
+	// establishment without waiting on this channel, so an unconditional send here would leave a
+	// stale value for whichever unrelated modification or release next waits on it.
+	awaited := smContext.SMContextState == context.SmStatePfcpCreatePending
 
-			if awaited {
-				smContext.SBIPFCPCommunicationChan <- context.SessionEstablishSuccess
-			}
-			smContext.SubPfcpLog.Infof("PFCP Session Establishment accepted")
-		} else {
-			if awaited {
-				smContext.SBIPFCPCommunicationChan <- context.SessionEstablishFailed
-			}
-			smContext.SubPfcpLog.Errorf("PFCP Session Establishment rejected with cause [%v]", causeValue)
-			if causeValue == ie.CauseNoEstablishedPFCPAssociation {
-				SetUpfInactive(*rspNodeID)
+	if !accepted {
+		smContext.SubPfcpLog.Errorf("PFCP Session Establishment rejected with cause [%v]", causeValue)
+		if causeValue == ie.CauseNoEstablishedPFCPAssociation {
+			SetUpfInactive(*rspNodeID)
+		}
+	} else {
+		// Lawful Interception IRI-POI: the session now exists on the UPF, so its F-SEID
+		// (the X2 correlation identifier) and F-TEID are known — both were set above from
+		// this response. At most once per session; silent no-op unless LI is configured.
+		// SMLock is held for the whole handler.
+		//
+		// Only on the anchor's response, as in the native handler: the record's correlation
+		// identifier is the *default path's* F-SEID, so emitting it on some other UPF's
+		// response would produce the one record describing the session with nothing to
+		// join it to.
+		if ANUPF.UPF.NodeID.ResolveNodeIdToIp().Equal(nodeID.ResolveNodeIdToIp()) {
+			notifyReportEstablishment(smContext)
+		}
+		smContext.SubPfcpLog.Infof("PFCP Session Establishment accepted")
+	}
+
+	if awaited {
+		tracked, signal, verdict := smContext.AggregateEstablishmentResponse(upfKey, accepted)
+		if !tracked {
+			smContext.SubPfcpLog.Warnf("PFCP Session Establishment Response from UPF[%s] was not pending; not counted toward the establishment verdict", nodeID.ResolveNodeIdToIp().String())
+		} else if signal {
+			select {
+			case smContext.SBIPFCPCommunicationChan <- verdict:
+			default:
+				smContext.SubPfcpLog.Warnf("an establishment verdict is already waiting; not queueing %v", verdict)
 			}
 		}
 	}
@@ -471,12 +480,11 @@ func HandlePfcpSessionEstablishmentResponse(msg *udp.Message) {
 	// the earliest point it can be sent — the duplication instruction itself rode out with the
 	// request.
 	//
-	// Outside the anchor branch above, as in the native handler, because a session can be served
-	// by more than one UPF and only the anchor's response takes that branch. Inside it, an
-	// additional PSA got its DUPL FAR but never its trigger, so it duplicated the target's
-	// traffic into content the CC-POI could not attribute and correctly dropped. Triggering is
-	// idempotent per (warrant, session, UPF).
-	if establishmentAccepted(rsp) {
+	// Not gated on the anchor, as in the native handler, because a session can be served by
+	// more than one UPF. Gated on the anchor, an additional PSA got its DUPL FAR but never its
+	// trigger, so it duplicated the target's traffic into content the CC-POI could not
+	// attribute and correctly dropped. Triggering is idempotent per (warrant, session, UPF).
+	if accepted {
 		// Re-derive duplication before tasking: a warrant that activated while this session was
 		// being established has not been applied to its FARs by anyone, and this is the first
 		// point ordered after the session exists. Under the same lock, so it cannot race the
@@ -484,25 +492,23 @@ func HandlePfcpSessionEstablishmentResponse(msg *udp.Message) {
 		notifyApplyCCAfterEstablishment(smContext)
 		notifyTriggerCC(smContext)
 	}
+	return nil
 }
 
-func HandlePfcpSessionModificationResponse(msg *udp.Message) {
+func HandlePfcpSessionModificationResponse(msg *udp.Message) error {
 	pfcpRsp, ok := msg.PfcpMessage.(*message.SessionModificationResponse)
 	if !ok {
-		logger.PfcpLog.Errorln("invalid PFCP Session Modification Response")
-		return
+		return errors.New("invalid PFCP Session Modification Response")
 	}
 	logger.PfcpLog.Infoln("in HandlePfcpSessionModificationResponse")
 
 	cause := pfcpRsp.Cause
 	if cause == nil {
-		logger.PfcpLog.Warnln("PFCP Session Modification Response found invalid cause, response discarded")
-		return
+		return errors.New("PFCP Session Modification Response found invalid cause, response discarded")
 	}
 	causeValue, err := cause.Cause()
 	if err != nil {
-		logger.PfcpLog.Errorf("PFCP Session Modification Response cause error: %v", err)
-		return
+		return fmt.Errorf("PFCP Session Modification Response cause error: %v", err)
 	}
 
 	logger.PfcpLog.Infof("in HandlePfcpSessionModificationResponse pfcpRsp.Cause.CauseValue = [%v], accepted?? %v", causeValue, causeValue == ie.CauseRequestAccepted)
@@ -512,8 +518,7 @@ func HandlePfcpSessionModificationResponse(msg *udp.Message) {
 
 	if SEID == 0 {
 		if eventData, ok := msg.EventData.(udp.PfcpEventData); !ok {
-			logger.PfcpLog.Warnln("PFCP Session Modification Response found invalid event data, response discarded")
-			return
+			return errors.New("PFCP Session Modification Response found invalid event data, response discarded")
 		} else {
 			SEID = eventData.LSEID
 		}
@@ -545,26 +550,29 @@ func HandlePfcpSessionModificationResponse(msg *udp.Message) {
 	if req, ok := lisequence.Take(pfcpRsp.Sequence()); ok {
 		notifyLIModificationAnswered(req, causeValue, true)
 
-		return
+		return nil
 	}
 
 	// After the interception block, as in the native handler: that block answers a
 	// modification this element sent itself, keyed on the sequence number alone, and it must
 	// still run when the session has since been released.
 	if smContext == nil {
-		logger.PfcpLog.Warnf("PFCP Session Modification Response found SM context nil for SEID %d, response discarded", SEID)
-		return
+		return fmt.Errorf("PFCP Session Modification Response found SM context nil for SEID %d, response discarded", SEID)
 	}
 
 	if causeValue == ie.CauseRequestAccepted {
 		smContext.SubPduSessLog.Infoln("PFCP Modification Response Accept")
 		if smContext.SMContextState == context.SmStatePfcpModify {
-			upfNodeID := smContext.GetNodeIDByLocalSEID(SEID)
-			upfIP := upfNodeID.ResolveNodeIdToIp().String()
-			delete(smContext.PendingUPF, upfIP)
-			smContext.SubPduSessLog.Debugf("delete pending pfcp response: UPF IP [%s]", upfIP)
+			// The dispatch-time PFCPContext key (recovered from the response's local SEID), not a
+			// re-resolution of the NodeID: an FQDN UPF's address can move under the DNS refresh while
+			// the modification is in flight, and a re-resolved key would miss PendingUPF and leave the
+			// awaited modify blocked on SBIPFCPCommunicationChan. An absent entry is nothing to drain.
+			upfKey, known := smContext.GetPFCPContextKeyByLocalSEID(SEID)
+			// DeletePendingUPF: see SMContext.PendingUPFLock's declaration.
+			pendingEmpty := known && smContext.DeletePendingUPF(upfKey)
+			smContext.SubPduSessLog.Debugf("delete pending pfcp response: UPF [%s]", upfKey)
 
-			if smContext.PendingUPF.IsEmpty() {
+			if pendingEmpty {
 				smContext.SBIPFCPCommunicationChan <- context.SessionUpdateSuccess
 			}
 		}
@@ -577,25 +585,23 @@ func HandlePfcpSessionModificationResponse(msg *udp.Message) {
 		}
 	}
 
-	smContext.SubCtxLog.Debugln("PFCP Session Context")
-	for _, ctx := range smContext.PFCPContext {
-		smContext.SubCtxLog.Debugln(ctx.String())
-	}
+	// No debug dump of PFCPContext here: this handler does not hold SMLock, so iterating the map
+	// would race -- fatally -- a concurrent AllocateLocalSEIDForDataPath insert (e.g. a PSA/ULCL
+	// branch activation). See SMContext.seidToPFCPCtx.
+	return nil
 }
 
-func HandlePfcpSessionDeletionResponse(msg *udp.Message) {
+func HandlePfcpSessionDeletionResponse(msg *udp.Message) error {
 	pfcpRsp, ok := msg.PfcpMessage.(*message.SessionDeletionResponse)
 	if !ok {
-		logger.PfcpLog.Errorln("invalid PFCP Session Deletion Response")
-		return
+		return errors.New("invalid PFCP Session Deletion Response")
 	}
 	logger.PfcpLog.Infoln("handle PFCP Session Deletion Response")
 	SEID := pfcpRsp.SEID()
 
 	if SEID == 0 {
 		if eventData, ok := msg.EventData.(udp.PfcpEventData); !ok {
-			logger.PfcpLog.Warnln("PFCP Session Deletion Response found invalid event data, response discarded")
-			return
+			return errors.New("PFCP Session Deletion Response found invalid event data, response discarded")
 		} else {
 			SEID = eventData.LSEID
 		}
@@ -603,40 +609,43 @@ func HandlePfcpSessionDeletionResponse(msg *udp.Message) {
 	smContext := context.GetSMContextBySEID(SEID)
 
 	if smContext == nil {
-		logger.PfcpLog.Warnln("PFCP Session Deletion Response found SM context nil, response discarded")
-		return
+		return errors.New("PFCP Session Deletion Response found SM context nil, response discarded")
 	}
 
 	cause := pfcpRsp.Cause
 	if cause == nil {
-		logger.PfcpLog.Warnln("PFCP Session Deletion Response found invalid cause, response discarded")
-		return
+		return errors.New("PFCP Session Deletion Response found invalid cause, response discarded")
 	}
 
 	causeValue, err := cause.Cause()
 	if err != nil {
-		logger.PfcpLog.Errorf("PFCP Session Deletion Response cause error: %v", err)
-		return
+		return fmt.Errorf("PFCP Session Deletion Response cause error: %v", err)
 	}
 
 	if causeValue == ie.CauseRequestAccepted {
 		if smContext.SMContextState == context.SmStatePfcpRelease {
-			upfNodeID := smContext.GetNodeIDByLocalSEID(SEID)
-			upfIP := upfNodeID.ResolveNodeIdToIp().String()
-			delete(smContext.PendingUPF, upfIP)
-			smContext.SubPduSessLog.Debugf("delete pending pfcp response: UPF IP [%s]", upfIP)
+			// The dispatch-time PFCPContext key (recovered from the response's local SEID), not a
+			// re-resolution of the NodeID: an FQDN UPF's address can move under the DNS refresh while
+			// the deletion is in flight, and a re-resolved key would miss PendingUPF and leave the
+			// awaited release blocked on SBIPFCPCommunicationChan. An absent entry is nothing to drain.
+			upfKey, known := smContext.GetPFCPContextKeyByLocalSEID(SEID)
+			// DeletePendingUPF: releaseTunnel rebuilds this same map under SMLock, which this
+			// handler cannot take (see SMContext.PendingUPFLock's declaration).
+			pendingEmpty := known && smContext.DeletePendingUPF(upfKey)
+			smContext.SubPduSessLog.Debugf("delete pending pfcp response: UPF [%s]", upfKey)
 
-			if smContext.PendingUPF.IsEmpty() && !smContext.LocalPurged {
+			if pendingEmpty && !smContext.LocalPurged.Load() {
 				smContext.SBIPFCPCommunicationChan <- context.SessionReleaseSuccess
 			}
 		}
 		smContext.SubPfcpLog.Infof("PFCP Session Deletion Success[%d]", SEID)
 	} else {
-		if smContext.SMContextState == context.SmStatePfcpRelease && !smContext.LocalPurged {
+		if smContext.SMContextState == context.SmStatePfcpRelease && !smContext.LocalPurged.Load() {
 			smContext.SBIPFCPCommunicationChan <- context.SessionReleaseSuccess
 		}
 		smContext.SubPfcpLog.Infof("PFCP Session Deletion Failed[%d]", SEID)
 	}
+	return nil
 }
 
 func SetUpfInactive(nodeID context.NodeID) {

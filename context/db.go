@@ -18,7 +18,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bytedance/sonic"
+	gojson "github.com/goccy/go-json"
 	"github.com/omec-project/openapi/v2/Namf_Communication"
 	"github.com/omec-project/openapi/v2/Npcf_SMPolicyControl"
 	"github.com/omec-project/smf/factory"
@@ -34,11 +34,12 @@ const (
 	NodeInDBCol       = "smf.data.nodeInDB"
 	RefSeidCol        = "smf.data.refToSeid"
 	refFilterKey      = "ref"
+	seidFilterKey     = "seid"
 )
 
 func SetupSmfCollection() {
 	dbName := "sdcore_smf"
-	dbUrl := "mongodb://mongodb-arbiter-headless"
+	dbUrl := "mongodb://mongodb-headless:27017/?replicaSet=rs0"
 
 	if factory.SmfConfig.Configuration.Mongodb.Url != "" {
 		dbUrl = factory.SmfConfig.Configuration.Mongodb.Url
@@ -58,7 +59,7 @@ func SetupSmfCollection() {
 	}
 
 	// SEID Table
-	_, err = mongoapi.CommonDBClient.CreateIndex(SeidSmContextCol, "seid")
+	_, err = mongoapi.CommonDBClient.CreateIndex(SeidSmContextCol, seidFilterKey)
 	if err != nil {
 		logger.DataRepoLog.Errorln("create index failed on TxnId field")
 	}
@@ -86,8 +87,8 @@ func (smContext *SMContext) MarshalJSON() ([]byte, error) {
 
 	dataPathPoolInDBVal := make(map[int64]*DataPathInDB)
 
-	var dataPathInDBIf interface{}
-	var FirstDPNodeIf interface{}
+	var dataPathInDBIf any
+	var FirstDPNodeIf any
 
 	var upTunnelVal UPTunnelInDB
 	if smContext.Tunnel != nil {
@@ -132,13 +133,13 @@ func (smContext *SMContext) MarshalJSON() ([]byte, error) {
 	var bpJSON json.RawMessage
 	if smContext.BPManager != nil {
 		var err error
-		bpJSON, err = sonic.Marshal(smContext.BPManager)
+		bpJSON, err = gojson.Marshal(smContext.BPManager)
 		if err != nil {
 			return nil, err
 		}
 	}
 
-	return sonic.Marshal(&struct {
+	return gojson.Marshal(&struct {
 		*Alias
 		PFCPContext         PFCPContextInDB                 `json:"pfcpContext"`
 		Tunnel              UPTunnelInDB                    `json:"tunnel"`
@@ -165,7 +166,7 @@ func (smContext *SMContext) UnmarshalJSON(data []byte) error {
 		Alias: (*Alias)(smContext),
 	}
 
-	if err := sonic.Unmarshal(data, &aux); err != nil {
+	if err := gojson.Unmarshal(data, &aux); err != nil {
 		logger.DataRepoLog.Errorln("err in customized unMarshall")
 		return err
 	}
@@ -186,10 +187,13 @@ func (smContext *SMContext) UnmarshalJSON(data []byte) error {
 			logger.DataRepoLog.Errorf("remoteSEID unmarshal error: %v", err)
 		}
 		smContext.PFCPContext[key].RemoteSEID = remoteSeid
+		// Rebuild the local-SEID index alongside PFCPContext so the SEID-keyed lookups work on a
+		// restored context without iterating the map (see SMContext.seidToPFCPCtx).
+		smContext.recordPFCPCtxRef(localSeid, key, pfcpCtxInDB.NodeID)
 	}
 
-	var dataPathInDBIf interface{}
-	var FirstDPNodeIf interface{}
+	var dataPathInDBIf any
+	var FirstDPNodeIf any
 	smContext.Tunnel = &UPTunnel{}
 	if !reflect.DeepEqual(aux.Tunnel, UPTunnelInDB{}) {
 		smContext.Tunnel.ANInformation = aux.Tunnel.ANInformation
@@ -225,19 +229,19 @@ func (smContext *SMContext) UnmarshalJSON(data []byte) error {
 }
 
 func ToBsonMSeidRef(data SeidSmContextRef) (ret bson.M) {
-	tmp, err := sonic.Marshal(data)
+	tmp, err := gojson.Marshal(data)
 	if err != nil {
 		logger.DataRepoLog.Errorf("SMContext marshal error: %v", err)
 		return
 	}
-	if err = sonic.Unmarshal(tmp, &ret); err != nil {
+	if err = gojson.Unmarshal(tmp, &ret); err != nil {
 		logger.DataRepoLog.Errorf("SMContext unmarshal error: %v", err)
 	}
 	return
 }
 
-// smContextAlias is a type alias that breaks the json.Marshaler interface, letting sonic
-// encode it as a plain struct instead of going through EncodeJsonMarshaler.
+// smContextAlias is a type alias that breaks the json.Marshaler interface, letting the encoder
+// encode it as a plain struct instead of going through SMContext's own MarshalJSON.
 type smContextAlias SMContext
 
 // smContextForDB is the DB serialization form with complex fields pre-transformed.
@@ -246,7 +250,7 @@ type smContextForDB struct {
 	PFCPContext PFCPContextInDB `json:"pfcpContext"`
 	Tunnel      UPTunnelInDB    `json:"tunnel"`
 	BPManager   json.RawMessage `json:"bpManager,omitempty"`
-	// Shadow with nil so sonic skips these unreconstructable API handles; they
+	// Shadow with nil so the encoder skips these unreconstructable API handles; they
 	// are rebuilt from AMFProfile / SelectedPCFProfile on context recovery.
 	SMPolicyClient      *Npcf_SMPolicyControl.APIClient `json:"smPolicyClient,omitempty"`
 	CommunicationClient *Namf_Communication.APIClient   `json:"communicationClient,omitempty"`
@@ -284,7 +288,7 @@ func ToBsonM(data *SMContext) (ret bson.M) {
 	var bpJSON json.RawMessage
 	if data.BPManager != nil {
 		var err error
-		bpJSON, err = sonic.Marshal(data.BPManager)
+		bpJSON, err = gojson.Marshal(data.BPManager)
 		if err != nil {
 			logger.DataRepoLog.Errorf("BPManager marshal error: %v", err)
 			return ret
@@ -297,12 +301,12 @@ func ToBsonM(data *SMContext) (ret bson.M) {
 		Tunnel:         upTunnelVal,
 		BPManager:      bpJSON,
 	}
-	tmp, err := sonic.Marshal(&dbDoc)
+	tmp, err := gojson.Marshal(&dbDoc)
 	if err != nil {
 		logger.DataRepoLog.Errorf("SMContext marshal error: %v", err)
 		return ret
 	}
-	if err = sonic.Unmarshal(tmp, &ret); err != nil {
+	if err = gojson.Unmarshal(tmp, &ret); err != nil {
 		logger.DataRepoLog.Errorf("SMContext unmarshal error: %v", err)
 	}
 	return ret
@@ -419,7 +423,7 @@ func StoreSeidContextInDB(seidUint uint64, smContext *SMContext) {
 		Seid: seid,
 	}
 	itemBsonA := ToBsonMSeidRef(item)
-	filter := bson.M{"seid": seid}
+	filter := bson.M{seidFilterKey: seid}
 	logger.DataRepoLog.Debugf("StoreSeidContextInDB filter: %+v", filter)
 
 	_, postErr := mongoapi.CommonDBClient.RestfulAPIPost(SeidSmContextCol, filter, itemBsonA)
@@ -458,7 +462,7 @@ func GetSMContextByRefInDB(ref string) (smContext *SMContext) {
 	}
 
 	if result != nil {
-		err := sonic.Unmarshal(mapToByte(result), smContext)
+		err := gojson.Unmarshal(mapToByte(result), smContext)
 		if err != nil {
 			logger.DataRepoLog.Errorf("smContext unmarshal error: %v", err)
 			return nil
@@ -477,7 +481,7 @@ func GetSMContextByRefInDB(ref string) (smContext *SMContext) {
 func GetSMContextBySEIDInDB(seidUint uint64) (smContext *SMContext) {
 	seid := SeidConv(seidUint)
 	filter := bson.M{}
-	filter["seid"] = seid
+	filter[seidFilterKey] = seid
 
 	result, getOneErr := mongoapi.CommonDBClient.RestfulAPIGetOne(SeidSmContextCol, filter)
 	if getOneErr != nil {
@@ -499,7 +503,7 @@ func GetSMContextBySEIDInDB(seidUint uint64) (smContext *SMContext) {
 func DeleteSmContextInDBBySEID(seidUint uint64) {
 	seid := SeidConv(seidUint)
 	logger.DataRepoLog.Infoln("db - delete SMContext In DB by seid")
-	filter := bson.M{"seid": seid}
+	filter := bson.M{seidFilterKey: seid}
 	logger.DataRepoLog.Infof("filter: %+v", filter)
 
 	result, getOneErr := mongoapi.CommonDBClient.RestfulAPIGetOne(SeidSmContextCol, filter)
@@ -534,6 +538,10 @@ func IsSmContextDeleteFailed(ref string) bool {
 	return failed
 }
 
+// deleteRetryBackoff is how long DeleteSmContextInDBByRef waits between retry attempts. A var
+// rather than a const so a test can shrink it instead of waiting out the real backoff.
+var deleteRetryBackoff = 100 * time.Millisecond
+
 // DeleteSmContextInDBByRef deletes the by-ref SMContext document. Callers (RemoveSMContext) must
 // hold the SMContext's SMLock across this call, the same lock AsyncStoreSmContextInDB takes
 // before enqueueing a write, so a write for this ref can never be enqueued after this delete and
@@ -558,15 +566,15 @@ func DeleteSmContextInDBByRef(ref string) {
 			return
 		}
 		if attempt < maxAttempts {
-			time.Sleep(100 * time.Millisecond)
+			time.Sleep(deleteRetryBackoff)
 		}
 	}
 	smContextDeleteFailed.Store(ref, struct{}{})
 	logger.DataRepoLog.Errorf("delete SMContext In DB w ref %v failed after %d attempts, giving up: %v", ref, maxAttempts, err)
 }
 
-func mapToByte(data map[string]interface{}) (ret []byte) {
-	ret, err := sonic.Marshal(data)
+func mapToByte(data map[string]any) (ret []byte) {
+	ret, err := gojson.Marshal(data)
 	if err != nil {
 		logger.DataRepoLog.Errorf("map to byte error: %v", err)
 	}

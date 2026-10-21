@@ -73,7 +73,9 @@ func TestLIModificationResponseDoesNotCompleteTheSessionsOwnProcedureInAdapterMo
 	// otherwise say.
 	lisequence.Mark(liSeq, lisequence.Request{SEID: seid, NodeID: "1.1.1.1", Duplicating: true})
 
-	adapter.HandlePfcpSessionModificationResponse(modificationResponse(liSeq, seid))
+	if err := adapter.HandlePfcpSessionModificationResponse(modificationResponse(liSeq, seid)); err != nil {
+		t.Fatalf("the response was refused: %v", err)
+	}
 
 	if smContext.PendingUPF.IsEmpty() {
 		t.Error("the LI modification's answer cleared the UPF the subscriber's own " +
@@ -93,7 +95,9 @@ func TestLIModificationResponseDoesNotCompleteTheSessionsOwnProcedureInAdapterMo
 func TestOrdinaryModificationResponseStillCompletesInAdapterMode(t *testing.T) {
 	smContext, seid := modifyingSession(t)
 
-	adapter.HandlePfcpSessionModificationResponse(modificationResponse(7373, seid))
+	if err := adapter.HandlePfcpSessionModificationResponse(modificationResponse(7373, seid)); err != nil {
+		t.Fatalf("the response was refused: %v", err)
+	}
 
 	if !smContext.PendingUPF.IsEmpty() {
 		t.Error("an ordinary modification's answer did not clear the UPF it came from")
@@ -134,7 +138,9 @@ func TestLIAnswerSurvivesAReleasedSessionInAdapterMode(t *testing.T) {
 	t.Cleanup(func() { adapter.LIModificationAnswered = orig })
 
 	// No SM context is registered for this SEID, so the lookup yields nil.
-	adapter.HandlePfcpSessionModificationResponse(modificationResponse(seq, 0xDEADBEEF))
+	if err := adapter.HandlePfcpSessionModificationResponse(modificationResponse(seq, 0xDEADBEEF)); err != nil {
+		t.Fatalf("the response was refused: %v", err)
+	}
 
 	if !called {
 		t.Fatal("the interception answer was not made for a released session; the nil guard " +

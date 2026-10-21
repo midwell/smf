@@ -6,17 +6,20 @@
 package producer
 
 import (
+	"errors"
 	"fmt"
 	"io"
-	"maps"
 	"net/http"
 	"os"
+	"time"
 
 	"github.com/omec-project/nas/v2"
 	"github.com/omec-project/openapi/v2/models"
 	"github.com/omec-project/smf/consumer"
 	"github.com/omec-project/smf/context"
 	"github.com/omec-project/smf/lawfulintercept"
+	"github.com/omec-project/smf/metrics"
+	"github.com/omec-project/smf/qos"
 	"github.com/omec-project/smf/smferrors"
 	"github.com/omec-project/smf/transaction"
 	"github.com/omec-project/smf/util"
@@ -177,35 +180,41 @@ func HandleUpdateN1Msg(txn *transaction.Transaction, response *models.UpdateSmCo
 				smContext.SubPduSessLog.Infof("PDUSessionSMContextUpdate, SM Context State[%v] should be SmStateActive", smContext.SMContextState.String())
 			}
 			if pduSessIDRelReq == pduSessIDSmCxt {
+				if isSmContextInactive(smContext.SMContextState) {
+					if smContext.SMContextState == context.SmStateInActivePending {
+						// The release is already in progress: HandlePDUSessionReleaseRequest (UE IP
+						// release) and the PFCP delete it triggers below must only run once, but the
+						// UE only retransmits here because the first PDU Session Release Command
+						// (TS 24.501 clause 6.3.3.3) never reached it, e.g. it was lost over the air.
+						// Resend the N1/N2 Release Command so the retry can still complete the
+						// handshake, without repeating the cleanup or disturbing the state the
+						// pending PFCP delete answer still needs.
+						smContext.SubPduSessLog.Warnf("PDUSessionSMContextUpdate, retransmitted PDU Session Release Request: resending Release Command, SM context state[%v]",
+							smContext.SMContextState.String())
+						buildPDUSessionReleaseN1N2(smContext, response)
+						break
+					}
+					if smContext.SMContextState == context.SmStateInit {
+						// TS 24.501 subclause 6.4.2.6 item b): a session that was never established has
+						// no release to resend, but the request still needs a NAS answer -- #43 invalid
+						// PDU session identity -- or the UE's own release procedure retransmits until
+						// its timer expires. State stays SmStateInit: there is nothing to clean up.
+						smContext.SubPduSessLog.Warnf("PDUSessionSMContextUpdate, rejecting PDU Session Release Request for a never-established session: SM context state[%v]",
+							smContext.SMContextState.String())
+						buildPDUSessionReleaseReject(smContext, response, pduSessIDRelReq, "InvalidPDUSessionIdentity")
+						break
+					}
+					// SmStateRelease: the N1 PDUSessionReleaseComplete handler or the N2
+					// duplicate-session-ID handler above already removed the context earlier in this
+					// same update. This guard only applies to a release request naming the session the
+					// context actually holds: a mismatched identity must still fall through to the
+					// reject branch below regardless of state.
+					smContext.SubPduSessLog.Warnf("PDUSessionSMContextUpdate, ignoring PDU Session Release Request: SM context state[%v] has no active user plane",
+						smContext.SMContextState.String())
+					break
+				}
 				smContext.HandlePDUSessionReleaseRequest(m.PDUSessionReleaseRequest)
-				if buf, err := context.BuildGSMPDUSessionReleaseCommand(smContext); err != nil {
-					smContext.SubPduSessLog.Errorf("PDUSessionSMContextUpdate, build GSM PDUSessionReleaseCommand failed: %+v", err)
-				} else {
-					tmpFile, err := util.CreatePayloadTempFile(buf)
-					if err != nil {
-						smContext.SubPduSessLog.Errorln(err)
-					} else {
-						response.SetBinaryDataN1SmMessage(tmpFile)
-						jsonData := response.GetJsonData()
-						jsonData.SetN1SmMsg(models.RefToBinaryData{ContentId: "PDUSessionReleaseCommand"})
-						response.SetJsonData(jsonData)
-					}
-				}
-
-				if buf, err := context.BuildPDUSessionResourceReleaseCommandTransfer(smContext); err != nil {
-					smContext.SubPduSessLog.Errorf("PDUSessionSMContextUpdate, build PDUSessionResourceReleaseCommandTransfer failed: %+v", err)
-				} else {
-					tmpFile, err := util.CreatePayloadTempFile(buf)
-					if err != nil {
-						smContext.SubPduSessLog.Errorln(err)
-					} else {
-						response.SetBinaryDataN2SmInformation(tmpFile)
-						jsonData := response.GetJsonData()
-						jsonData.SetN2SmInfo(models.RefToBinaryData{ContentId: "PDUResourceReleaseCommand"})
-						jsonData.SetN2SmInfoType(models.N2SMINFOTYPE_PDU_RES_REL_CMD)
-						response.SetJsonData(jsonData)
-					}
-				}
+				buildPDUSessionReleaseN1N2(smContext, response)
 
 				if smContext.Tunnel != nil {
 					smContext.ChangeState(context.SmStatePfcpModify)
@@ -222,22 +231,175 @@ func HandleUpdateN1Msg(txn *transaction.Transaction, response *models.UpdateSmCo
 				// Same cause key the reject is built from, so the record and the
 				// wire cannot disagree (design D7).
 				lawfulintercept.ReportReleaseReject(smContext, smferrors.ErrorCause["InvalidPDUSessionIdentity"])
-				if buf, err := context.BuildGSMPDUSessionReleaseRejectWithCause(smContext, pduSessIDRelReq, "InvalidPDUSessionIdentity"); err != nil {
-					smContext.SubPduSessLog.Errorf("PDUSessionSMContextRelease, build GSM PDUSessionReleaseReject failed: %+v", err)
-				} else {
-					tmpFile, err := util.CreatePayloadTempFile(buf)
-					if err != nil {
-						smContext.SubPduSessLog.Errorln(err)
-					} else {
-						response.SetBinaryDataN1SmMessage(tmpFile)
-						jsonData := response.GetJsonData()
-						jsonData.SetN1SmMsg(models.RefToBinaryData{ContentId: context.PDU_SESS_REL_REJECT})
-						response.SetJsonData(jsonData)
-					}
-				}
+				buildPDUSessionReleaseReject(smContext, response, pduSessIDRelReq, "InvalidPDUSessionIdentity")
 				smContext.ChangeState(context.SmStateModify)
 				smContext.SubCtxLog.Debugln("PDUSessionSMContextUpdate, SMContextState Change State:", smContext.SMContextState.String())
 			}
+		case nas.MsgTypePDUSessionModificationRequest:
+			// TS 23.502 subclause 4.3.3.2 step 3a: the refusal goes back in the UpdateSmContext
+			// response. BuildAndSendQosN1N2TransferMsg is the step 3b helper for a
+			// network-requested modification and must not be used here.
+			pduSessIDModReq := int32(m.PDUSessionModificationRequest.GetPDUSessionID())
+			pti := m.PDUSessionModificationRequest.GetPTI()
+
+			// TS 24.501 subclause 6.3.2.5 item d: a UE request for the session the network is
+			// already modifying is disregarded, not refused. The network's own procedure carries
+			// on as if the request had never arrived — so no reject, no state change, and T3591
+			// keeps running. Refusing here would answer a procedure the UE is entitled to have
+			// ignored, and the UE would apply the back-off #32 asks for on a session that is
+			// about to change anyway.
+			// Read directly: HandlePDUSessionSMContextUpdate holds SMLock across this whole
+			// function, and taking it again would deadlock the session permanently.
+			sessionID, state := smContext.PDUSessionID, smContext.SMContextState
+			// NwModificationPending and not modificationInProgressLocked: TS 24.501 subclause
+			// 6.3.2.5 d) is about the network's procedure in PDU SESSION MODIFICATION PENDING,
+			// which ends with the UE's own answer. Waiting for the radio's answer after that is this
+			// SMF's own N2-side ordering, and the UE's request is no collision with it.
+			collision := smContext.NwModificationPending && pduSessIDModReq == sessionID
+			if collision {
+				// Sub-item i would have the URSP rule enforcement reports IE consumed before
+				// ignoring the rest. github.com/omec-project/nas/v2 does not decode that IE — the
+				// message struct has no field for it — so no report can reach this point and
+				// sub-item ii is the whole of the reachable behaviour.
+				smContext.SubPduSessLog.Infof(
+					"PDUSessionSMContextUpdate, N1 Msg PDU Session Modification Request received for pdu session %d (pti %d) while the network is modifying it; disregarding it per TS 24.501 subclause 6.3.2.5 item d",
+					pduSessIDModReq, pti)
+				break
+			}
+
+			// Decided from the snapshot taken above rather than re-read: the state is written under
+			// SMLock by other goroutines, and choosing the cause from one value while logging
+			// another would make the log unusable for exactly the case worth investigating.
+			// Each arm passes its cause as a literal rather than assigning one variable, so that
+			// the error-key scan in smferrors can enumerate the keys this path uses.
+			var refusal error
+			switch {
+			case pduSessIDModReq != sessionID:
+				// An identity the SMF does not hold for this context.
+				refusal = refuseUeRequestedModification(smContext, response, pduSessIDModReq, pti, state,
+					"InvalidPDUSessionIdentity")
+			case state == context.SmStateInit, state == context.SmStateInActivePending:
+				// Established but on the way out, or never established. TS 24.501 subclause
+				// 6.4.2.6 item b: an inactive PDU session identity takes #43, not the refusal.
+				refusal = refuseUeRequestedModification(smContext, response, pduSessIDModReq, pti, state,
+					"InvalidPDUSessionIdentity")
+			default:
+				refusal = refuseUeRequestedModification(smContext, response, pduSessIDModReq, pti, state,
+					"ModificationNotSupported")
+			}
+			if refusal != nil {
+				return refusal
+			}
+
+		case nas.MsgTypePDUSessionModificationComplete:
+			smContext.SubPduSessLog.Infoln("PDUSessionSMContextUpdate, N1 Msg PDU Session Modification Complete received")
+			// Another session's answer must not end this session's procedure. TS 24.501 subclause
+			// 7.3.2 d) has the network ignore a 5GSM message whose PDU session identity does not
+			// match an existing PDU session, and this context is the session the message reached.
+			if id := int32(m.PDUSessionModificationComplete.GetPDUSessionID()); id != smContext.PDUSessionID {
+				smContext.SubPduSessLog.Warnf("PDUSessionSMContextUpdate, the Modification Complete carries PDU session ID %d, not this session's %d; ignoring it",
+					id, smContext.PDUSessionID)
+				break
+			}
+			// Nor does an answer to a procedure the network is not running. Every Command it sends carries
+			// the core-initiated PTI, and TS 24.501 subclause 7.3.1 a) has an answer whose PTI matches no
+			// PTI in use refused with 5GSM STATUS cause 47, which this SMF has no message path for.
+			if pti := m.PDUSessionModificationComplete.GetPTI(); pti != context.PTI {
+				smContext.SubPduSessLog.Warnf("PDUSessionSMContextUpdate, the Modification Complete carries PTI %d, not the Command's %d; ignoring it",
+					pti, context.PTI)
+				break
+			}
+			// Nor may a late answer to an earlier Command end a procedure whose own Command has not
+			// gone out: the UE has nothing of this one to answer yet.
+			if smContext.NwModificationPending && smContext.NwModificationUnsent {
+				smContext.SubPduSessLog.Warnf("PDUSessionSMContextUpdate, a Modification Complete arrived before this modification's Command was sent; it answers an earlier one, ignoring it")
+				break
+			}
+			// The modification is complete only now. Committing on the UE's acknowledgement rather
+			// than when the command was sent is what keeps the SMF's record of the session in step
+			// with what the UE is actually running, so the next modification computes its delta
+			// against the parameters in force.
+			//
+			// Stopping the timer and taking the realignment marker happen together, under one hold
+			// of the lock. Where the radio access network established only part of this
+			// modification, what it established is what the session has, so the pending update is
+			// pruned to that before it becomes the record — committing the whole of it would record
+			// flows that do not exist. Releasing the lock between the two would let a modification
+			// starting on another goroutine replace the pending update in the gap, and this would
+			// then prune and commit that one instead.
+			// SMLock is already held by HandlePDUSessionSMContextUpdate for the whole of this
+			// function, so nothing here may take it. Everything below is therefore one atomic
+			// section by construction rather than by locking.
+			smContext.StopT3591()
+			realign := smContext.Realign
+			smContext.Realign = nil
+			var corrective *qos.PolicyUpdate
+			if realign != nil && len(smContext.SmPolicyUpdates) > 0 {
+				corrective = smContext.SmPolicyUpdates[0].RemoveFlows(qos.RefusedFlowSet(realign.RefusedQFIs))
+			}
+
+			// The radio may not have answered yet: on a short link the UE completes first, and then
+			// there is no realignment marker to read and the update below is committed whole. The
+			// answer that follows would have nothing left to prune, so what it needs is kept for it
+			// here -- this is the same object the commit is about to record, and the correction is
+			// built from it by handleModifyResponse instead of by this branch.
+			if realign == nil && smContext.RanAnswerPending && len(smContext.SmPolicyUpdates) > 0 {
+				smContext.CommittedBeforeRanAnswer = smContext.SmPolicyUpdates[0]
+			}
+			// The procedure is not over until the radio answers, and a held decision waits for that
+			// answer too -- but only for a bounded time.
+			if realign == nil && smContext.RanAnswerPending {
+				armRanAnswerGuardLocked(smContext)
+			}
+
+			if err := smContext.CommitSmPolicyDecisionLocked(true); err != nil {
+				smContext.SubPduSessLog.Errorf("PDUSessionSMContextUpdate, committing the modification failed: %v", err)
+			}
+
+			// A radio that refused part of the modification needs the UE corrected first, and the
+			// correction is a modification of its own: it goes ahead of any decision held behind
+			// this one, which starts once the correction ends.
+			if realign != nil {
+				realignSession(smContext, realign, corrective)
+			} else {
+				startDeferredModificationLocked(smContext)
+			}
+
+		case nas.MsgTypePDUSessionModificationCommandReject:
+			// As for the Complete above: another session's reject, or one to a procedure the network is not
+			// running, must not abandon this procedure.
+			if id := int32(m.PDUSessionModificationCommandReject.GetPDUSessionID()); id != smContext.PDUSessionID {
+				smContext.SubPduSessLog.Warnf("PDUSessionSMContextUpdate, the Modification Command Reject carries PDU session ID %d, not this session's %d; ignoring it",
+					id, smContext.PDUSessionID)
+				break
+			}
+			if pti := m.PDUSessionModificationCommandReject.GetPTI(); pti != context.PTI {
+				smContext.SubPduSessLog.Warnf("PDUSessionSMContextUpdate, the Modification Command Reject carries PTI %d, not the Command's %d; ignoring it",
+					pti, context.PTI)
+				break
+			}
+			// A Complete with nothing pending commits nothing, so it is left to run. A reject with
+			// nothing pending would still report an abandonment and put the session back to Active: it
+			// answers a copy of a Command whose procedure has already ended, typically in the quiet
+			// interval after a retransmission.
+			if !smContext.NwModificationPending {
+				smContext.SubPduSessLog.Warnf("PDUSessionSMContextUpdate, a Modification Command Reject, 5GSM cause %d, arrived with no modification pending; it answers a Command whose procedure has ended, ignoring it",
+					m.PDUSessionModificationCommandReject.GetCauseValue())
+				break
+			}
+			if smContext.NwModificationUnsent {
+				smContext.SubPduSessLog.Warnf("PDUSessionSMContextUpdate, a Modification Command Reject arrived before this modification's Command was sent; it answers an earlier one, ignoring it")
+				break
+			}
+			cause := m.PDUSessionModificationCommandReject.GetCauseValue()
+			smContext.SubPduSessLog.Warnf("PDUSessionSMContextUpdate, N1 Msg PDU Session Modification Command Reject received, 5GSM cause %d", cause)
+			smContext.StopT3591()
+			// The UE will not apply the parameters it was given. This is an abandonment with its
+			// own cause rather than a timeout, and it is reported on the same path as one, so that
+			// a modification the network could not apply is countable however it failed.
+			abandonModificationUnderLock(smContext, "command_reject", fmt.Sprintf("5gsm_cause_%d", cause))
+			startDeferredModificationLocked(smContext)
+
 		case nas.MsgTypePDUSessionReleaseComplete:
 			smContext.SubPduSessLog.Infoln("PDUSessionSMContextUpdate, N1 Msg PDU Session Release Complete received")
 			if smContext.SMContextState != context.SmStateInActivePending {
@@ -259,12 +421,98 @@ func HandleUpdateN1Msg(txn *transaction.Transaction, response *models.UpdateSmCo
 			// reentrant.
 			context.RemoveSMContextLocked(smContext)
 			smContext.SubPduSessLog.Debugln("PDUSessionSMContextUpdate, sent SMContext Status Notification successfully")
+
+		default:
+			// Every unhandled type before this branch existed was decoded, debug-logged and
+			// dropped, and the SMF answered 200 with no N1 or N2 content. The UE then retransmits
+			// until its timer expires and gives up, which looks like a UE fault. Log loudly so the
+			// next missing case is found from a log line rather than from a packet capture.
+			smContext.SubPduSessLog.Errorf(
+				"PDUSessionSMContextUpdate, unhandled N1 SM message type 0x%02x; the SMF will answer with no N1 content and the UE will retransmit until it gives up",
+				m.GsmHeader.GetMessageType())
 		}
 	} else {
 		smContext.SubPduSessLog.Debugln("PDUSessionSMContextUpdate, Binary Data N1 SmMessage is nil")
 	}
 
 	return nil
+}
+
+// isSmContextInactive reports whether the SM context has no established (or surviving) user
+// plane: Init (never established), InActivePending (being torn down) and Release (just removed
+// by an earlier phase of this same update, e.g. an N1 PDUSessionReleaseComplete). UpCnxState,
+// HoState and the N2 PDU session resource setup responses handled below all assume an active
+// user plane per TS 23.502 clause 4.2.3/4.9; running them against one of these states can
+// reactivate a session mid-teardown or dereference a Tunnel releaseTunnel has already cleared.
+func isSmContextInactive(state context.SMContextState) bool {
+	switch state {
+	case context.SmStateInit, context.SmStateInActivePending, context.SmStateRelease:
+		return true
+	default:
+		return false
+	}
+}
+
+// buildPDUSessionReleaseN1N2 fills response with the GSM PDU Session Release Command (N1) and the
+// matching PDUSessionResourceReleaseCommandTransfer (N2) that TS 23.502 clause 4.3.4 has the AMF
+// relay together to the UE/gNB. Used both for the first PDU Session Release Request and, without
+// the cleanup that must only run once, to resend the same pair on a retransmission that never saw
+// either arrive.
+func buildPDUSessionReleaseN1N2(smContext *context.SMContext, response *models.UpdateSmContext200Response) {
+	if buf, err := context.BuildGSMPDUSessionReleaseCommand(smContext); err != nil {
+		smContext.SubPduSessLog.Errorf("PDUSessionSMContextUpdate, build GSM PDUSessionReleaseCommand failed: %+v", err)
+	} else {
+		tmpFile, err := util.CreatePayloadTempFile(buf)
+		if err != nil {
+			smContext.SubPduSessLog.Errorln(err)
+		} else {
+			response.SetBinaryDataN1SmMessage(tmpFile)
+			var refToBinaryData models.RefToBinaryData
+			refToBinaryData.SetContentId("PDUSessionReleaseCommand")
+			jsonData := response.GetJsonData()
+			jsonData.SetN1SmMsg(refToBinaryData)
+			response.SetJsonData(jsonData)
+		}
+	}
+
+	if buf, err := context.BuildPDUSessionResourceReleaseCommandTransfer(smContext); err != nil {
+		smContext.SubPduSessLog.Errorf("PDUSessionSMContextUpdate, build PDUSessionResourceReleaseCommandTransfer failed: %+v", err)
+	} else {
+		tmpFile, err := util.CreatePayloadTempFile(buf)
+		if err != nil {
+			smContext.SubPduSessLog.Errorln(err)
+		} else {
+			response.SetBinaryDataN2SmInformation(tmpFile)
+			var refToBinaryData models.RefToBinaryData
+			refToBinaryData.SetContentId("PDUResourceReleaseCommand")
+			jsonData := response.GetJsonData()
+			jsonData.SetN2SmInfo(refToBinaryData)
+			jsonData.SetN2SmInfoType(models.N2SMINFOTYPE_PDU_RES_REL_CMD)
+			response.SetJsonData(jsonData)
+		}
+	}
+}
+
+// buildPDUSessionReleaseReject fills response with a GSM PDU Session Release Reject (N1) carrying
+// cause, the TS 24.501 clause 6.4.2.6 answer a release request naming the wrong or a
+// never-established PDU session must get instead of being silently dropped.
+func buildPDUSessionReleaseReject(smContext *context.SMContext, response *models.UpdateSmContext200Response, pduSessionID int32, cause string) {
+	if buf, err := context.BuildGSMPDUSessionReleaseRejectWithCause(smContext, pduSessionID, cause); err != nil {
+		smContext.SubPduSessLog.Errorf("PDUSessionSMContextUpdate, build GSM PDUSessionReleaseReject failed: %+v", err)
+	} else {
+		tmpFile, err := util.CreatePayloadTempFile(buf)
+		if err != nil {
+			smContext.SubPduSessLog.Errorln(err)
+		} else {
+			response.SetBinaryDataN1SmMessage(tmpFile)
+			var refToBinaryData models.RefToBinaryData
+			refToBinaryData.SetContentId(context.PDU_SESS_REL_REJECT)
+
+			jsonData := response.GetJsonData()
+			jsonData.SetN1SmMsg(refToBinaryData)
+			response.SetJsonData(jsonData)
+		}
+	}
 }
 
 func HandleUpCnxState(txn *transaction.Transaction, response *models.UpdateSmContext200Response, pfcpAction *pfcpAction, pfcpParam *pfcpParam) error {
@@ -274,6 +522,11 @@ func HandleUpCnxState(txn *transaction.Transaction, response *models.UpdateSmCon
 
 	switch smContextUpdateData.GetUpCnxState() {
 	case models.UPCNXSTATE_ACTIVATING:
+		if isSmContextInactive(smContext.SMContextState) {
+			smContext.SubPduSessLog.Warnf("PDUSessionSMContextUpdate, ignoring UP cnx state %v: SM context state[%v] has no active user plane",
+				smContextUpdateData.GetUpCnxState(), smContext.SMContextState.String())
+			break
+		}
 		smContext.SubPduSessLog.Infof("PDUSessionSMContextUpdate, UP cnx state %v received", smContextUpdateData.GetUpCnxState())
 		if smContext.SMContextState != context.SmStateActive {
 			// Wait till the state becomes SmStateActive again
@@ -302,6 +555,11 @@ func HandleUpCnxState(txn *transaction.Transaction, response *models.UpdateSmCon
 		}
 		response.SetBinaryDataN2SmInformation(tmpFile)
 	case models.UPCNXSTATE_DEACTIVATED:
+		if isSmContextInactive(smContext.SMContextState) {
+			smContext.SubPduSessLog.Warnf("PDUSessionSMContextUpdate, ignoring UP cnx state %v: SM context state[%v] has no active user plane",
+				smContextUpdateData.GetUpCnxState(), smContext.SMContextState.String())
+			break
+		}
 		smContext.SubPduSessLog.Infof("PDUSessionSMContextUpdate, UP cnx state %v received", smContextUpdateData.GetUpCnxState())
 		if smContext.SMContextState != context.SmStateActive {
 			// Wait till the state becomes Active again
@@ -320,7 +578,7 @@ func HandleUpCnxState(txn *transaction.Transaction, response *models.UpdateSmCon
 			// TODO: Deactivate N2 downlink tunnel
 			// Set FAR and An, N3 Release Info
 			farList := []*context.FAR{}
-			smContext.PendingUPF = make(context.PendingUPF)
+			smContext.ResetPendingUPF(nil)
 			for _, dataPath := range smContext.Tunnel.DataPathPool {
 				ANUPF := dataPath.FirstDPNode
 				for _, DLPDR := range ANUPF.DownLinkTunnel.PDR {
@@ -335,7 +593,7 @@ func HandleUpCnxState(txn *transaction.Transaction, response *models.UpdateSmCon
 						if DLPDR.FAR.ForwardingParameters != nil {
 							DLPDR.FAR.ForwardingParameters.OuterHeaderCreation = nil
 						}
-						smContext.PendingUPF[ANUPF.GetNodeIP()] = true
+						smContext.AddPendingUPF(ANUPF.GetNodeIP())
 						farList = append(farList, DLPDR.FAR)
 					}
 				}
@@ -358,6 +616,11 @@ func HandleUpdateHoState(txn *transaction.Transaction, response *models.UpdateSm
 
 	switch smContextUpdateData.GetHoState() {
 	case models.HOSTATE_PREPARING:
+		if isSmContextInactive(smContext.SMContextState) {
+			smContext.SubPduSessLog.Warnf("PDUSessionSMContextUpdate, ignoring Ho state %v: SM context state[%v] has no active user plane",
+				smContextUpdateData.GetHoState(), smContext.SMContextState.String())
+			break
+		}
 		smContext.SubPduSessLog.Infof("PDUSessionSMContextUpdate, Ho state %v received", smContextUpdateData.GetHoState())
 		smContext.SubPduSessLog.Debugln("PDUSessionSMContextUpdate, in HoState_PREPARING")
 		if smContext.SMContextState != context.SmStateActive {
@@ -395,6 +658,11 @@ func HandleUpdateHoState(txn *transaction.Transaction, response *models.UpdateSm
 		jd.SetHoState(models.HOSTATE_PREPARING)
 		response.SetJsonData(jd)
 	case models.HOSTATE_PREPARED:
+		if isSmContextInactive(smContext.SMContextState) {
+			smContext.SubPduSessLog.Warnf("PDUSessionSMContextUpdate, ignoring Ho state %v: SM context state[%v] has no active user plane",
+				smContextUpdateData.GetHoState(), smContext.SMContextState.String())
+			break
+		}
 		smContext.SubPduSessLog.Infof("PDUSessionSMContextUpdate, Ho state %v received", smContextUpdateData.GetHoState())
 		smContext.SubPduSessLog.Debugln("PDUSessionSMContextUpdate, in HoState_PREPARED")
 		if smContext.SMContextState != context.SmStateActive {
@@ -424,10 +692,7 @@ func HandleUpdateHoState(txn *transaction.Transaction, response *models.UpdateSm
 		// HandleHandoverRequestAcknowledgeTransfer above.
 		pendingUPF := collectHoFARsForPFCPModify(smContext.Tunnel, pfcpParam)
 		if len(pendingUPF) > 0 {
-			if smContext.PendingUPF == nil {
-				smContext.PendingUPF = make(context.PendingUPF)
-			}
-			maps.Copy(smContext.PendingUPF, pendingUPF)
+			smContext.MergePendingUPF(pendingUPF)
 			pfcpAction.sendPfcpModify = true
 			smContext.ChangeState(context.SmStatePfcpModify)
 			smContext.SubCtxLog.Debugln("PDUSessionSMContextUpdate, SMContextState Change State:", smContext.SMContextState.String())
@@ -448,6 +713,11 @@ func HandleUpdateHoState(txn *transaction.Transaction, response *models.UpdateSm
 			}
 		}
 	case models.HOSTATE_COMPLETED:
+		if isSmContextInactive(smContext.SMContextState) {
+			smContext.SubPduSessLog.Warnf("PDUSessionSMContextUpdate, ignoring Ho state %v: SM context state[%v] has no active user plane",
+				smContextUpdateData.GetHoState(), smContext.SMContextState.String())
+			break
+		}
 		smContext.SubPduSessLog.Infof("PDUSessionSMContextUpdate, Ho state %v received", smContextUpdateData.GetHoState())
 		smContext.SubPduSessLog.Debugln("PDUSessionSMContextUpdate, in HoState_COMPLETED")
 		if smContext.SMContextState != context.SmStateActive {
@@ -473,6 +743,14 @@ func HandleUpdateCause(txn *transaction.Transaction, response *models.UpdateSmCo
 
 	switch smContextUpdateData.GetCause() {
 	case models.CAUSE_REL_DUE_TO_DUPLICATE_SESSION_ID:
+		if isSmContextInactive(smContext.SMContextState) {
+			// SendPfcpSessionReleaseReq always waits on SBIPFCPCommunicationChan after calling
+			// releaseTunnel; with no tunnel left to delete, releaseTunnel sends nothing and that
+			// wait never returns, hanging this update while it still holds smContext.SMLock.
+			smContext.SubPduSessLog.Warnf("PDUSessionSMContextUpdate, ignoring update cause %v: SM context state[%v] has no active user plane",
+				smContextUpdateData.GetCause(), smContext.SMContextState.String())
+			break
+		}
 		smContext.SubPduSessLog.Infof("PDUSessionSMContextUpdate, update cause %v received", smContextUpdateData.GetCause())
 		//* release PDU Session Here
 		if smContext.SMContextState != context.SmStateActive {
@@ -519,7 +797,18 @@ func HandleUpdateN2Msg(txn *transaction.Transaction, response *models.UpdateSmCo
 	tunnel := smContext.Tunnel
 
 	switch smContextUpdateData.GetN2SmInfoType() {
+	case models.N2SMINFOTYPE_PDU_RES_MOD_RSP:
+		return handleModifyResponse(smContext, body)
+
+	case models.N2SMINFOTYPE_PDU_RES_MOD_FAIL:
+		return handleModifyFailure(smContext, body)
+
 	case models.N2SMINFOTYPE_PDU_RES_SETUP_RSP:
+		if isSmContextInactive(smContext.SMContextState) {
+			smContext.SubPduSessLog.Warnf("PDUSessionSMContextUpdate, ignoring N2 SM info type %v: SM context state[%v] has no active user plane",
+				smContextUpdateData.GetN2SmInfoType(), smContext.SMContextState.String())
+			break
+		}
 		smContext.SubPduSessLog.Infof("PDUSessionSMContextUpdate, N2 SM info type %v received",
 			smContextUpdateData.GetN2SmInfoType())
 		if smContext.SMContextState != context.SmStateActive {
@@ -533,7 +822,7 @@ func HandleUpdateN2Msg(txn *transaction.Transaction, response *models.UpdateSmCo
 		pdrList := []*context.PDR{}
 		farList := []*context.FAR{}
 
-		smContext.PendingUPF = make(context.PendingUPF)
+		smContext.ResetPendingUPF(nil)
 		for _, dataPath := range tunnel.DataPathPool {
 			if dataPath.Activated {
 				ANUPF := dataPath.FirstDPNode
@@ -550,9 +839,7 @@ func HandleUpdateN2Msg(txn *transaction.Transaction, response *models.UpdateSmCo
 					pdrList = append(pdrList, DLPDR)
 					farList = append(farList, DLPDR.FAR)
 
-					if _, exist := smContext.PendingUPF[ANUPF.GetNodeIP()]; !exist {
-						smContext.PendingUPF[ANUPF.GetNodeIP()] = true
-					}
+					smContext.AddPendingUPF(ANUPF.GetNodeIP())
 				}
 			}
 		}
@@ -585,6 +872,11 @@ func HandleUpdateN2Msg(txn *transaction.Transaction, response *models.UpdateSmCo
 		smContext.ChangeState(context.SmStatePfcpModify)
 		smContext.SubCtxLog.Debugln("PDUSessionSMContextUpdate, SMContextState Change State:", smContext.SMContextState.String())
 	case models.N2SMINFOTYPE_PDU_RES_SETUP_FAIL:
+		if isSmContextInactive(smContext.SMContextState) {
+			smContext.SubPduSessLog.Warnf("PDUSessionSMContextUpdate, ignoring N2 SM info type %v: SM context state[%v] has no active user plane",
+				smContextUpdateData.GetN2SmInfoType(), smContext.SMContextState.String())
+			break
+		}
 		smContext.SubPduSessLog.Infof("PDUSessionSMContextUpdate, N2 SM info type %v received",
 			smContextUpdateData.GetN2SmInfoType())
 		fileBytes, err := readBinaryN2SmInformation(body.GetBinaryDataN2SmInformation())
@@ -652,6 +944,11 @@ func HandleUpdateN2Msg(txn *transaction.Transaction, response *models.UpdateSmCo
 			smContext.SubCtxLog.Debugln("PDUSessionSMContextUpdate, SMContextState Change State:", smContext.SMContextState.String())
 		}
 	case models.N2SMINFOTYPE_PATH_SWITCH_REQ:
+		if isSmContextInactive(smContext.SMContextState) {
+			smContext.SubPduSessLog.Warnf("PDUSessionSMContextUpdate, ignoring N2 SM info type %v: SM context state[%v] has no active user plane",
+				smContextUpdateData.GetN2SmInfoType(), smContext.SMContextState.String())
+			break
+		}
 		smContext.SubPduSessLog.Infof("PDUSessionSMContextUpdate, N2 SM info type %v received",
 			smContextUpdateData.GetN2SmInfoType())
 		smContext.SubPduSessLog.Debugln("PDUSessionSMContextUpdate, handle Path Switch Request")
@@ -694,7 +991,7 @@ func HandleUpdateN2Msg(txn *transaction.Transaction, response *models.UpdateSmCo
 
 		pdrList := []*context.PDR{}
 		farList := []*context.FAR{}
-		smContext.PendingUPF = make(context.PendingUPF)
+		smContext.ResetPendingUPF(nil)
 		for _, dataPath := range tunnel.DataPathPool {
 			if dataPath.Activated {
 				ANUPF := dataPath.FirstDPNode
@@ -702,9 +999,7 @@ func HandleUpdateN2Msg(txn *transaction.Transaction, response *models.UpdateSmCo
 					pdrList = append(pdrList, DLPDR)
 					farList = append(farList, DLPDR.FAR)
 
-					if _, exist := smContext.PendingUPF[ANUPF.GetNodeIP()]; !exist {
-						smContext.PendingUPF[ANUPF.GetNodeIP()] = true
-					}
+					smContext.AddPendingUPF(ANUPF.GetNodeIP())
 				}
 			}
 		}
@@ -716,6 +1011,11 @@ func HandleUpdateN2Msg(txn *transaction.Transaction, response *models.UpdateSmCo
 		smContext.ChangeState(context.SmStatePfcpModify)
 		smContext.SubCtxLog.Debugln("PDUSessionSMContextUpdate, SMContextState Change State:", smContext.SMContextState.String())
 	case models.N2SMINFOTYPE_PATH_SWITCH_SETUP_FAIL:
+		if isSmContextInactive(smContext.SMContextState) {
+			smContext.SubPduSessLog.Warnf("PDUSessionSMContextUpdate, ignoring N2 SM info type %v: SM context state[%v] has no active user plane",
+				smContextUpdateData.GetN2SmInfoType(), smContext.SMContextState.String())
+			break
+		}
 		smContext.SubPduSessLog.Infof("PDUSessionSMContextUpdate, N2 SM info type %v received",
 			smContextUpdateData.GetN2SmInfoType())
 		if smContext.SMContextState != context.SmStateActive {
@@ -735,6 +1035,11 @@ func HandleUpdateN2Msg(txn *transaction.Transaction, response *models.UpdateSmCo
 			smContext.SubPduSessLog.Error()
 		}
 	case models.N2SMINFOTYPE_HANDOVER_REQUIRED:
+		if isSmContextInactive(smContext.SMContextState) {
+			smContext.SubPduSessLog.Warnf("PDUSessionSMContextUpdate, ignoring N2 SM info type %v: SM context state[%v] has no active user plane",
+				smContextUpdateData.GetN2SmInfoType(), smContext.SMContextState.String())
+			break
+		}
 		smContext.SubPduSessLog.Infof("PDUSessionSMContextUpdate, N2 SM info type %v received",
 			smContextUpdateData.GetN2SmInfoType())
 		if smContext.SMContextState != context.SmStateActive {
@@ -749,6 +1054,361 @@ func HandleUpdateN2Msg(txn *transaction.Transaction, response *models.UpdateSmCo
 		jd.SetN2SmInfo(models.RefToBinaryData{ContentId: "Handover"})
 		response.SetJsonData(jd)
 	}
+
+	return nil
+}
+
+// ranAnswerIsExpected reports whether this session is still waiting for the radio's answer to a
+// modification, and clears the wait if it is.
+//
+// The radio's answer is only an answer while the question stands. T3591 can abandon a modification
+// before the response arrives, and the session then sits on the parameters it had -- realigning it
+// from a stale response would start a corrective modification for a change nobody made, and a
+// stale failure would stop the timer and discard the update belonging to whatever modification is
+// running by then.
+//
+// What this cannot separate is a stale answer arriving while a *newer* modification is in flight:
+// the response carries no identity beyond the session, so at this interface it is indistinguishable
+// from the new one's. That one stays open.
+//
+// The caller must hold SMLock, which every N2 update handler already does -- HandlePDUSessionSMContextUpdate
+// takes it for the whole dispatch, and SMLock is not reentrant, so taking it here wedges the
+// session instead of guarding it. That is not hypothetical: it deadlocked every modify-response
+// test on the first draft of this guard.
+func ranAnswerIsExpectedLocked(smContext *context.SMContext) bool {
+	return smContext.RanAnswerPending
+}
+
+// ranAnswerTakenLocked consumes the expectation, once the answer has been read and decoded rather
+// than when it arrived. Clearing on arrival meant a response the SMF could not decode took the
+// expectation with it, and the radio's next attempt -- or the valid answer behind a malformed one
+// -- was then ignored as belonging to no modification, leaving a partial acceptance with nothing
+// to realign it. The whole path runs under SMLock, so no second answer is being decoded meanwhile.
+func ranAnswerTakenLocked(smContext *context.SMContext) {
+	smContext.RanAnswerPending = false
+}
+
+// handleModifyResponse acts on what the radio access network made of a modification. A response
+// means the radio passed the Command to the UE, so a refusal of some or all of the flows means the UE
+// was told about flows that were not established, and it is owed a further modification saying
+// which are actually in force — a distinct procedure, not a retry, because the parameters it carries
+// describe what exists rather than what was attempted.
+func handleModifyResponse(smContext *context.SMContext, body models.UpdateSmContextRequest) error {
+	if !ranAnswerIsExpectedLocked(smContext) {
+		smContext.SubPduSessLog.Warnln("a modify response arrived for a modification this session is not waiting on; ignoring it")
+		return nil
+	}
+
+	// The radio's answer can end the modification, when the UE has already completed it, and a
+	// policy decision held behind it then starts. A correction this answer calls for goes first: it
+	// marks the session pending, and the decision waits for the correction to end.
+	//
+	// A held decision also waits for this answer once the UE has completed, but only for one T3591
+	// interval (armRanAnswerGuardLocked), since an answer that never comes would otherwise hold every
+	// later decision for good. A late answer meeting the newer modification is the case
+	// ranAnswerIsExpectedLocked already cannot separate.
+	defer startDeferredModificationLocked(smContext)
+
+	fileBytes, err := readBinaryN2SmInformation(body.GetBinaryDataN2SmInformation())
+	if err != nil {
+		smContext.SubPduSessLog.Errorf("reading the modify response failed: %v", err)
+		return err
+	}
+
+	result, err := context.HandlePDUSessionResourceModifyResponseTransfer(fileBytes, smContext)
+	if err != nil {
+		smContext.SubPduSessLog.Errorf("decoding the modify response failed: %v", err)
+		return err
+	}
+
+	ranAnswerTakenLocked(smContext)
+
+	// A modification the UE has already completed was committed whole, including whatever this
+	// answer refuses. Nothing downstream will read a realignment marker for it -- the completion
+	// that reads one has been and gone -- so the correction is built and started here instead.
+	if committed := smContext.CommittedBeforeRanAnswer; committed != nil {
+		smContext.CommittedBeforeRanAnswer = nil
+		correctCommittedModification(smContext, committed, result)
+		return nil
+	}
+
+	// A response says the session was modified. TS 38.413 subclause 8.2.3.2 has the radio pass the
+	// Command to the UE only if at least one request in the transfer succeeded, which is what puts
+	// the session in the response rather than in the failed list, and a request for an added or
+	// changed flow also carries the session AMBR. TS 23.502 clause 4.3.3.2 step 7 draws the same line:
+	// the SMF assumes the Command was not forwarded only when no part of the request succeeded. So a
+	// response refusing every listed flow still means the UE has the Command and will answer it. It is realigned like a partial refusal and
+	// waits for that answer, and the releases, which the answer does not list, are committed with the
+	// rest. Abandoning instead left the UE on flows the session no longer had, and let a held decision
+	// start whose Command a late answer to this one would then have answered. Only the failure
+	// message, for which the radio does not pass the Command on, abandons (handleModifyFailure).
+	switch {
+	case result.WhollyRejected():
+		smContext.SubPduSessLog.Warnf("radio access network established none of the added or modified flows %v; realigning the UE once it answers",
+			result.RejectedQFIs)
+		realignAfterPartialRejection(smContext, result)
+
+	case result.PartiallyRejected():
+		smContext.SubPduSessLog.Warnf("radio access network established flows %v and refused %v; realigning the UE",
+			result.AcceptedQFIs, result.RejectedQFIs)
+		realignAfterPartialRejection(smContext, result)
+
+	default:
+		smContext.SubPduSessLog.Infof("radio access network established all modified flows %v", result.AcceptedQFIs)
+	}
+
+	return nil
+}
+
+// handleModifyFailure acts on the radio access network refusing a modification outright, which
+// it reports as a failure rather than as a response. Then the radio does not pass the Command to the
+// UE (TS 38.413 subclause 8.2.3.2), so unless the UE has already completed the modification, it is
+// abandoned: the UE has nothing of it to answer, beyond a copy T3591 retransmitted, whose late answer
+// the quiet interval after a retransmission already waits out.
+func handleModifyFailure(smContext *context.SMContext, body models.UpdateSmContextRequest) error {
+	if !ranAnswerIsExpectedLocked(smContext) {
+		smContext.SubPduSessLog.Warnln("a modify failure arrived for a modification this session is not waiting on; ignoring it")
+		return nil
+	}
+
+	// Refusing the modification ends it, and a held decision starts.
+	defer startDeferredModificationLocked(smContext)
+
+	fileBytes, err := readBinaryN2SmInformation(body.GetBinaryDataN2SmInformation())
+	if err != nil {
+		smContext.SubPduSessLog.Errorf("reading the modify failure failed: %v", err)
+		return err
+	}
+
+	cause, err := context.HandlePDUSessionResourceModifyUnsuccessfulTransfer(fileBytes, smContext)
+	if err != nil {
+		smContext.SubPduSessLog.Errorf("decoding the modify failure failed: %v", err)
+		return err
+	}
+
+	// Taken here, as on the response path, and not left to the abandonment below to clear as a side
+	// effect of what it does: the correction further down returns instead of abandoning, and would
+	// otherwise leave the expectation standing with nothing in flight to meet it. A stray or
+	// repeated answer would then pass the gate at the top of this function and abandon a session
+	// running no modification at all.
+	ranAnswerTakenLocked(smContext)
+
+	smContext.StopT3591()
+
+	// Same order as handleModifyResponse has to answer, and the same remedy. A modification the UE
+	// has already completed was committed whole, and the abandonment below has nothing to discard:
+	// the pending update it would have dropped was popped by that commit. Refusing the modification
+	// outright therefore left every flow of it in force, on the record, on the UE and in the user
+	// plane. Withdrawing the flows it added takes those back out; the flows it changed are left as
+	// they are, as RemoveFlows leaves them on any refusal.
+	if committed := smContext.CommittedBeforeRanAnswer; committed != nil {
+		smContext.CommittedBeforeRanAnswer = nil
+		flows := flowsCarriedBy(committed)
+		if len(flows) == 0 {
+			// A modification that only released flows or changed session-level parameters has no
+			// flow to withdraw, and putting those back would take the record from before it, which
+			// the committed update does not carry. Said here rather than reported as an acceptance.
+			smContext.SubPduSessLog.Warnf("radio access network refused a modification the UE had already completed, which added or changed no flow; nothing is withdrawn, and what it released or changed for the session stays in force")
+
+			return nil
+		}
+		correctCommittedModification(smContext, committed, context.ModifyResponse{RejectedQFIs: flows})
+
+		return nil
+	}
+
+	abandonModificationUnderLock(smContext, "ran_whole_rejection", fmt.Sprintf("ngap_cause_present_%d", cause.Present))
+
+	return nil
+}
+
+// flowsCarriedBy names every flow an update asked for, read the way RemoveFlows reads them so the
+// two agree on which identifier belongs to which entry. A modify failure refuses the modification
+// as a whole rather than flow by flow, so this is what "all of it" means for one.
+func flowsCarriedBy(update *qos.PolicyUpdate) []int64 {
+	if update == nil || update.QosFlowUpdate == nil {
+		return nil
+	}
+
+	var flows []int64
+
+	for _, entries := range []map[string]*models.QosData{
+		update.QosFlowUpdate.GetAdded(),
+		update.QosFlowUpdate.GetModified(),
+	} {
+		for _, entry := range entries {
+			flowID, err := qos.ParseQosFlowId(entry.GetQosId())
+			if err != nil {
+				continue
+			}
+
+			flows = append(flows, int64(flowID))
+		}
+	}
+
+	return flows
+}
+
+// correctCommittedModification answers a radio response that arrived after the UE had already
+// acknowledged the modification, and so after it was committed in full.
+//
+// The ordinary order lets the completion prune the pending update to what the radio established,
+// so the record is right before it is written and only the UE and user plane need correcting. In
+// this order the record is wrong as well: it names flows the radio refused. All three are put back
+// by the same corrective modification -- a deletion is an ordinary modification, and committing
+// its own result is what takes those flows off the record -- so this differs from the pruning path
+// only in where the deletions come from, which is the update the completion committed.
+//
+// A response refusing every flow is corrected the same way, as it is in the other order;
+// withdrawing the flows the modification added takes them back out. Flows it changed stay on the
+// changed parameters on the UE and in the user plane.
+func correctCommittedModification(smContext *context.SMContext, committed *qos.PolicyUpdate, result context.ModifyResponse) {
+	if len(result.RejectedQFIs) == 0 {
+		smContext.SubPduSessLog.Infof("radio access network established all modified flows %v", result.AcceptedQFIs)
+		return
+	}
+
+	corrective := committed.RemoveFlows(qos.RefusedFlowSet(result.RejectedQFIs))
+	if corrective != nil {
+		smContext.SubPduSessLog.Warnf("radio access network refused flows %v for a modification the UE had already completed; withdrawing the ones it added from the session, the UE and the user plane",
+			result.RejectedQFIs)
+	}
+
+	realignSession(smContext, &context.PendingRealignment{
+		EstablishedQFIs: result.AcceptedQFIs,
+		RefusedQFIs:     result.RejectedQFIs,
+	}, corrective)
+}
+
+// realignAfterPartialRejection records that the UE's view of the session is wider than what the
+// radio access network established. The corrective modification runs once the UE has
+// acknowledged the first one, per TS 23.502 clause 4.3.3.2, which places it after step 11.
+func realignAfterPartialRejection(smContext *context.SMContext, result context.ModifyResponse) {
+	smContext.Realign = &context.PendingRealignment{
+		EstablishedQFIs: result.AcceptedQFIs,
+		RefusedQFIs:     result.RejectedQFIs,
+	}
+}
+
+// realignSession brings the session into agreement with what the radio access network actually
+// established, after a modification it accepted only part of.
+//
+// The record is already correct by this point: the pending update was pruned to the established
+// flows before it was committed. What is left wrong is the UE, which acknowledged a wider set of
+// parameters than the session has, and the user plane, which was programmed before the radio
+// answered and still carries rules for flows that were never built. A downlink packet matching
+// one of those is classified onto a QoS flow with no radio bearer and dropped, rather than
+// falling back — so both halves matter.
+//
+// Both are corrected by one ordinary modification carrying the deletions. TS 23.502 clause
+// 4.3.3.2 calls for a further procedure rather than a retry of the one that was partly accepted,
+// and a deletion *is* such a procedure — so it goes through ApplyModification like any other
+// instead of this function rebuilding the user plane and sending N1N2 itself. It did both by hand
+// before, and got both wrong: the rebuild ran after the pruned update had been committed and so
+// programmed nothing, and the user-plane call blocked forever on a response the triggering
+// transaction had already taken.
+//
+// It runs on its own goroutine, and acquiring SMLock is what sequences it: the transaction that
+// brought the acknowledgement holds the lock for its whole life, so the correction cannot start
+// until that has finished and the user plane's response channel is free.
+func realignSession(smContext *context.SMContext, realign *context.PendingRealignment, corrective *qos.PolicyUpdate) {
+	smContext.SubPduSessLog.Warnf("realigning session: radio access network established %v and refused %v",
+		realign.EstablishedQFIs, realign.RefusedQFIs)
+
+	if corrective == nil {
+		// Nothing to delete: no refused flow was one the update added. Either the refused flows were
+		// not in the update being committed, or the radio refused only changes to established flows,
+		// which it keeps and RemoveFlows leaves in place. Worth saying, because the alternative
+		// reading is that the correction was skipped.
+		smContext.SubPduSessLog.Infof("no flows to withdraw; the radio refused no flow this modification added")
+		startDeferredModificationLocked(smContext)
+		return
+	}
+
+	// The correction is committed to from here, though it starts later: a policy decision arriving
+	// meanwhile is held behind it, and the modification it corrects -- whose transfer call may not
+	// have returned yet -- leaves the session to it. Its Command is not out yet, so an answer
+	// arriving meanwhile is a late one to an earlier Command and is ignored.
+	smContext.NwModificationPending = true
+	smContext.NwModificationGen++
+	smContext.NwModificationUnsent = true
+
+	// Like a held decision, the correction waits out the interval in which the UE may still answer
+	// another copy of the Command it corrects -- one retransmitted, or one AMF re-discovery
+	// delivered twice. Such an answer, taken as the correction's, would commit it unanswered.
+	wait := smContext.NwModificationQuietFor
+	if wait > 0 {
+		smContext.NwModificationQuietFor = 0
+		smContext.NwModificationQuietUntil = time.Now().Add(wait)
+	}
+	if remaining := time.Until(smContext.NwModificationQuietUntil); remaining > wait {
+		wait = remaining
+	}
+
+	refused := realign.RefusedQFIs
+	start := func() {
+		// Queued in the session's transaction slot, for the reason a held decision is: the caller is
+		// the UE's completion, whose state machine sets Active after this returns, and a correction
+		// already in SmStatePfcpModify by then would never see the user plane's answer.
+		queueSessionTask(smContext, correct(smContext, corrective, refused))
+	}
+	if wait > 0 {
+		smContext.SubPduSessLog.Infof("the Command being corrected may still be answered from another copy; starting the correction in %s", wait)
+		time.AfterFunc(wait, start)
+
+		return
+	}
+	start()
+}
+
+// correct is the correction's own work, run in the session's queue.
+func correct(smContext *context.SMContext, corrective *qos.PolicyUpdate, refused []int64) func() {
+	return func() {
+		if err := applyModification(smContext, corrective); err != nil {
+			if errors.Is(err, errSessionNotModifiable) {
+				smContext.SubPduSessLog.Infof("not withdrawing the refused flows %v: %v", refused, err)
+				return
+			}
+			smContext.SubPduSessLog.Errorf("withdrawing the refused flows %v failed: %v; the UE still believes they exist and downlink traffic matching them will be dropped",
+				refused, err)
+			metrics.IncrementModificationAbandonedStats("realignment", "ue_not_corrected")
+			return
+		}
+		smContext.SubPduSessLog.Infof("corrective modification sent, withdrawing flows %v", refused)
+	}
+}
+
+// refuseUeRequestedModification answers a UE-requested PDU session modification with a
+// MODIFICATION REJECT carrying cause, attached to the UpdateSmContext response per TS 23.502
+// subclause 4.3.3.2 step 3a.
+//
+// The cause arrives as a parameter rather than being computed at the builder call, which is what
+// lets the error-key scan in smferrors account for every key that reaches the tables: a key it
+// cannot enumerate would make it report the remaining literals as though the set were complete.
+//
+// A reject that cannot be built or written is returned as an error, with no response set, so the
+// AMF is answered with a system failure. Answering 200 with no N1 message would leave the request
+// as unanswered as it was before this refusal existed.
+func refuseUeRequestedModification(smContext *context.SMContext,
+	response *models.UpdateSmContext200Response, pduSessionID int32, pti uint8,
+	state context.SMContextState, cause string,
+) error {
+	smContext.SubPduSessLog.Warnf(
+		"PDUSessionSMContextUpdate, N1 Msg PDU Session Modification Request received for pdu session %d (pti %d), state %s; refusing with %s",
+		pduSessionID, pti, state.String(), cause)
+
+	buf, err := context.BuildGSMPDUSessionModificationRejectWithCause(pduSessionID, pti, cause)
+	if err != nil {
+		return fmt.Errorf("build GSM PDUSessionModificationReject: %w", err)
+	}
+	tmpFile, err := util.CreatePayloadTempFile(buf)
+	if err != nil {
+		return fmt.Errorf("write GSM PDUSessionModificationReject: %w", err)
+	}
+	response.SetBinaryDataN1SmMessage(tmpFile)
+	jsonData := response.GetJsonData()
+	jsonData.SetN1SmMsg(models.RefToBinaryData{ContentId: "PDUSessionModificationReject"})
+	response.SetJsonData(jsonData)
 
 	return nil
 }
