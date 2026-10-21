@@ -9,6 +9,7 @@ import (
 	"github.com/omec-project/nas/v2/nasMessage"
 	"github.com/omec-project/openapi/v2/models"
 	smf_context "github.com/omec-project/smf/context"
+	"github.com/omec-project/smf/msgtypes/svcmsgtypes"
 	"github.com/omec-project/smf/transaction"
 )
 
@@ -17,17 +18,23 @@ type liFailures struct {
 	*liCalls
 	establishmentRejects []uint8
 	modificationRejects  int
+	releaseRejects       []uint8
 }
 
 func captureLIFailures(t *testing.T) *liFailures {
 	t.Helper()
 	c := &liFailures{liCalls: captureLI(t)}
-	establishment, modification := liReportEstablishmentReject, liReportModificationReject
+	establishment, modification, release := liReportEstablishmentReject, liReportModificationReject, liReportReleaseReject
 	liReportEstablishmentReject = func(_ *smf_context.SMContext, cause uint8) {
 		c.establishmentRejects = append(c.establishmentRejects, cause)
 	}
 	liReportModificationReject = func(*smf_context.SMContext, uint8) { c.modificationRejects++ }
-	t.Cleanup(func() { liReportEstablishmentReject, liReportModificationReject = establishment, modification })
+	liReportReleaseReject = func(_ *smf_context.SMContext, cause uint8) {
+		c.releaseRejects = append(c.releaseRejects, cause)
+	}
+	t.Cleanup(func() {
+		liReportEstablishmentReject, liReportModificationReject, liReportReleaseReject = establishment, modification, release
+	})
 
 	return c
 }
@@ -170,5 +177,33 @@ func TestAFailedPolicyUpdateIsNotReportedAsAFailedModification(t *testing.T) {
 					calls.modificationRejects)
 			}
 		})
+	}
+}
+
+// A release the SMF refuses because the session was never established is a refused release like
+// the one naming the wrong identity, and is reported the same way, with the cause the reject carries.
+func TestARefusedReleaseOfANeverEstablishedSessionIsReported(t *testing.T) {
+	calls := captureLIFailures(t)
+	const pduSessionID = 10
+
+	smContext := smf_context.NewSMContext("imsi-208930100007488", pduSessionID)
+	t.Cleanup(func() { smf_context.RemoveSMContext(smContext.Ref) })
+
+	var request models.UpdateSmContextRequest
+	request.SetJsonData(models.SmContextUpdateData{})
+	request.SetBinaryDataN1SmMessage(n1SmMessageFile(t, encodeReleaseRequest(t, pduSessionID, requestPti)))
+
+	txn := transaction.NewTransaction(request, nil, svcmsgtypes.UpdateSmContext)
+	txn.Ctxt = smContext
+
+	if err := HandleUpdateN1Msg(txn, models.NewUpdateSmContext200Response(), &pfcpAction{}); err != nil {
+		t.Fatalf("HandleUpdateN1Msg returned %v, want the release to be refused without error", err)
+	}
+
+	if len(calls.releaseRejects) != 1 {
+		t.Fatalf("failed-release records = %d, want 1", len(calls.releaseRejects))
+	}
+	if got := calls.releaseRejects[0]; got != nasMessage.Cause5GSMInvalidPDUSessionIdentity {
+		t.Errorf("record cause = %d, want #43, the cause the reject carries", got)
 	}
 }

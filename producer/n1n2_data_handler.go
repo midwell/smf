@@ -201,6 +201,9 @@ func HandleUpdateN1Msg(txn *transaction.Transaction, response *models.UpdateSmCo
 						// its timer expires. State stays SmStateInit: there is nothing to clean up.
 						smContext.SubPduSessLog.Warnf("PDUSessionSMContextUpdate, rejecting PDU Session Release Request for a never-established session: SM context state[%v]",
 							smContext.SMContextState.String())
+						// Lawful Interception IRI-POI: a refused release, as on the mismatched
+						// identity below, reported with the cause the reject carries.
+						liReportReleaseReject(smContext, smferrors.ErrorCause["InvalidPDUSessionIdentity"])
 						buildPDUSessionReleaseReject(smContext, response, pduSessIDRelReq, "InvalidPDUSessionIdentity")
 						break
 					}
