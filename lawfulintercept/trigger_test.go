@@ -1133,28 +1133,27 @@ func TestReconcileReportsATriggerThePOISaysIsNotRunning(t *testing.T) {
 		t.Errorf("sent %d deactivations for a faulty trigger; the warrant is live", n)
 	}
 
-	if len(taskReports.reports) == 0 {
+	// The fault is held as state against the warrant — not the trigger: the LIPF issued the
+	// warrant's XID and never saw the trigger's. The X1 server's task-fault watcher reports it
+	// from there as a NonTerminatingFault, since the tasking is in place at both ends and only
+	// the product has stopped, and retracts it once the POI reports the trigger running.
+	faults := s.taskFaults(warrant.XID)
+	if len(faults) == 0 {
 		t.Fatal("the POI reported a trigger this element installed as not provisioned, and this " +
-			"element told the LIPF nothing: the warrant is live, no content is being produced, " +
-			"and the only party that can see it said so to nobody")
+			"element holds no fault for the warrant: the warrant is live, no content is being " +
+			"produced, and nothing would ever tell the LIPF")
 	}
-	for _, r := range taskReports.reports {
-		// The warrant, not the trigger. The LIPF issued the warrant's XID and never saw the
-		// trigger's, so a report naming the trigger names an identifier the LIPF cannot look
-		// up — which is less useful than naming none, because it looks like an answer.
-		if r.xid != string(warrant.XID) {
-			t.Errorf("the report names %q; the warrant is %q and the trigger XIDs are %v — the "+
-				"LIPF never issued a trigger XID and cannot resolve one", r.xid, warrant.XID, mine)
+	for _, f := range faults {
+		if !strings.HasPrefix(f.ErrorDescription, x1.TaskIssueTriggerNotRunning+": ") {
+			t.Errorf("the fault is %q, want %s", f.ErrorDescription, x1.TaskIssueTriggerNotRunning)
 		}
-		if !strings.Contains(r.details, testUnhealthyReason) {
-			t.Errorf("the report does not say what the POI reported: %q", r.details)
+		if !strings.Contains(f.ErrorDescription, testUnhealthyReason) {
+			t.Errorf("the fault does not say what the POI reported: %q", f.ErrorDescription)
 		}
-		// Non-terminating: the tasking is in place at both ends and the product has stopped.
-		// A terminating fault would ask the LIPF to re-provision an element whose provisioning
-		// is intact.
-		if r.reportType != x1.TaskReportNonTerminatingFault {
-			t.Errorf("the report is a %q; a trigger the POI holds and is not running has not "+
-				"stopped this element from being able to carry the warrant out", r.reportType)
+	}
+	for _, trigger := range mine {
+		if len(s.taskFaults(types.XID(trigger))) != 0 {
+			t.Errorf("a fault is held under the trigger XID %s, which the LIPF never issued", trigger)
 		}
 	}
 }
@@ -3395,9 +3394,12 @@ func TestAFaultyTriggerNamesOnlyItsOwnWarrant(t *testing.T) {
 			"on by tearing an interception down", n)
 	}
 
+	// The faults held per warrant are what the task-fault watcher reports.
 	var named []string
-	for _, r := range taskReports.reports {
-		named = append(named, r.xid)
+	for _, w := range []types.XID{faulty.XID, working.XID, triggerFor[faulty.XID], triggerFor[working.XID]} {
+		if len(s.taskFaults(w)) != 0 {
+			named = append(named, string(w))
+		}
 	}
 	if len(named) != 1 || named[0] != string(faulty.XID) {
 		t.Errorf("reports named %v; want exactly the faulty warrant %q. The working warrant is %q "+
@@ -3458,18 +3460,29 @@ func TestATriggerThatStopsRunningAfterStartupIsReported(t *testing.T) {
 	// signal to, and it owes one exactly when it holds tasking there.
 	s.triggers.keepaliveRound()
 
+	// Recorded as state against the warrant, which is what the X1 server's task-fault watcher
+	// reports from — both the fault and, once the POI reports the trigger running again, its
+	// all-clear (TS 103 221-1 clause 6.5.2.1) — and what an interrogation answers.
 	var found bool
 
-	for _, r := range taskReports.reports {
-		if r.xid == string(warrant.XID) && strings.Contains(r.details, x1.TaskIssueTriggerNotRunning) {
+	for _, f := range s.taskFaults(warrant.XID) {
+		if strings.HasPrefix(f.ErrorDescription, x1.TaskIssueTriggerNotRunning+": ") {
 			found = true
 		}
 	}
 
 	if !found {
-		t.Errorf("a trigger the POI reports as not running was not reported against its warrant. "+
-			"Content interception has stopped while the warrant is live, and the only party that "+
-			"can notice is this one. Reports seen: %+v", taskReports.reports)
+		t.Errorf("a trigger the POI reports as not running is not answered as a fault of its "+
+			"warrant, so neither the task-fault watcher nor an interrogation can report it: %+v",
+			s.taskFaults(warrant.XID))
+	}
+
+	// Not pushed as well: the watcher owns both edges, and a push of its own would be an
+	// onset report nothing ever retracts.
+	for _, r := range taskReports.reports {
+		if r.xid == string(warrant.XID) && strings.Contains(r.details, x1.TaskIssueTriggerNotRunning) {
+			t.Errorf("the keepalive round pushed the fault itself: %+v", r)
+		}
 	}
 
 	// And it is reported, not acted on: the warrant is live, so tearing its interception down

@@ -876,9 +876,10 @@ func TestUEEndpointIsNotTheTunnelEndpoint(t *testing.T) {
 }
 
 // TestUEEndpointAbsentAddress: a session with no address assigned must omit the
-// optional field on the establishment record rather than emit an empty list, and
-// must not produce a start-of-interception record at all — its uEEndpoint is
-// mandatory, and an empty one asserts the session has no address.
+// optional field on the establishment record rather than emit an empty list. The
+// start-of-interception record still reports the session, with an empty uEEndpoint: TS
+// 33.128 table 6.2.3-4 makes it conditional ("if available"), and the module's SEQUENCE
+// OF has no OPTIONAL, so an empty list is its only form for a session with no address.
 func TestUEEndpointAbsentAddress(t *testing.T) {
 	sc := targetSM()
 	sc.PDUAddress = nil
@@ -895,9 +896,10 @@ func TestUEEndpointAbsentAddress(t *testing.T) {
 		t.Errorf("establishment must still encode without an address: %v", err)
 	}
 
-	// The mandatory-field record must be refused, not silently emitted empty.
-	if _, err := iri.EncodeXIRI(smfStartOfInterception(sc)); err == nil {
-		t.Error("start-of-interception encoded with an empty uEEndpoint; want a refusal")
+	// The start-of-interception record is still produced, stating that no address is
+	// available rather than leaving the session unreported.
+	if _, err := iri.EncodeXIRI(smfStartOfInterception(sc)); err != nil {
+		t.Errorf("start-of-interception must encode for a session with no address: %v", err)
 	}
 }
 

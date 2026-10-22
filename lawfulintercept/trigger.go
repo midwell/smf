@@ -1048,16 +1048,11 @@ func (s *subsystem) noteTaskHealth(_ string, reported []x1.TaskResponseDetails) 
 			continue
 		}
 
-		// Kept as well as pushed. The push tells the LIPF when it happens; this is what lets
-		// the same condition be *answered* when the ADMF asks, which is a separate obligation
-		// — a fault reported once and then unavailable to an interrogation is a fault the
-		// provisioning function cannot confirm still holds.
+		// Recorded as state, which is what both the X1 server's task-fault watcher and an
+		// interrogation read: the watcher reports the fault to the LIPF when it appears and
+		// retracts it once the POI reports the trigger running again (TS 103 221-1 clause
+		// 6.5.2.1), and the ADMF can ask whether it still holds in between.
 		s.triggers.noteUnhealthy(warrant, task.TaskStatus.Describe())
-
-		s.reportTaskIssueAs(warrant, x1.TaskReportNonTerminatingFault,
-			x1.TaskIssueTriggerNotRunning+": a UPF reports the content trigger this "+
-				"element installed for this warrant as not running: "+
-				task.TaskStatus.Describe())
 	}
 }
 

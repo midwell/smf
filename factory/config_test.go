@@ -165,9 +165,9 @@ func TestAQuotedTriStateBooleanIsRefusedByTheConfigLoader(t *testing.T) {
 // property is that a mistyped LI key stops the network function from starting, and that is only
 // true if InitConfigFactory calls the check.
 //
-// Both keys below are chosen because their defaults fail *unsafely*. A dropped
-// `keepaliveTimeout` leaves the X1 fail-safe off, so the element keeps tasking that nothing will
-// ever reclaim; a dropped `admfUrl` leaves the fault channel a no-op, so nothing it is required to
+// Both keys below are chosen because their defaults are not what the operator asked for. A
+// dropped `keepaliveTimeout` leaves the X1 keepalive procedure on the clause default rather than
+// the operator's TIME_P2; a dropped `admfUrl` leaves the fault channel a no-op, so nothing it is required to
 // report — including a misconfiguration — reaches the ADMF. Neither is visible from outside: the
 // element runs, answers X1, and looks provisioned.
 func TestLiBlockRefusesUnknownKeys(t *testing.T) {

@@ -95,9 +95,9 @@ func scanFixture(t *testing.T, task types.InterceptTask, sessions int) (*subsyst
 		// untrue, and a PFCP session, because its SEID is the correlation the mediation
 		// function joins content to. Omitting either makes the scan silently deliver
 		// nothing — which is how the first draft of this test asserted nothing at all.
-		// The record refuses to describe a session with no endpoint address, so one is
-		// needed — marked as allocated by the user plane, which is a real deployment
-		// choice and the one that keeps the address out of an SMF-side pool these tests
+		// An established IP session has an endpoint address, and the record reports it, so
+		// the fixture gives the session one — marked as allocated by the user plane, which is
+		// a real deployment choice and the one that keeps the address out of an SMF-side pool these tests
 		// do not build. Clearing it from a cleanup instead would be a write to a session
 		// the scan's goroutine may still be reading, which -race reports as the test's
 		// own race rather than the element's.

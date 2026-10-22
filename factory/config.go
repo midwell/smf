@@ -104,9 +104,19 @@ type Li struct {
 	// serves a task that names nothing resolvable.
 	Destinations []LiDestination `yaml:"destinations,omitempty"`
 
-	AdmfURL          string `yaml:"admfUrl"`          // ADMF X1 endpoint for NE-initiated issue reports (optional)
-	AdmfID           string `yaml:"admfId"`           // responsible ADMF identifier (for reports)
-	KeepaliveTimeout string `yaml:"keepaliveTimeout"` // duration; purge tasking if no X1 message within it (optional)
+	AdmfURL string `yaml:"admfUrl"` // ADMF X1 endpoint for NE-initiated issue reports (optional)
+	AdmfID  string `yaml:"admfId"`  // responsible ADMF identifier (for reports)
+	// The X1 keepalive procedure of ETSI TS 103 221-1 clause 6.6.2, which runs unless
+	// keepaliveDisabled is set: the clause enables it by default. keepaliveTimeout is
+	// TIME_P2, the silence after which the element reports fault 9050 (default 1h);
+	// keepaliveTimeP1 bounds the wait for the ADMF's answer (default 1m), and
+	// keepaliveTimeP3 the wait after an acknowledged report (default 2h) before tasking is
+	// deactivated — unless keepaliveRetainTasking is set.
+	KeepaliveTimeout       string `yaml:"keepaliveTimeout"`                 // duration; TIME_P2 (optional)
+	KeepaliveTimeP1        string `yaml:"keepaliveTimeP1,omitempty"`        // duration; TIME_P1 (optional)
+	KeepaliveTimeP3        string `yaml:"keepaliveTimeP3,omitempty"`        // duration; TIME_P3 (optional)
+	KeepaliveRetainTasking bool   `yaml:"keepaliveRetainTasking,omitempty"` // never deactivate tasking (optional)
+	KeepaliveDisabled      bool   `yaml:"keepaliveDisabled,omitempty"`      // agreed with the agency: no procedure (optional)
 
 	// The X2/X3 keepalive mechanism of ETSI TS 103 221-2 clause 6.2.4, which is a
 	// different mechanism from keepaliveTimeout above: that one is the X1 fail-safe

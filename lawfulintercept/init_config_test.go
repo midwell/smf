@@ -21,6 +21,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/omec-project/util/li/x1"
 )
 
 // liPKI writes a throwaway LI certificate, key and trust anchor, and returns their
@@ -150,25 +152,90 @@ func TestUnreadableKeepaliveWindowStopsInterceptionAndTellsTheADMF(t *testing.T)
 	}
 }
 
-// TestAStatedEmptyWindowIsHonoured keeps the other reading available. An operator who
-// writes nothing has said the fail-safe is off, which is a choice — not a value this
-// element could not read — and interception starts.
-func TestAStatedEmptyWindowIsHonoured(t *testing.T) {
+// TestTheKeepaliveProcedureRunsByDefault: TS 103 221-1 clause 6.6.2 enables keepalives
+// "by default (with no prior agreement)", so an element configured with no keepalive
+// settings runs the procedure on the clause's timers rather than holding tasking an ADMF
+// that has gone away can never withdraw.
+func TestTheKeepaliveProcedureRunsByDefault(t *testing.T) {
+	sub := initWithKeepalive(t, Config{})
+
+	if sub.keepalive == nil {
+		t.Fatal("no keepalive procedure runs on an element whose configuration says nothing " +
+			"about one; clause 6.6.2 enables it by default")
+	}
+	if *sub.keepalive != (x1.KeepaliveProcedure{}) {
+		t.Errorf("the procedure is %+v, want the clause defaults (zero timers)", *sub.keepalive)
+	}
+}
+
+// TestADisabledKeepaliveStartsNothing: an operator who agreed with the agency that there
+// are no keepalives says so, and the element runs no procedure.
+func TestADisabledKeepaliveStartsNothing(t *testing.T) {
+	sub := initWithKeepalive(t, Config{KeepaliveDisabled: true, KeepaliveTimeout: "30s"})
+
+	if sub.keepalive != nil {
+		t.Errorf("a keepalive procedure %+v runs although the configuration disabled it", *sub.keepalive)
+	}
+}
+
+// TestKeepaliveTimersAreTheOperatorsOwn: keepaliveTimeout is TIME_P2, the silence after
+// which the fault is reported, and the other keys set the remaining timers.
+func TestKeepaliveTimersAreTheOperatorsOwn(t *testing.T) {
+	sub := initWithKeepalive(t, Config{
+		KeepaliveTimeout: "30m", KeepaliveTimeP1: "2m", KeepaliveTimeP3: "4h",
+		KeepaliveRetainTasking: true,
+	})
+
+	want := x1.KeepaliveProcedure{
+		TimeP2: 30 * time.Minute, TimeP1: 2 * time.Minute, TimeP3: 4 * time.Hour,
+		RetainTasking: true,
+	}
+	if sub.keepalive == nil || *sub.keepalive != want {
+		t.Errorf("the procedure is %+v, want %+v", sub.keepalive, want)
+	}
+}
+
+// TestAQuietADMFIsToldKeepalivesStopped: the procedure's reports travel on the fault
+// channel. With the timers at their floor and no X1 request arriving, the ADMF receives the
+// clause 6.6.2 fault report — which it cannot if the reporter is not wired into the server.
+func TestAQuietADMFIsToldKeepalivesStopped(t *testing.T) {
+	admf := newADMFStub(t)
+	initWithKeepalive(t, Config{
+		AdmfURL: admf.srv.URL, AdmfID: testADMFID,
+		KeepaliveTimeout: "1s", KeepaliveTimeP1: "1s", KeepaliveTimeP3: "1s",
+	})
+
+	var joined string
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); {
+		if joined = strings.Join(admf.received(), "\n"); strings.Contains(joined, x1.NEIssueKeepalivesMissing) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !strings.Contains(joined, x1.NEIssueKeepalivesMissing) {
+		t.Errorf("no keepalive fault reached the ADMF after TIME_P2 passed in silence:\n%s", joined)
+	}
+}
+
+// initWithKeepalive starts interception with cfg's keepalive and reporting settings and
+// returns the subsystem it started.
+func initWithKeepalive(t *testing.T, cfg Config) *subsystem {
+	t.Helper()
+
 	cert, key, ca := liPKI(t)
 	t.Cleanup(func() { active.Store(nil) })
 
-	if err := Init(Config{
-		NEID:     testNEID,
-		X1Listen: testListenEphemeral,
-		MDF2:     testDestinationAddr,
-		Cert:     cert, Key: key, CACert: ca,
-		KeepaliveTimeout: "",
-	}); err != nil {
-		t.Fatalf("Init refused an empty keepalive window: %v", err)
+	cfg.NEID, cfg.X1Listen, cfg.MDF2 = testNEID, testListenEphemeral, testDestinationAddr
+	cfg.Cert, cfg.Key, cfg.CACert = cert, key, ca
+	if err := Init(cfg); err != nil {
+		t.Fatalf("Init: %v", err)
 	}
-	if active.Load() == nil {
-		t.Error("interception did not start with the fail-safe deliberately off")
+	sub := active.Load()
+	if sub == nil {
+		t.Fatal("interception did not start")
 	}
+
+	return sub
 }
 
 // TestASubFloorKeepaliveWindowStopsInterceptionRatherThanTheProcess is the second path

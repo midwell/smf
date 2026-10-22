@@ -13,9 +13,9 @@ import (
 // model.
 //
 // **A misspelled LI key is silently dropped, and the defaults it lands on are the dangerous
-// ones.** A typo'd `keepaliveTimeout` leaves the X1 fail-safe *off*, so the element holds tasking
-// nothing will ever reclaim while looking healthy. A typo'd `admfUrl` leaves the fault channel a
-// no-op, so every condition this element is required to report goes nowhere — including the report
+// ones.** A typo'd `keepaliveRetainTasking` or `keepaliveTimeout` leaves the X1 keepalive procedure
+// on timers or a purge policy the operator did not choose, while the element looks healthy. A
+// typo'd `admfUrl` leaves the fault channel a no-op, so every condition this element is required to report goes nowhere — including the report
 // that would have said the configuration was wrong. In both cases the operator wrote the setting,
 // the element ignored it, and nothing anywhere says so.
 //
@@ -70,7 +70,8 @@ func strictLiBlock(content []byte) error {
 	if err := yaml.Load(raw, &li, yaml.WithKnownFields()); err != nil {
 		return fmt.Errorf("configuration.li: %w — a key this element does not recognise is a "+
 			"setting that never reaches it, and the defaults it leaves in place are the unsafe ones: "+
-			"an unread keepaliveTimeout leaves the X1 fail-safe off, and an unread admfUrl leaves "+
+			"an unread keepalive setting leaves the X1 keepalive procedure on terms the operator did not "+
+			"choose, and an unread admfUrl leaves "+
 			"this element with no channel to report that on", err)
 	}
 
