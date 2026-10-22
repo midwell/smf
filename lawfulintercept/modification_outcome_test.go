@@ -283,11 +283,8 @@ func TestARefusedDuplicationIsAttributedToItsWarrant(t *testing.T) {
 	sub, admf, _ := outcomeFixture(t)
 	sc := duplicatingSession(t)
 
-	reports := &recordingTaskReporter{}
-	sub.taskReporter = reports
-
 	warrant := types.InterceptTask{
-		XID:      "44444444-4444-4444-8444-444444444444",
+		XID:      testXIDCovering,
 		Products: []types.ProductType{types.ProductCC},
 		Targets:  []types.TargetIdentifier{{Type: types.TargetSUPI, Value: "262019876543210"}},
 	}
@@ -310,18 +307,18 @@ func TestARefusedDuplicationIsAttributedToItsWarrant(t *testing.T) {
 		ModificationAnswered(req, ie.CauseRequestRejected, true)
 	}
 
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		for _, r := range reports.reports {
-			if r.xid == string(warrant.XID) {
-				return
-			}
-		}
-
-		time.Sleep(20 * time.Millisecond)
+	faults := sub.taskFaults(warrant.XID)
+	if len(faults) != 1 || !strings.Contains(faults[0].ErrorDescription, "did not apply") {
+		t.Fatalf("a datapath that refused an acknowledged interception is not a fault of the warrant "+
+			"covering the session, so a LIPF holding several warrants cannot tell which one stopped. "+
+			"Faults: %+v; element reports:\n%s", faults, strings.Join(admf.received(), "\n"))
 	}
 
-	t.Fatalf("a datapath that refused an acknowledged interception was reported at element scope "+
-		"only, so a LIPF holding several warrants cannot tell which one stopped. Task reports: "+
-		"%+v; element reports:\n%s", reports.reports, strings.Join(admf.received(), "\n"))
+	// State, not a push: a later modification the datapath applies ends it, and the watcher
+	// then retracts the fault (TS 103 221-1 clause 6.5.2.1).
+	ModificationAnswered(req, ie.CauseRequestAccepted, true)
+
+	if f := sub.taskFaults(warrant.XID); len(f) != 0 {
+		t.Errorf("the warrant still reports %+v after a modification for the session applied", f)
+	}
 }

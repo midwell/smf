@@ -198,15 +198,17 @@ type triggerRegistry struct {
 	// owns what reconciliation means.
 	reconcile func(nodeID string, e *upfEndpoint)
 	// unhealthy is what a POI last said about a trigger this element installed, keyed by the
-	// warrant it serves. Empty means every POI holding one of this warrant's triggers last
-	// reported it as running.
+	// trigger's own XID: one warrant has a trigger per session and serving UPF, so a warrant-keyed
+	// record would let a healthy sibling's report erase an unhealthy one. A warrant is faulty while
+	// any trigger it currently holds is in here; taskFaults reads only installed triggers, and an
+	// entry is dropped when its trigger is released or withdrawn.
 	//
 	// Refreshed on the keepalive cadence rather than by asking when the question arrives: an
 	// X1 status request answered by dialling every POI would put a round trip per endpoint on
 	// the request goroutine, which is the cost this element's own worker exists to keep off it.
 	// The cadence is the same one the fail-safe windows are chosen against, so the answer is at
 	// most one round old.
-	unhealthy map[types.XID]string
+	unhealthy map[types.XID]triggerHealth
 
 	// sleep and now are the withdrawal retry loop's clock, held here so a test can
 	// drive a backoff measured in minutes without spending it. Nil means the real
@@ -384,7 +386,7 @@ func newTriggerRegistry(
 		resolved:             make(map[string]string, len(cfg.UPFTriggers)),
 		installed:            make(map[string]installedTrigger),
 		pending:              make(map[string]*pendingWithdrawal),
-		unhealthy:            make(map[types.XID]string),
+		unhealthy:            make(map[types.XID]triggerHealth),
 		reportUnattributable: onUnattributable,
 		reportCadenceMissed:  onCadenceMissed,
 	}
@@ -1043,7 +1045,7 @@ func (s *subsystem) noteTaskHealth(_ string, reported []x1.TaskResponseDetails) 
 		}
 
 		if task.TaskStatus.Healthy() {
-			s.triggers.noteHealthy(warrant)
+			s.triggers.noteHealthy(xid)
 
 			continue
 		}
@@ -1052,55 +1054,78 @@ func (s *subsystem) noteTaskHealth(_ string, reported []x1.TaskResponseDetails) 
 		// interrogation read: the watcher reports the fault to the LIPF when it appears and
 		// retracts it once the POI reports the trigger running again (TS 103 221-1 clause
 		// 6.5.2.1), and the ADMF can ask whether it still holds in between.
-		s.triggers.noteUnhealthy(warrant, task.TaskStatus.Describe())
+		s.triggers.noteUnhealthy(xid, warrant, task.TaskStatus.Describe())
 	}
 }
 
-// noteUnhealthy and noteHealthy record what a POI last said about the triggers serving one
-// warrant, so the same condition can be answered when the ADMF asks and not only pushed when it
-// happens.
-func (r *triggerRegistry) noteUnhealthy(warrant types.XID, why string) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	r.unhealthy[warrant] = why
+// triggerHealth is what a POI last said about one installed trigger that is not running.
+type triggerHealth struct {
+	warrant types.XID
+	why     string
 }
 
-func (r *triggerRegistry) noteHealthy(warrant types.XID) {
+// noteUnhealthy and noteHealthy record what a POI last said about one trigger, so the condition
+// can be answered when the ADMF asks and reported by the task-fault watcher.
+func (r *triggerRegistry) noteUnhealthy(trigger, warrant types.XID, why string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	delete(r.unhealthy, warrant)
+	r.unhealthy[trigger] = triggerHealth{warrant: warrant, why: why}
+}
+
+func (r *triggerRegistry) noteHealthy(trigger types.XID) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	delete(r.unhealthy, trigger)
+}
+
+// unhealthyFor returns, sorted, what the POIs last said about every trigger this warrant
+// currently holds that is not running. A trigger no longer installed contributes nothing: its
+// report ended with it.
+func (r *triggerRegistry) unhealthyFor(warrant types.XID) []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	var reasons []string
+	for _, installed := range r.installed {
+		if installed.warrant != warrant {
+			continue
+		}
+		if h, ok := r.unhealthy[installed.xid]; ok {
+			reasons = append(reasons, h.why)
+		}
+	}
+	slices.Sort(reasons)
+
+	return reasons
 }
 
 // taskFaults answers what is currently wrong with one warrant's content interception, for the X1
-// status a provisioning function can ask for.
+// status a provisioning function can ask for and for the task-fault watcher, which reports a fault
+// when it appears and retracts it when it ends.
 //
-// **This element used to answer "nothing" for every task, and that was recorded as a decision.**
-// The reasoning held for the IRI-POI role — a quiet subscriber is indistinguishable from one this
+// The IRI-POI role contributes nothing here: a quiet subscriber is indistinguishable from one this
 // element has stopped watching, and a destination's failure belongs to the destination rather than
-// to each warrant pointing at it. It did not hold for the CC triggering role, which is the other
-// thing this element is: a trigger a POI reports as not running is task-scoped, re-observable, and
-// means this warrant's content interception has stopped while the warrant is live.
-//
-// It was unanswerable only because this element asked once per process, at start-up, before it had
-// installed anything. Asking on the keepalive round is what makes it a state rather than an event.
+// to each warrant pointing at it. The CC triggering role does: a trigger a POI reports as not
+// running is task-scoped, re-observable on the keepalive round, and means this warrant's content
+// interception has stopped while the warrant is live. So does a modification this element could
+// not apply to a session the warrant covers, until a later one applies.
 func (s *subsystem) taskFaults(xid types.XID) []x1.X1Error {
-	if s.triggers == nil {
+	var reasons []string
+	if s.triggers != nil {
+		for _, why := range s.triggers.unhealthyFor(xid) {
+			reasons = append(reasons, "a point of interception reports a content trigger this "+
+				"element installed for this warrant as not running: "+why)
+		}
+	}
+	reasons = append(reasons, s.failedModificationsFor(xid)...)
+
+	if len(reasons) == 0 {
 		return nil
 	}
 
-	s.triggers.mu.Lock()
-	why, faulty := s.triggers.unhealthy[xid]
-	s.triggers.mu.Unlock()
-
-	if !faulty {
-		return nil
-	}
-
-	return []x1.X1Error{x1.TaskFault(x1.TaskIssueTriggerNotRunning,
-		"a point of interception reports the content trigger this element installed for this "+
-			"warrant as not running: "+why)}
+	return []x1.X1Error{x1.TaskFault(x1.TaskIssueTriggerNotRunning, strings.Join(reasons, "; "))}
 }
 
 // upfSession is one UPF serving a session, with the detection criterion for that
@@ -1390,13 +1415,30 @@ func (s *subsystem) installTriggers(planned []plannedTrigger) {
 				err = p.endpoint.req.ActivateTask(p.trigger)
 			}
 		case !errors.As(err, &refused):
-			// No answer: the POI may hold the trigger. Resend it unchanged — a POI
-			// holding the identical task acknowledges the replay, one that never
-			// received it activates it — rather than with re-provisioned destinations,
-			// which would be a different task under an XID the POI may hold, refused
-			// with 2010 (TS 103 221-1 table 6.2.1.1-2).
+			// No answer: the POI may hold the trigger. Resend it unchanged rather than with
+			// re-provisioned destinations, which would be a different task under an XID the
+			// POI may hold, refused with 2010 (TS 103 221-1 table 6.2.1.1-2). The util x1
+			// server this UPF runs acknowledges a replay of the identical task it holds; one
+			// that never received it activates it.
 			unanswered = true
 			err = p.endpoint.req.ActivateTask(p.trigger)
+
+			// A refusal of the replay other than 2010 says the POI holds no task under this
+			// XID — holding the identical task it would have acknowledged, holding a different
+			// one it would have answered 2010 — so the first attempt was not applied. That is
+			// the restarted POI the branch above re-provisions for, and it is handled the same
+			// way. Only a re-provisioned attempt that again goes unanswered leaves the task
+			// possibly held.
+			if errors.As(err, &refused) && refused.Code != x1ErrXIDExists {
+				unanswered = false
+				p.endpoint.forgetDestination()
+
+				if again, retryErr := s.ensureDestinations(p.endpoint, p.addresses); retryErr == nil {
+					p.trigger.DIDs = again
+					err = p.endpoint.req.ActivateTask(p.trigger)
+					unanswered = err != nil && !errors.As(err, &refused)
+				}
+			}
 		}
 
 		if err != nil {
@@ -1420,9 +1462,9 @@ func (s *subsystem) installTriggers(planned []plannedTrigger) {
 			//
 			// 2010, "XID already exists on NE", is not a refusal to hold anything: the
 			// POI holds a different task under this XID, so it is withdrawn like a
-			// non-answer rather than released. So is any refusal that follows an
-			// unanswered attempt: the first may have been applied, and a refused replay
-			// does not say it was not.
+			// non-answer rather than released. So is a refusal of a re-provisioned
+			// attempt whose own predecessor went unanswered: that attempt may have been
+			// applied.
 			if errors.As(err, &refused) && refused.Code != x1ErrXIDExists && !unanswered {
 				s.triggers.release(p.key)
 			} else if w, owned := s.triggers.takeFailedActivation(p.key, p.trigger.XID); owned {
@@ -1961,6 +2003,7 @@ func (r *triggerRegistry) holdsFor(xid types.XID) (held, withdrawing bool, warra
 func (r *triggerRegistry) release(key string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	delete(r.unhealthy, r.installed[key].xid)
 	delete(r.installed, key)
 }
 
@@ -2099,6 +2142,7 @@ func (r *triggerRegistry) take(match func(warrant, session, nodeID string) bool)
 		pkey := pendingKey(key, installed.xid)
 		out = append(out, withdrawal{key: pkey, nodeID: nodeID, xid: installed.xid})
 		delete(r.installed, key)
+		delete(r.unhealthy, installed.xid)
 		r.pending[pkey] = &pendingWithdrawal{xid: installed.xid, nodeID: nodeID, since: r.timeNow()}
 	}
 	slices.SortFunc(out, func(a, b withdrawal) int { return strings.Compare(a.key, b.key) })
@@ -2143,6 +2187,7 @@ func (r *triggerRegistry) takeFailedActivation(key string, xid types.XID) (withd
 	if r.installed[key].xid == xid {
 		delete(r.installed, key)
 	}
+	delete(r.unhealthy, xid)
 
 	_, _, nodeID, ok := parseTriggerKey(key)
 	if !ok {
@@ -2179,6 +2224,9 @@ func (r *triggerRegistry) takeOrphan(nodeID string, xid types.XID) withdrawal {
 func (r *triggerRegistry) forgetPending(key string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if p, ok := r.pending[key]; ok {
+		delete(r.unhealthy, p.xid)
+	}
 	delete(r.pending, key)
 }
 

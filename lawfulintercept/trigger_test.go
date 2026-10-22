@@ -163,6 +163,12 @@ type fakePOI struct {
 	// answer of any kind describes: the request arrives, the POI may well apply it,
 	// and what ends the exchange is the requester's own clock.
 	hangOn string
+	// activateScript answers successive ActivateTask requests in order, overriding the other
+	// settings for each: "unbindable" answers under another NE identifier (an answer this
+	// element cannot bind, the no-answer class), "refuse" refuses with 3000, "ok" acknowledges.
+	// It is what lets a test say "the first attempt went unanswered and the replay was
+	// refused" without a setting that persists across requests.
+	activateScript []string
 	// refuseCode is the errorCode a refusing POI answers with. Zero means 1000, a
 	// generic refusal. It matters because the code is the whole content of some
 	// answers: 2020 says the XID is not held, which for a withdrawal is the
@@ -228,6 +234,13 @@ func poiEnvelope(t *testing.T, request []byte, payload string) string {
 		`</x1:x1ResponseMessage></x1:X1Response>`
 }
 
+// The steps an activateScript can hold.
+const (
+	scriptUnbindable = "unbindable"
+	scriptRefuse     = "refuse"
+	scriptOK         = "ok"
+)
+
 func newFakePOI(t *testing.T) *fakePOI {
 	t.Helper()
 
@@ -252,6 +265,19 @@ func newFakePOI(t *testing.T) *fakePOI {
 				p.provisioned = true
 			case !p.provisioned:
 				refuse = true
+			}
+		}
+		scriptedMisname := ""
+		if len(p.activateScript) > 0 && strings.Contains(string(body), "ActivateTaskRequest") {
+			step := p.activateScript[0]
+			p.activateScript = p.activateScript[1:]
+			switch step {
+			case scriptUnbindable:
+				refuse, scriptedMisname = false, "some-other-upf"
+			case scriptRefuse:
+				refuse, refuseCode = true, 3000
+			case scriptOK:
+				refuse = false
 			}
 		}
 		var delay func()
@@ -351,6 +377,9 @@ func newFakePOI(t *testing.T) *fakePOI {
 		// where nothing has been installed at the POI to withdraw.
 		if misnameOn != "" && !strings.Contains(string(body), misnameOn) {
 			misname = ""
+		}
+		if scriptedMisname != "" {
+			misname = scriptedMisname
 		}
 
 		answer := poiEnvelope(t, body, `<x1:oK>AcknowledgedAndCompleted</x1:oK>`)
@@ -3097,10 +3126,10 @@ func TestSessionsWithTriggersNamesOnlyThisWarrantsSessions(t *testing.T) {
 //  2. The `ActivateTask` is taken and never answered. The requester's 10s deadline
 //     (li/x1/trigger.go) is what ends it — which is why this test costs those 10s, and
 //     the elapsed-time assertion below is what makes them worth paying.
-//  3. From that moment the POI answers nothing, so the retry's `CreateDestination`
-//     fails at once and no second activation is sent. Without that the retry would
-//     produce its own, later error and the classification would be reading *that*
-//     rather than the timeout — a test that passes for the wrong reason.
+//  3. The identical replay that follows gets no answer this element can bind either, so
+//     the trigger may be held and nothing says otherwise. (A replay *refused* other than
+//     with 2010 would say it is not held, and is re-provisioned instead — see
+//     TestARefusedReplayAfterAnUnansweredActivationReprovisions.)
 //  4. The withdrawal is refused once, and the retry clock belongs to the test, so the
 //     sleep hook restores the POI and the withdrawal converges instead of looping past
 //     the end of the test.
@@ -3110,6 +3139,10 @@ func TestAnActivationThatTimesOutIsWithdrawnNotForgotten(t *testing.T) {
 	s.taskReporter = &recordingTaskReporter{}
 
 	poi.setHangOn("ActivateTaskRequest")
+	poi.mu.Lock()
+	// The first step is the hung request itself; the second is the replay.
+	poi.activateScript = []string{scriptOK, scriptUnbindable}
+	poi.mu.Unlock()
 	s.triggers.sleep = func(time.Duration) { poi.setRefuse(false) }
 
 	warrant := types.InterceptTask{
@@ -3699,4 +3732,135 @@ func TestAnActivationAnsweredXIDExistsIsWithdrawnNotReleased(t *testing.T) {
 	if n := poi.countMessages("ActivateTaskRequest"); n != 1 {
 		t.Errorf("sent %d activations, want one: 2010 is not a lost destination to re-provision", n)
 	}
+}
+
+// twoTriggersForOneWarrant installs one warrant's triggers for two sessions at one POI and
+// returns the warrant and the two trigger XIDs, read from the registry.
+func twoTriggersForOneWarrant(t *testing.T, s *subsystem) (types.XID, []types.XID) {
+	t.Helper()
+
+	warrant := types.InterceptTask{XID: testXIDPrimary, Products: []types.ProductType{types.ProductCC}}
+	s.installFor("session-1", []types.InterceptTask{warrant}, []upfSession{{node: upfNode(trigNodeA), seid: 42}}, 7)
+	s.installFor("session-2", []types.InterceptTask{warrant}, []upfSession{{node: upfNode(trigNodeA), seid: 43}}, 8)
+
+	var triggers []types.XID
+	for _, installed := range s.triggers.installed {
+		if installed.warrant == warrant.XID {
+			triggers = append(triggers, installed.xid)
+		}
+	}
+	if len(triggers) != 2 {
+		t.Fatalf("expected two triggers for the warrant, got %v", triggers)
+	}
+
+	return warrant.XID, triggers
+}
+
+// TestAHealthySiblingDoesNotHideAStoppedTrigger: one warrant has a trigger per session, and the
+// POI reports on each. Recorded against the warrant, whichever report came last decided the
+// answer — a healthy sibling listed after the stopped one erased the fault, so whether it was
+// ever reported depended on the POI's response order. Either order must report it.
+func TestAHealthySiblingDoesNotHideAStoppedTrigger(t *testing.T) {
+	for _, stoppedFirst := range []bool{true, false} {
+		poi := newFakePOI(t)
+		s := triggerSubsystem(t, poi)
+		warrant, triggers := twoTriggersForOneWarrant(t, s)
+
+		stopped, running := triggers[0], triggers[1]
+		order := []string{string(stopped), string(running)}
+		if !stoppedFirst {
+			order = []string{string(running), string(stopped)}
+		}
+
+		poi.mu.Lock()
+		poi.holds = order
+		poi.unhealthy = map[string]string{string(stopped): testUnhealthyReason}
+		poi.mu.Unlock()
+
+		s.reconcileOne()
+
+		if len(s.taskFaults(warrant)) != 1 {
+			t.Errorf("stopped trigger listed first=%v: the warrant reports %d faults, want 1 — a "+
+				"running sibling must not hide a trigger that is not", stoppedFirst, len(s.taskFaults(warrant)))
+		}
+	}
+}
+
+// TestATriggerFaultEndsWithItsTriggers: once every trigger of a warrant is withdrawn, nothing
+// remains that is not running, so the warrant must stop reporting the fault rather than hold it
+// until the warrant itself is deactivated.
+func TestATriggerFaultEndsWithItsTriggers(t *testing.T) {
+	poi := newFakePOI(t)
+	s := triggerSubsystem(t, poi)
+	warrant, triggers := twoTriggersForOneWarrant(t, s)
+
+	poi.mu.Lock()
+	poi.holds = []string{string(triggers[0]), string(triggers[1])}
+	poi.unhealthy = map[string]string{string(triggers[0]): testUnhealthyReason, string(triggers[1]): testUnhealthyReason}
+	poi.mu.Unlock()
+
+	s.reconcileOne()
+
+	if len(s.taskFaults(warrant)) != 1 {
+		t.Fatalf("precondition: both triggers reported not running, want the warrant faulty")
+	}
+
+	s.triggers.takeForSession("session-1")
+	s.triggers.takeForSession("session-2")
+
+	if f := s.taskFaults(warrant); len(f) != 0 {
+		t.Errorf("the warrant still reports %v after every trigger it held was withdrawn", f)
+	}
+}
+
+// TestARefusedReplayAfterAnUnansweredActivationReprovisions is the restarted UPF: the first
+// activation goes unanswered, the replay reaches a POI that has lost the destinations and
+// refuses it. A POI holding the identical task would have acknowledged the replay, and one holding
+// a different task would have answered 2010, so this refusal says the task is not held — the
+// same answer the first branch re-provisions for. Withdrawing instead leaves the warrant without
+// content until the session's next event.
+func TestARefusedReplayAfterAnUnansweredActivationReprovisions(t *testing.T) {
+	poi := newFakePOI(t)
+	s := triggerSubsystem(t, poi)
+	s.taskReporter = &recordingTaskReporter{}
+
+	poi.mu.Lock()
+	poi.activateScript = []string{scriptUnbindable, scriptRefuse, scriptOK}
+	poi.mu.Unlock()
+
+	s.installFor("session-ref-1", []types.InterceptTask{{
+		XID:      testXIDPrimary,
+		Products: []types.ProductType{types.ProductCC},
+	}}, []upfSession{{node: upfNode(trigNodeA), seid: 0x2632898145f4d191}}, 7)
+
+	if n := poi.countMessages("ActivateTaskRequest"); n != 3 {
+		t.Fatalf("sent %d activations, want the original, the replay and one after re-provisioning", n)
+	}
+	if n := poi.countMessages("CreateDestinationRequest"); n != 2 {
+		t.Errorf("provisioned destinations %d times, want twice: the refused replay means the POI "+
+			"lost them", n)
+	}
+	if held, _ := s.triggers.holds(s.triggers.installed[installedKeyFor(t, s)].xid); !held {
+		t.Error("the trigger is not held after the re-provisioned activation was acknowledged")
+	}
+	if n := poi.countMessages("DeactivateTaskRequest"); n != 0 {
+		t.Errorf("sent %d withdrawals; the re-provisioned trigger is running", n)
+	}
+}
+
+// installedKeyFor returns the single installed trigger key, failing the test otherwise.
+func installedKeyFor(t *testing.T, s *subsystem) string {
+	t.Helper()
+
+	s.triggers.mu.Lock()
+	defer s.triggers.mu.Unlock()
+
+	if len(s.triggers.installed) != 1 {
+		t.Fatalf("installed triggers: %d, want 1", len(s.triggers.installed))
+	}
+	for k := range s.triggers.installed {
+		return k
+	}
+
+	return ""
 }

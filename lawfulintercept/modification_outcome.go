@@ -4,10 +4,13 @@
 package lawfulintercept
 
 import (
+	"maps"
+	"slices"
 	"time"
 
 	smfctx "github.com/omec-project/smf/context"
 	"github.com/omec-project/smf/pfcp/lisequence"
+	"github.com/omec-project/util/li/types"
 	"github.com/omec-project/util/li/x1"
 	"github.com/wmnsk/go-pfcp/ie"
 )
@@ -64,12 +67,58 @@ type modKey struct {
 	nodeID string
 }
 
-// modificationApplied forgets the attempts made for a modification the datapath took.
+// modificationApplied forgets the attempts made for a modification the datapath took, and any
+// failure recorded for the same session and UPF: the duplication that did not apply now has.
 func (s *subsystem) modificationApplied(req lisequence.Request) {
 	s.modMu.Lock()
 	defer s.modMu.Unlock()
 
-	delete(s.modAttempts, modKey{seid: req.SEID, nodeID: req.NodeID})
+	k := modKey{seid: req.SEID, nodeID: req.NodeID}
+	delete(s.modAttempts, k)
+	delete(s.modFailed, k)
+}
+
+// noteModificationFailed records that this element gave up on a modification, as task-fault
+// state for the warrants covering the session.
+func (s *subsystem) noteModificationFailed(req lisequence.Request, detail string) {
+	s.modMu.Lock()
+	defer s.modMu.Unlock()
+
+	if s.modFailed == nil {
+		s.modFailed = map[modKey]string{}
+	}
+	s.modFailed[modKey{seid: req.SEID, nodeID: req.NodeID}] = detail
+}
+
+// failedModificationsFor returns, sorted, the recorded modification failures of sessions this
+// warrant currently covers. A failure whose session has gone is forgotten: nothing is left to
+// duplicate or to stop duplicating.
+func (s *subsystem) failedModificationsFor(warrant types.XID) []string {
+	s.modMu.Lock()
+	failed := maps.Clone(s.modFailed)
+	s.modMu.Unlock()
+
+	var out []string
+	for k, detail := range failed {
+		sc := smfctx.GetSMContextBySEID(k.seid)
+		if sc == nil {
+			s.modMu.Lock()
+			delete(s.modFailed, k)
+			s.modMu.Unlock()
+
+			continue
+		}
+		for _, task := range s.matchingTasks(sc) {
+			if task.XID == warrant {
+				out = append(out, detail)
+
+				break
+			}
+		}
+	}
+	slices.Sort(out)
+
+	return out
 }
 
 // attemptsFor records another attempt at this modification and reports how many have now
@@ -124,18 +173,12 @@ func (s *subsystem) modificationNotApplied(req lisequence.Request) {
 
 		s.reporter.NotifyAsync(x1.NEIssueDuplicationRefused, detail)
 
-		// And against each warrant the session is covered by. Non-terminating for the same
-		// reason the trigger-health report is: the tasking is intact and it is the product
-		// that has stopped, so telling the LIPF to re-provision would be the wrong remedy.
-		//
-		// Best-effort by nature — if the session has already gone there is nothing left to
-		// attribute, and the element-scoped report above has already said what happened.
-		if sc := smfctx.GetSMContextBySEID(req.SEID); sc != nil {
-			for _, task := range s.matchingTasks(sc) {
-				s.reportTaskIssueAs(task.XID, x1.TaskReportNonTerminatingFault,
-					x1.TaskIssueTriggerNotRunning+": "+detail)
-			}
-		}
+		// And against each warrant the session is covered by, as state rather than as a push:
+		// the task-fault watcher reports it as a non-terminating fault — the tasking is intact
+		// and it is the product that has stopped — and retracts it when a later modification
+		// for this session and UPF applies (TS 103 221-1 clause 6.5.2.1). A push could only
+		// ever be raised, never cleared.
+		s.noteModificationFailed(req, detail)
 
 		return
 	}

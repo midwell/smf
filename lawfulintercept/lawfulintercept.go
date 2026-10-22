@@ -152,6 +152,11 @@ type subsystem struct {
 	// know how many attempts preceded it — the sequence number is allocated per send.
 	modMu       sync.Mutex
 	modAttempts map[modKey]int
+	// modFailed holds, per (session, UPF), why this element gave up on an LI modification the
+	// datapath did not apply. It is task-fault state: taskFaults reports it against every warrant
+	// covering the session until a later modification for that session and UPF applies, or the
+	// session goes. Guarded by modMu.
+	modFailed map[modKey]string
 
 	// scans counts the activation and deactivation scan goroutines this subsystem has
 	// dispatched. Nothing in production waits on it — the whole point of the scan is
@@ -366,6 +371,14 @@ func newX1Server(st *store.Store, cfg Config, sub *subsystem) *x1.Server {
 // Init starts the SMF LI IRI-POI: it loads the LI credentials, opens the X1
 // listener (mutual TLS), and prepares X2 delivery to the MDF2. Call it once at
 // SMF startup, only when LI is configured.
+// taskFaultInterval is how often the task-fault watcher samples, and taskFaultStop ends it.
+// Zero takes the X1 reporter's throttle interval and nil runs it for the life of the process;
+// only tests set them, so a watcher started by one test does not outlive it.
+var (
+	taskFaultInterval time.Duration
+	taskFaultStop     <-chan struct{}
+)
+
 func Init(cfg Config) error {
 	// Without an identifier for this network element, product would reach a mediation
 	// function that cannot attribute it to the element that produced it. Interception
@@ -385,12 +398,12 @@ func Init(cfg Config) error {
 	if cfg.AdmfURL != "" {
 		reporter = x1.NewReporter(cfg.AdmfURL, cfg.AdmfID, cfg.NEID, mat.ClientTLS())
 	}
-	// The fail-safe window, now that there is somewhere to report a value this element
-	// cannot read. Interception does not start on one — a deployment that asked for the
-	// fail-safe and silently did not get it holds tasking nothing will ever reclaim,
-	// and looks healthy while it does — but the network function does, because an
-	// element that refuses to run over its LI configuration is distinguishable from one
-	// that has none by anybody who can see whether it is running.
+	// The keepalive timers, now that there is somewhere to report a value this element
+	// cannot read (they are read below, once the block itself is trusted). Interception
+	// does not start on one — the element would otherwise run a procedure other than the
+	// one agreed with the agency, and look healthy while it did — but the network function
+	// does, because an element that refuses to run over its LI configuration is
+	// distinguishable from one that has none by anybody who can see whether it is running.
 	// The listener's address, before anything binds it. An empty address is a bind that
 	// succeeds on an unpredictable port rather than one that fails, so nothing downstream
 	// will ever report it — see errNoX1Listen. Reported to the ADMF, because an element that
@@ -399,7 +412,7 @@ func Init(cfg Config) error {
 	// The refused `li` block, now that there is somewhere to report it. Checked before any
 	// value out of that block is used, because the block is exactly what could not be read:
 	// the keys that did decode are not trustworthy as a set, and one of the ones that did not
-	// may be the fail-safe window or the fault endpoint.
+	// may be a keepalive timer or the fault endpoint.
 	if cfg.BlockError != nil {
 		reporter.Notify(x1.NEIssueInvalidConfig,
 			"this element's interception configuration carries a setting it does not "+
@@ -527,8 +540,8 @@ func Init(cfg Config) error {
 			func(elapsed time.Duration) {
 				// NE-level: which point of interception was late is not the fault. The
 				// fault is that this element could not keep the cadence its POIs'
-				// fail-safe windows are chosen against, so any of them may purge live
-				// tasking and report that this element went silent.
+				// keepalive timers (TS 103 221-1 clause 6.6.2) are chosen against, so any
+				// of them may report this element silent and deactivate live tasking.
 				sub.reporter.NotifyAsync(x1.NEIssueTriggerFaulty,
 					fmt.Sprintf("a keepalive round to the triggered points of interception took %s, "+
 						"longer than the interval it must keep; tasking may be purged at a point of "+
@@ -596,7 +609,7 @@ func Init(cfg Config) error {
 	// 6.5.2.1): a content trigger a POI reports as not running is reported when it is
 	// seen, and retracted with an all-clear once the POI reports it running again.
 	if reporter != nil {
-		go x1srv.WatchTaskFaults(reporter, 0, nil)
+		go x1srv.WatchTaskFaults(reporter, taskFaultInterval, taskFaultStop)
 	}
 	active.Store(sub)
 	// **Only now.** Reconciliation withdraws every trigger a POI reports that this
