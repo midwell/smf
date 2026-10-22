@@ -1322,10 +1322,10 @@ func (s *subsystem) modifySession(sc *smfctx.SMContext) {
 	}
 }
 
-// sessionTargets reports whether task's target identifier matches one of sc's
-// identifiers. Caller holds sc.SMLock (targetsOf reads sc's identity fields).
+// sessionTargets reports whether sc's identifiers satisfy every criterion task names.
+// Caller holds sc.SMLock (targetsOf reads sc's identity fields).
 func sessionTargets(task types.InterceptTask, sc *smfctx.SMContext) bool {
-	return task.TargetsAny(targetsOf(sc))
+	return task.MatchedBy(targetsOf(sc))
 }
 
 // reportEvent delivers event to every task this session's identities match, as the
@@ -1504,16 +1504,21 @@ func servingUPFSEID(sc *smfctx.SMContext) uint64 {
 	return 0
 }
 
-// matchingTasks returns the active tasks targeting any of sc's identifiers,
-// de-duplicated by task id.
+// matchingTasks returns the active tasks whose every criterion sc's identifiers
+// satisfy, de-duplicated by task id. The store's index finds the tasks naming any of
+// them; a task's criteria are conjunctive (TS 103 221-1 table 6.2.1.2-1), so each is
+// then decided against all of sc's identifiers.
 func (s *subsystem) matchingTasks(sc *smfctx.SMContext) []types.InterceptTask {
+	ids := targetsOf(sc)
 	var out []types.InterceptTask
 	seen := map[types.XID]bool{}
-	for _, id := range targetsOf(sc) {
+	for _, id := range ids {
 		for _, t := range s.store.Match(id) {
 			if !seen[t.XID] {
 				seen[t.XID] = true
-				out = append(out, t)
+				if t.MatchedBy(ids) {
+					out = append(out, t)
+				}
 			}
 		}
 	}
@@ -2025,9 +2030,17 @@ func canApply(task types.InterceptTask) error {
 	if len(task.Targets) == 0 {
 		return errors.New("li: task names no target identifiers")
 	}
-	if !task.NamesAnyType(resolvableTargets...) {
-		return errors.New("li: task names no identifier this element resolves; " +
-			"it matches subjects by SUPI, PEI or GPSI")
+	// Every criterion must match (TS 103 221-1 table 6.2.1.2-1), so one this element
+	// never evaluates makes the task unmatchable here, and so does a combination no
+	// subscriber presents; the same table has the element reject both rather than
+	// acknowledge an interception that can never run.
+	if !task.NamesOnlyTypes(resolvableTargets...) {
+		return errors.New("li: task names an identifier this element does not resolve, and " +
+			"every criterion of a task must match; it matches subjects by SUPI, PEI or GPSI")
+	}
+	if a, b, ok := task.ContradictoryTargets(); ok {
+		return fmt.Errorf("li: task names %s and %s, which no subscriber presents together, "+
+			"and every criterion of a task must match", a.Type, b.Type)
 	}
 
 	// **No product test here, deliberately.** The AMF refuses an X3Only warrant, because an

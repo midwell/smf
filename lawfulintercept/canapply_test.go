@@ -78,7 +78,9 @@ func activateWithTargets(targets string) string {
 const (
 	supiTarget = `<ns1:targetIdentifier><ns1:supiimsi>262019876543210</ns1:supiimsi></ns1:targetIdentifier>`
 	ipTarget   = `<ns1:targetIdentifier><ns1:ipv4Address>10.45.0.2</ns1:ipv4Address></ns1:targetIdentifier>`
-	taskXID    = types.XID("50b93d1e-1b53-4d63-aacb-e4d99811bc0b")
+	// otherSUPITarget is a second subscriber: no UE presents two SUPIs.
+	otherSUPITarget = `<ns1:targetIdentifier><ns1:supiimsi>262019876543211</ns1:supiimsi></ns1:targetIdentifier>`
+	taskXID         = types.XID("50b93d1e-1b53-4d63-aacb-e4d99811bc0b")
 )
 
 // TestX1ServerRefusesTaskingItCannotAct drives the X1 server this element
@@ -86,10 +88,12 @@ const (
 // decision never wired in, and a test that calls canApply directly passes with
 // the option unregistered.
 //
-// This element matches subjects by subscriber identity alone. A warrant naming
-// only a UE address matches nothing here at every moment, and acknowledging it
-// tells the ADMF an interception is running that cannot be — indistinguishable,
-// from the agency's side, from a tasked subject who did nothing.
+// This element matches subjects by subscriber identity alone, and every criterion of a
+// task must match (TS 103 221-1 table 6.2.1.2-1). A warrant naming a UE address — alone
+// or beside a subscriber identity — matches nothing here at every moment, and so does
+// one naming two SUPIs; acknowledging either tells the ADMF an interception is running
+// that cannot be — indistinguishable, from the agency's side, from a tasked subject who
+// did nothing.
 func TestX1ServerRefusesTaskingItCannotAct(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
@@ -98,7 +102,8 @@ func TestX1ServerRefusesTaskingItCannotAct(t *testing.T) {
 	}{
 		{"only an address this element never resolves", ipTarget, false},
 		{"a subscriber identity", supiTarget, true},
-		{"a subscriber identity and an address", supiTarget + ipTarget, true},
+		{"a subscriber identity and an address", supiTarget + ipTarget, false},
+		{"two subscriber identities", supiTarget + otherSUPITarget, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			st := store.New()
@@ -140,9 +145,9 @@ func TestX1ServerRefusesTaskingItCannotAct(t *testing.T) {
 				t.Fatal("a warrant this element cannot act on was acknowledged; the ADMF now " +
 					"believes an interception is running that never can be")
 			}
-			if !strings.Contains(errInfo.ErrorDescription, "SUPI, PEI or GPSI") {
-				t.Errorf("refusal reason = %q, want it to name what this element does resolve — "+
-					"a provisioning function has to be able to tell this from a fault",
+			if !strings.Contains(errInfo.ErrorDescription, "every criterion of a task must match") {
+				t.Errorf("refusal reason = %q, want it to say why — every criterion must match — "+
+					"so a provisioning function can tell this from a fault",
 					errInfo.ErrorDescription)
 			}
 		})

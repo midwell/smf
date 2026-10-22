@@ -3176,7 +3176,10 @@ func TestALabelChangeArrivingWithATargetChangeStillReachesTheTrigger(t *testing.
 
 	prev := types.InterceptTask{
 		XID: warrantXID, ProductID: oldLabel,
-		Targets:  []types.TargetIdentifier{{Type: types.TargetSUPI, Value: supi}},
+		Targets: []types.TargetIdentifier{
+			{Type: types.TargetSUPI, Value: supi},
+			{Type: types.TargetPEI, Value: "3534250000000151"},
+		},
 		Products: []types.ProductType{types.ProductCC},
 	}
 	s.installFor(session.Ref, []types.InterceptTask{prev},
@@ -3186,15 +3189,12 @@ func TestALabelChangeArrivingWithATargetChangeStillReachesTheTrigger(t *testing.
 		t.Fatalf("activation carried productID %v, want [%s]", got, oldLabel)
 	}
 
-	// Both at once: a target is added and the label changes. The session installed
-	// above is covered before and after, so its trigger survives the reconciliation —
-	// which is exactly the trigger that used to keep the old label.
+	// Both at once: a criterion is dropped and the label changes. The session installed
+	// above is covered by the narrowed task, so its trigger survives the reconciliation —
+	// which is exactly the trigger that would otherwise keep the old label.
 	next := prev
 	next.ProductID = newLabel
-	next.Targets = []types.TargetIdentifier{
-		{Type: types.TargetSUPI, Value: supi},
-		{Type: types.TargetPEI, Value: "3534250000000151"},
-	}
+	next.Targets = []types.TargetIdentifier{{Type: types.TargetSUPI, Value: supi}}
 	if !s.store.Activate(next) {
 		t.Fatal("Activate failed")
 	}

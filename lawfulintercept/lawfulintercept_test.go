@@ -1408,3 +1408,31 @@ func TestConcurrentEstablishmentAndTasking(t *testing.T) {
 			"emitted as a Create FAR", state)
 	}
 }
+
+// TestAWarrantNamingTwoIdentitiesMatchesOnlyTheSubjectPresentingBoth is TS 103 221-1 table
+// 6.2.1.2-1: "Where multiple criteria are present, all criteria are required to be
+// matched." A warrant naming a SUPI and a GPSI describes the subscriber holding both; a
+// session of the SUPI under another GPSI belongs to someone else, and reporting it would
+// intercept a subject the warrant does not describe.
+func TestAWarrantNamingTwoIdentitiesMatchesOnlyTheSubjectPresentingBoth(t *testing.T) {
+	task := iriTask()
+	task.Targets = []types.TargetIdentifier{
+		{Type: types.TargetSUPI, Value: "262019876543210"},
+		{Type: types.TargetGPSI, Value: "4915123456789"},
+	}
+	capture := &captureSender{}
+	activateIRISub(t, capture, task)
+
+	ReportEstablishment(targetSM())
+	if len(capture.pdus) != 1 {
+		t.Fatalf("the session presenting both identities produced %d records, want 1", len(capture.pdus))
+	}
+
+	other := targetSM()
+	other.Gpsi = "msisdn-4915100000000"
+	ReportEstablishment(other)
+	if len(capture.pdus) != 1 {
+		t.Errorf("a session presenting only the warrant's SUPI produced %d more records, want none",
+			len(capture.pdus)-1)
+	}
+}
