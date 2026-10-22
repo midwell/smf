@@ -53,17 +53,20 @@ func targetSM() *smfctx.SMContext {
 
 func TestTargetsOf(t *testing.T) {
 	got := targetsOf(targetSM())
-	want := map[types.TargetIdentifierType]string{
-		types.TargetSUPI: "262019876543210",
-		types.TargetPEI:  "3534250000000151",
-		types.TargetGPSI: "4915123456789",
+	// The IMEISV the UE presented, and the IMEI it carries (its first fourteen digits), so an
+	// IMEI warrant matches this device as well as an IMEISV one.
+	want := map[types.TargetIdentifier]bool{
+		{Type: types.TargetSUPI, Value: "262019876543210"}: true,
+		{Type: types.TargetPEI, Value: "3534250000000151"}: true,
+		{Type: types.TargetPEI, Value: "35342500000001"}:   true,
+		{Type: types.TargetGPSI, Value: "4915123456789"}:   true,
 	}
 	if len(got) != len(want) {
 		t.Fatalf("targetsOf returned %d ids, want %d: %+v", len(got), len(want), got)
 	}
 	for _, id := range got {
-		if want[id.Type] != id.Value {
-			t.Errorf("identifier %s = %q, want %q", id.Type, id.Value, want[id.Type])
+		if !want[id] {
+			t.Errorf("unexpected identifier %+v", id)
 		}
 	}
 	// An unmappable/absent identifier is not emitted.

@@ -66,8 +66,11 @@ func TestSessionXIRICarriesTheSixRequiredAttributes(t *testing.T) {
 	if got := attrs[x2x3.AttrMatchedTargetIdentifier]; len(got) != 1 || got[0] != "<supiimsi>262019876543210</supiimsi>" {
 		t.Errorf("matched target identifier = %q, want the SUPI the task named", got)
 	}
-	if got := len(attrs[x2x3.AttrOtherTargetIdentifier]); got != 2 {
-		t.Errorf("other target identifiers = %d (%q), want the session's PEI and GPSI", got, attrs[x2x3.AttrOtherTargetIdentifier])
+	// The PEI twice: the IMEISV the UE presented, and the IMEI it carries, which is the
+	// device's identity an IMEI warrant names.
+	if got := len(attrs[x2x3.AttrOtherTargetIdentifier]); got != 3 {
+		t.Errorf("other target identifiers = %d (%q), want the session's PEI (as its IMEISV and the "+
+			"IMEI it carries) and GPSI", got, attrs[x2x3.AttrOtherTargetIdentifier])
 	}
 	if got := attrs[x2x3.AttrSequenceNumber]; len(got) != 1 {
 		t.Fatalf("sequence number occurrences = %d, want 1", len(got))
@@ -129,8 +132,9 @@ func TestInitRefusesWithoutAnElementIdentifier(t *testing.T) {
 // cannot be rendered would drop a required attribute with nothing failing.
 func TestEveryIdentityThisPOIProducesRenders(t *testing.T) {
 	ids := targetsOf(targetSM())
-	if len(ids) != 3 {
-		t.Fatalf("the fixture yields %d identities, want the SUPI, PEI and GPSI this POI reads", len(ids))
+	if len(ids) != 4 {
+		t.Fatalf("the fixture yields %d identities, want the SUPI, the PEI (as its IMEISV and the "+
+			"IMEI it carries) and the GPSI this POI reads", len(ids))
 	}
 	for _, id := range ids {
 		if _, ok := id.XMLFragment(); !ok {
@@ -139,5 +143,37 @@ func TestEveryIdentityThisPOIProducesRenders(t *testing.T) {
 	}
 	if got := len(types.XMLFragments(ids)); got != len(ids) {
 		t.Errorf("XMLFragments dropped %d of %d identities silently", len(ids)-got, len(ids))
+	}
+}
+
+// TestAnIMEIWarrantMatchesASessionWhoseUEPresentedItsIMEISV: an IMEISV is the IMEI's Type
+// Allocation Code and Serial Number followed by a software version, so a UE that presented one
+// is the device a warrant naming the fourteen-digit IMEI targets. Matching only the IMEISV as
+// presented would leave that warrant producing nothing for such a UE's sessions.
+func TestAnIMEIWarrantMatchesASessionWhoseUEPresentedItsIMEISV(t *testing.T) {
+	snd := &captureSender{}
+	st := store.New()
+	st.Activate(types.InterceptTask{
+		XID:      testTaskIRI,
+		Targets:  []types.TargetIdentifier{{Type: types.TargetPEI, Value: "35342500000001"}},
+		Products: []types.ProductType{types.ProductIRI},
+		State:    types.TaskActive,
+	})
+	active.Store(&subsystem{
+		store: st, senderFor: func(string) sender { return snd },
+		mdf2: configuredMDF2,
+		ids:  x2x3.NewIdentity(testNEID, smfInterceptionPoint), neID: testNEID,
+	})
+	t.Cleanup(func() { active.Store(nil) })
+
+	ReportEstablishment(targetSM())
+	if len(snd.pdus) != 1 {
+		t.Fatalf("delivered %d records for an IMEI warrant naming a UE that presented its IMEISV, want 1",
+			len(snd.pdus))
+	}
+
+	attrs := attrsOf(snd.pdus[0])
+	if got := attrs[x2x3.AttrMatchedTargetIdentifier]; len(got) != 1 || got[0] != "<peiImei>35342500000001</peiImei>" {
+		t.Errorf("matched target identifier = %q, want the IMEI the warrant named", got)
 	}
 }

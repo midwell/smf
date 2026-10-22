@@ -21,6 +21,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/omec-project/util/li/iri"
+	"github.com/omec-project/util/li/types"
 	"github.com/omec-project/util/li/x1"
 	"github.com/omec-project/util/li/x2x3"
 )
@@ -258,5 +260,84 @@ func TestAnOrdinaryDeliveryFailureIsNotReportedAsALoss(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 	if joined := strings.Join(admf.received(), "\n"); strings.Contains(joined, "x2DeliveryLost") {
 		t.Errorf("a connection failure was reported as lost product:\n%s", joined)
+	}
+}
+
+// startWithADMF starts interception reporting to admf, and returns the running subsystem.
+func startWithADMF(t *testing.T, admf *admfStub) *subsystem {
+	t.Helper()
+
+	cert, key, ca, _ := loopbackPKI(t)
+	t.Cleanup(func() { active.Store(nil) })
+
+	if err := Init(Config{
+		NEID:     testNEID,
+		X1Listen: testListenEphemeral,
+		MDF2:     testDestinationAddr,
+		Cert:     cert, Key: key, CACert: ca,
+		AdmfURL: admf.srv.URL, AdmfID: testADMFID,
+	}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	sub := active.Load()
+	if sub == nil {
+		t.Fatal("interception did not start")
+	}
+
+	return sub
+}
+
+// awaitReport waits for a report containing want, and returns everything received.
+func awaitReport(t *testing.T, admf *admfStub, want string) string {
+	t.Helper()
+
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if joined := strings.Join(admf.received(), "\n"); strings.Contains(joined, want) {
+			return joined
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	t.Fatalf("no report containing %q arrived:\n%s", want, strings.Join(admf.received(), "\n"))
+
+	return ""
+}
+
+// TestADroppedRunOfXIRIsIsReportedWithItsCount: a resend that does not land loses every unit
+// from the one the write stopped in to the end of its batch, and the library counts them. The
+// report must say how many, or the agency's gap is larger than this element's account of it.
+func TestADroppedRunOfXIRIsIsReportedWithItsCount(t *testing.T) {
+	admf := newADMFStub(t)
+	sub := startWithADMF(t, admf)
+	watcher := x1.NewDestinationWatcher(func() []x1.DestinationHealth { return nil }, sub.reporter, 0)
+
+	sub.reportDeliveryError(&x2x3.DeliveryError{
+		Lost: 5,
+		Err:  fmt.Errorf("%w: send to 10.0.60.122:42069", x2x3.ErrUnitDropped),
+	}, watcher)
+
+	if joined := awaitReport(t, admf, "x2DeliveryLost"); !strings.Contains(joined, "5 xIRIs") {
+		t.Errorf("the loss was reported without the number of xIRIs it cost:\n%s", joined)
+	}
+}
+
+// TestARecordThatCannotBeEncodedIsReportedAgainstItsWarrant: the NE-level report says only
+// that something did not encode, which is the signal an unreachable MDF2 also gives. Each
+// warrant the record was for must be told, with the record type, as the AMF does.
+func TestARecordThatCannotBeEncodedIsReportedAgainstItsWarrant(t *testing.T) {
+	admf := newADMFStub(t)
+	sub := startWithADMF(t, admf)
+
+	// A SUPI the record's own definition refuses: an IMSI is six to fifteen digits.
+	sub.deliverIRI([]types.InterceptTask{iriTask()}, [8]byte{}, nil, time.Now(),
+		iri.SMFPDUSessionRelease{SUPI: iri.IMSI("12"), PDUSessionID: 5})
+
+	joined := awaitReport(t, admf, "recordNotEncoded")
+	if !strings.Contains(joined, string(iriTask().XID)) {
+		t.Errorf("the encoding failure was not reported against the warrant it was for:\n%s", joined)
+	}
+	if !strings.Contains(joined, "SMFPDUSessionRelease") {
+		t.Errorf("the encoding failure did not name the record type:\n%s", joined)
 	}
 }
