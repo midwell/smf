@@ -13,11 +13,12 @@ import (
 // model.
 //
 // **A misspelled LI key is silently dropped, and the defaults it lands on are the dangerous
-// ones.** A typo'd `keepaliveRetainTasking` or `keepaliveTimeout` leaves the X1 keepalive procedure
-// on timers or a purge policy the operator did not choose, while the element looks healthy. A
-// typo'd `admfUrl` leaves the fault channel a no-op, so every condition this element is required to report goes nowhere — including the report
-// that would have said the configuration was wrong. In both cases the operator wrote the setting,
-// the element ignored it, and nothing anywhere says so.
+// ones.** A typo'd `keepaliveRetainTasking` or `keepaliveTimeout` leaves the X1 keepalive
+// procedure on timers or a purge policy the operator did not choose, while the element looks
+// healthy. A typo'd `admfUrl` leaves the fault channel a no-op, so every condition this element
+// is required to report goes nowhere — including the report that would have said the
+// configuration was wrong. In both cases the operator wrote the setting, the element ignored it,
+// and nothing anywhere says so.
 //
 // **Scoped to the `li` block, deliberately.** Decoding the whole configuration strictly would
 // refuse upstream keys this fork does not model, which is a different and much larger change: the

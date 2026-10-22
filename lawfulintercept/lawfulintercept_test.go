@@ -571,6 +571,15 @@ func TestSessionTargets(t *testing.T) {
 	if sessionTargets(types.InterceptTask{Targets: []types.TargetIdentifier{{Type: types.TargetSUPI, Value: "111111111111111"}}}, sc) {
 		t.Error("a non-matching SUPI must not match")
 	}
+	// All of a task's criteria must match (TS 103 221-1 table 6.2.1.2-1). This predicate decides
+	// the activation scan, a record's re-validation and whether a session is covered, so a task
+	// naming this SUPI and a GPSI the session does not present must not reach any of them.
+	if sessionTargets(types.InterceptTask{Targets: []types.TargetIdentifier{
+		{Type: types.TargetSUPI, Value: "262019876543210"},
+		{Type: types.TargetGPSI, Value: "4915100000000"},
+	}}, sc) {
+		t.Error("a task whose GPSI the session does not present matched on its SUPI alone")
+	}
 }
 
 // TestEstablishmentReportsTheRealRequestAndAccessType: both fields are mandatory

@@ -155,23 +155,16 @@ func (smf *SMF) Start() {
 	// Lawful Interception IRI-POI: start only when the opt-in Li config is
 	// present; silent otherwise.
 	if li := factory.SmfConfig.Configuration.Li; li != nil {
-		// The fail-safe window is passed on as the operator wrote it, and read inside
-		// Init. Reading it here meant refusing it here, and the refusal was a `return`
-		// from this function — which is not this subsystem's to make. It stopped every
-		// other subsystem too: PFCP, the service-based interface, registration with the
-		// network. The process then exited 0, so a mistyped duration in an optional
-		// block became a restart loop carrying a success code.
+		// The keepalive timers and the strict `li`-block decode's verdict are passed on as the
+		// operator wrote them and acted on inside Init. A refusal made here would be a return
+		// from this function, which stops every other subsystem too — PFCP, the service-based
+		// interface, registration with the network. Inside Init the refusal is scoped to
+		// interception, and the fault reporter exists by then, so the ADMF is told that this
+		// element is not intercepting.
 		//
-		// Inside Init the refusal is scoped to interception, and the fault reporter
-		// exists by then — so the ADMF is told that this element is not intercepting,
-		// which nothing here could have told it.
-		//
-		// Inject the PFCP session-modification hook the mid-session CC trigger
-		// needs. Done before Init mounts the X1 listener so the hook is in place
-		// before any tasking can arrive.
-		// The strict `li`-block decode's verdict, carried from the factory rather than acted
-		// on there. Same reasoning as the fail-safe window above: the refusal is scoped to
-		// interception here, and the fault reporter exists by then.
+		// Inject the PFCP session-modification hook the mid-session CC trigger needs. Done
+		// before Init mounts the X1 listener so the hook is in place before any tasking can
+		// arrive.
 		liBlockErr := factory.LiBlockError()
 		lawfulintercept.SetSessionModifier(producer.ModifySessionForLI)
 		// And the restart notification the adapter's PFCP handlers raise. It is a package
@@ -191,35 +184,7 @@ func (smf *SMF) Start() {
 		adapter.TriggerCC = lawfulintercept.TriggerCC
 		// And the answer to this element's own PFCP modifications, for the same reason.
 		adapter.LIModificationAnswered = lawfulintercept.ModificationAnswered
-		triggers := make([]lawfulintercept.UPFTrigger, 0, len(li.UPFTriggers))
-		for _, t := range li.UPFTriggers {
-			triggers = append(triggers, lawfulintercept.UPFTrigger{
-				NodeID: t.NodeID, X1URL: t.X1URL, NEID: t.NEID,
-			})
-		}
-		dests := make([]lawfulintercept.Destination, 0, len(li.Destinations))
-		for _, d := range li.Destinations {
-			dests = append(dests, lawfulintercept.Destination{
-				DID: d.DID, DeliveryType: d.DeliveryType, Address: d.Address,
-			})
-		}
-		if err := lawfulintercept.Init(lawfulintercept.Config{
-			BlockError: liBlockErr,
-			X1Listen:   li.X1Listen, MDF2: li.MDF2, NEID: li.NEID,
-			Cert: li.Cert, Key: li.Key, CACert: li.CACert,
-			MDF3: li.MDF3, UPFTriggers: triggers,
-			Destinations: dests,
-			AdmfURL:      li.AdmfURL, AdmfID: li.AdmfID, KeepaliveTimeout: li.KeepaliveTimeout,
-			KeepaliveTimeP1:        li.KeepaliveTimeP1,
-			KeepaliveTimeP3:        li.KeepaliveTimeP3,
-			KeepaliveRetainTasking: li.KeepaliveRetainTasking,
-			KeepaliveDisabled:      li.KeepaliveDisabled,
-			X2X3KeepaliveEnabled:   li.X2X3KeepaliveEnabled,
-			X2X3KeepaliveTimeP1:    li.X2X3KeepaliveTimeP1,
-			X2X3KeepaliveTimeP2:    li.X2X3KeepaliveTimeP2,
-			DeactivateAllTasks:     li.DeactivateAllTasks,
-			RemoveAllDestinations:  li.RemoveAllDestinations,
-		}); err != nil {
+		if err := lawfulintercept.Init(liConfig(li, liBlockErr)); err != nil {
 			// Do not name the subsystem or echo err (which carries LI-identifying
 			// text) on the general operator log: that would reveal to an unauthorized
 			// operator that this NE is LI-provisioned, which network-element-level
@@ -412,4 +377,38 @@ func (smf *SMF) Terminate(cancelServices context.CancelFunc, wg *sync.WaitGroup)
 	nfregistration.DeregisterNF()
 	wg.Wait()
 	logger.InitLog.Infoln("SMF terminated")
+}
+
+// liConfig maps the factory's li block onto the interception subsystem's configuration.
+func liConfig(li *factory.Li, blockErr error) lawfulintercept.Config {
+	triggers := make([]lawfulintercept.UPFTrigger, 0, len(li.UPFTriggers))
+	for _, t := range li.UPFTriggers {
+		triggers = append(triggers, lawfulintercept.UPFTrigger{
+			NodeID: t.NodeID, X1URL: t.X1URL, NEID: t.NEID,
+		})
+	}
+	dests := make([]lawfulintercept.Destination, 0, len(li.Destinations))
+	for _, d := range li.Destinations {
+		dests = append(dests, lawfulintercept.Destination{
+			DID: d.DID, DeliveryType: d.DeliveryType, Address: d.Address,
+		})
+	}
+
+	return lawfulintercept.Config{
+		BlockError: blockErr,
+		X1Listen:   li.X1Listen, MDF2: li.MDF2, NEID: li.NEID,
+		Cert: li.Cert, Key: li.Key, CACert: li.CACert,
+		MDF3: li.MDF3, UPFTriggers: triggers,
+		Destinations: dests,
+		AdmfURL:      li.AdmfURL, AdmfID: li.AdmfID, KeepaliveTimeout: li.KeepaliveTimeout,
+		KeepaliveTimeP1:        li.KeepaliveTimeP1,
+		KeepaliveTimeP3:        li.KeepaliveTimeP3,
+		KeepaliveRetainTasking: li.KeepaliveRetainTasking,
+		KeepaliveDisabled:      li.KeepaliveDisabled,
+		X2X3KeepaliveEnabled:   li.X2X3KeepaliveEnabled,
+		X2X3KeepaliveTimeP1:    li.X2X3KeepaliveTimeP1,
+		X2X3KeepaliveTimeP2:    li.X2X3KeepaliveTimeP2,
+		DeactivateAllTasks:     li.DeactivateAllTasks,
+		RemoveAllDestinations:  li.RemoveAllDestinations,
+	}
 }

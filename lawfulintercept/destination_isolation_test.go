@@ -56,7 +56,7 @@ func TestTheConfiguredEndpointServesAnUnnamedDestinationOnly(t *testing.T) {
 	// And a task whose named destinations do include an X2 endpoint delivers there, to
 	// that endpoint and to no other.
 	both := types.InterceptTask{
-		XID:      "44444444-4444-4444-8444-444444444444",
+		XID:      testXIDCovering,
 		Products: []types.ProductType{types.ProductIRI},
 		DIDs:     []string{"55555555-5555-4555-8555-555555555555"},
 		Deliveries: []types.DeliveryEndpoint{{
