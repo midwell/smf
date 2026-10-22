@@ -368,9 +368,6 @@ func newX1Server(st *store.Store, cfg Config, sub *subsystem) *x1.Server {
 	return x1.NewServer(st, cfg.NEID, opts...)
 }
 
-// Init starts the SMF LI IRI-POI: it loads the LI credentials, opens the X1
-// listener (mutual TLS), and prepares X2 delivery to the MDF2. Call it once at
-// SMF startup, only when LI is configured.
 // taskFaultInterval is how often the task-fault watcher samples, and taskFaultStop ends it.
 // Zero takes the X1 reporter's throttle interval and nil runs it for the life of the process;
 // only tests set them, so a watcher started by one test does not outlive it.
@@ -379,6 +376,9 @@ var (
 	taskFaultStop     <-chan struct{}
 )
 
+// Init starts the SMF LI IRI-POI: it loads the LI credentials, opens the X1
+// listener (mutual TLS), and prepares X2 delivery to the MDF2. Call it once at
+// SMF startup, only when LI is configured.
 func Init(cfg Config) error {
 	// Without an identifier for this network element, product would reach a mediation
 	// function that cannot attribute it to the element that produced it. Interception
