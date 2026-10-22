@@ -109,10 +109,17 @@ func TestSMFRecordsCarryTheServingNetwork(t *testing.T) {
 
 // The one uEEndpoint site that was genuinely missing. The other two records already
 // carried it; finding 3's prose named the wrong one.
+//
+// The modification record's uEEndpoint is the CHOICE itself in the module, not the
+// SEQUENCE OF the other records carry, so it must be one address — and must encode.
 func TestModificationCarriesTheUEEndpoint(t *testing.T) {
-	if got := smfModification(fullSession()).UEEndpoint; len(got) == 0 {
+	rec := smfModification(fullSession())
+	if rec.UEEndpoint == nil {
 		t.Error("SMFPDUSessionModification carries no uEEndpoint, though the SMF holds " +
 			"PDUAddress and reports it in the other session records")
+	}
+	if _, err := iri.EncodeXIRI(rec); err != nil {
+		t.Errorf("the modification record does not encode: %v", err)
 	}
 }
 

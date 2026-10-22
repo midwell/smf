@@ -125,6 +125,8 @@ var recordedConversions = map[string]iriConversion{
 	// Calls into li/iri rather than conversions.
 	"EncodeXIRI": {kind: built, note: "the encode entry point, which is where validateConstraints runs"},
 	"UEEndpoint": {kind: built, note: "builds the ueEndpoint CHOICE list, discriminating v4 from v6"},
+	"UEEndpointAddress": {kind: built, note: "builds the single UEEndpointAddress alternative " +
+		"SMFPDUSessionModification's uEEndpoint is, discriminating v4 from v6 as UEEndpoint does"},
 	"FiveGSMCause": {kind: carried, note: "INTEGER (0..255). **Not mapped, and the distinction is " +
 		"recorded rather than obvious**: the module gives the field an integer range, not an " +
 		"enumeration, so a receiver validates any octet and there is no second enumeration to " +

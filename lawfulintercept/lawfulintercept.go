@@ -1490,7 +1490,7 @@ func targetsOf(sc *smfctx.SMContext) []types.TargetIdentifier {
 	if v := afterPrefix(sc.Supi, "imsi-", "nai-"); v != "" {
 		ids = append(ids, types.TargetIdentifier{Type: types.TargetSUPI, Value: v})
 	}
-	if v := afterPrefix(sc.Pei, "imeisv-", "imei-"); v != "" {
+	if v := peiValue(sc.Pei); v != "" {
 		ids = append(ids, types.TargetIdentifier{Type: types.TargetPEI, Value: v})
 	}
 	if v := afterPrefix(sc.Gpsi, "msisdn-", "extid-"); v != "" {
@@ -1635,6 +1635,16 @@ func ueEndpoint(sc *smfctx.SMContext) []any {
 	return iri.UEEndpoint(sc.PDUAddress.Ip)
 }
 
+// ueEndpointAddress is the single-address form SMFPDUSessionModification's uEEndpoint takes:
+// the module makes it the UEEndpointAddress CHOICE itself, not the SEQUENCE OF the other
+// session records carry. Nil when no address has been assigned, as for ueEndpoint.
+func ueEndpointAddress(sc *smfctx.SMContext) any {
+	if sc == nil || sc.PDUAddress == nil {
+		return nil
+	}
+	return iri.UEEndpointAddress(sc.PDUAddress.Ip)
+}
+
 // smfStartOfInterception maps an SMContext to a TS 33.128
 // SMFStartOfInterceptionWithEstablishedPDUSession record (XIRIEvent [9]), emitted
 // when a warrant is activated for a UE whose PDU session is already up. Same shape
@@ -1674,7 +1684,7 @@ func smfModification(sc *smfctx.SMContext) iri.SMFPDUSessionModification {
 		GTPTunnelInfo:       gtpTunnelInfo(sc),
 		SUPIUnauthenticated: supiUnauthenticatedOf(sc),
 		RATType:             ratTypeOf(sc.RatType),
-		UEEndpoint:          ueEndpoint(sc),
+		UEEndpoint:          ueEndpointAddress(sc),
 		ServingNetwork:      servingNetworkOf(sc),
 	}
 }
@@ -1799,9 +1809,37 @@ func peiChoice(sc *smfctx.SMContext) any {
 		return iri.IMEISV(v)
 	}
 	if v, ok := strings.CutPrefix(sc.Pei, "imei-"); ok {
-		return iri.IMEI(v)
+		return iri.IMEI(imeiWithoutCheckDigit(v))
 	}
 	return nil
+}
+
+// peiValue is sc's PEI in the form X1 tasking names it: the IMEISV whole, and the IMEI as
+// fourteen digits.
+func peiValue(pei string) string {
+	if v, ok := strings.CutPrefix(pei, "imeisv-"); ok {
+		return v
+	}
+	if v, ok := strings.CutPrefix(pei, "imei-"); ok {
+		return imeiWithoutCheckDigit(v)
+	}
+	return ""
+}
+
+// imeiWithoutCheckDigit drops the check digit from a fifteen-digit IMEI.
+//
+// The SMF receives the PEI from the AMF in TS 29.571 form, "imei-" and fifteen digits, because
+// NAS carries the IMEI that way: TS 24.008 clause 10.5.1.4 says "the IMEI is composed of 15
+// digits", the last being the check digit TS 23.003 computes over the other fourteen. TS 33.128
+// defines IMEI as NumericString (SIZE(14)) and TS 103 221-1's peiImei as fourteen digits, so
+// both the record and the target identifier X1 tasking names are the TAC and serial number
+// alone. A value of any other length is passed through for the encoder to refuse, rather than
+// guessed at. The AMF carries the same function.
+func imeiWithoutCheckDigit(v string) string {
+	if len(v) == 15 {
+		return v[:14]
+	}
+	return v
 }
 
 // gpsiChoice returns sc's GPSI as the iri "gpsi" CHOICE arm (MSISDN), or nil.
