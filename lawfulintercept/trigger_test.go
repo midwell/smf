@@ -3629,3 +3629,61 @@ func TestAFaultyTriggerIsAnsweredAndNotOnlyPushed(t *testing.T) {
 		t.Errorf("a withdrawn warrant still answers with a fault: %+v", got)
 	}
 }
+
+// TestAnUnansweredActivationIsReplayedUnchanged: an activation that went unanswered may
+// have been applied, so it is resent exactly as it was. A POI holding the identical task
+// acknowledges the replay (TS 103 221-1 table 6.2.1.1-2 makes only a *different* task under
+// a held XID an error); a resend carrying re-provisioned destinations would be that
+// different task, refused with 2010 while the POI went on holding the first.
+func TestAnUnansweredActivationIsReplayedUnchanged(t *testing.T) {
+	poi := newFakePOI(t)
+	s := triggerSubsystem(t, poi)
+	s.taskReporter = &recordingTaskReporter{}
+	s.triggers.sleep = func(time.Duration) { poi.setMisname("", "") }
+
+	poi.setMisname("some-other-upf", "ns1:ActivateTaskRequest")
+
+	s.installFor("session-ref-1", []types.InterceptTask{{
+		XID:      testXIDPrimary,
+		Products: []types.ProductType{types.ProductCC},
+	}}, []upfSession{{node: upfNode(trigNodeA), seid: 0x2632898145f4d191}}, 7)
+
+	dids := poi.elements("ActivateTaskRequest", "dId")
+	if n := poi.countMessages("ActivateTaskRequest"); n != 2 {
+		t.Fatalf("sent %d activations, want the original and one replay", n)
+	}
+	if len(dids) != 2 || dids[0] != dids[1] {
+		t.Errorf("the replay named destinations %v, want the original's unchanged", dids)
+	}
+	if n := poi.countMessages("CreateDestinationRequest"); n != 1 {
+		t.Errorf("re-provisioned destinations %d times, want once: an unanswered activation is "+
+			"replayed, not rebuilt", n)
+	}
+	// Still unanswered, so the POI may hold it: withdrawn, not forgotten.
+	awaitMessages(t, poi, "DeactivateTaskRequest", 1)
+}
+
+// TestAnActivationAnsweredXIDExistsIsWithdrawnNotReleased: 2010 says the POI holds a
+// different task under this XID, which is the opposite of a refusal to hold anything.
+// Releasing the claim would leave that task installed and untracked; it is withdrawn.
+func TestAnActivationAnsweredXIDExistsIsWithdrawnNotReleased(t *testing.T) {
+	poi := newFakePOI(t)
+	s := triggerSubsystem(t, poi)
+	s.taskReporter = &recordingTaskReporter{}
+
+	poi.mu.Lock()
+	poi.refuseOn = "ns1:ActivateTaskRequest"
+	poi.refuseCode = x1ErrXIDExists
+	poi.mu.Unlock()
+
+	s.installFor("session-ref-1", []types.InterceptTask{{
+		XID:      testXIDPrimary,
+		Products: []types.ProductType{types.ProductCC},
+	}}, []upfSession{{node: upfNode(trigNodeA), seid: 0x2632898145f4d191}}, 7)
+
+	awaitMessages(t, poi, "DeactivateTaskRequest", 1)
+	awaitPending(t, s.triggers, 0)
+	if n := poi.countMessages("ActivateTaskRequest"); n != 1 {
+		t.Errorf("sent %d activations, want one: 2010 is not a lost destination to re-provision", n)
+	}
+}

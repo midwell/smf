@@ -1349,6 +1349,10 @@ func (s *subsystem) triggerCC(sc *smfctx.SMContext) {
 	}()
 }
 
+// x1ErrXIDExists is TS 103 221-1 table 6.7-3's "XID already exists on NE": the POI holds
+// a different task under the XID an ActivateTask named.
+const x1ErrXIDExists = 2010
+
 // installTriggers performs the X1 exchanges off the signalling path. Every
 // trigger it is given has already been claimed in the registry by triggerCC, so
 // the withdrawal path can see it even before it exists at the POI.
@@ -1371,18 +1375,33 @@ func (s *subsystem) installTriggers(planned []plannedTrigger) {
 		p.trigger.DIDs = dids
 
 		err = p.endpoint.req.ActivateTask(p.trigger)
-		if err != nil {
+		var refused *x1.RequestError
+		// unanswered records that an attempt went unanswered, after which the POI may
+		// hold the trigger whatever a later attempt says.
+		unanswered := false
+		switch {
+		case err == nil:
+		case errors.As(err, &refused) && refused.Code != x1ErrXIDExists:
 			// A refusal may mean the POI has lost the destinations we provisioned —
 			// it restarts independently of us, and its destination registry does not
 			// survive that. Re-provision and try once more before concluding the
 			// interception cannot be arranged: the alternative is content dropped
-			// at the POI for as long as this process happens to live.
+			// at the POI for as long as this process happens to live. A refused task
+			// is not held, so the retry's new destinations cannot collide with it.
 			p.endpoint.forgetDestination()
 
 			if again, retryErr := s.ensureDestinations(p.endpoint, p.addresses); retryErr == nil {
 				p.trigger.DIDs = again
 				err = p.endpoint.req.ActivateTask(p.trigger)
 			}
+		case !errors.As(err, &refused):
+			// No answer: the POI may hold the trigger. Resend it unchanged — a POI
+			// holding the identical task acknowledges the replay, one that never
+			// received it activates it — rather than with re-provisioned destinations,
+			// which would be a different task under an XID the POI may hold, refused
+			// with 2010 (TS 103 221-1 table 6.2.1.1-2).
+			unanswered = true
+			err = p.endpoint.req.ActivateTask(p.trigger)
 		}
 
 		if err != nil {
@@ -1403,8 +1422,13 @@ func (s *subsystem) installTriggers(planned []plannedTrigger) {
 			// warrant is revoked. So it is withdrawn instead, durably, and the POI's
 			// own "XID not held" answer completes that withdrawal at once in the case
 			// where it never received the activation at all.
-			var refused *x1.RequestError
-			if errors.As(err, &refused) {
+			//
+			// 2010, "XID already exists on NE", is not a refusal to hold anything: the
+			// POI holds a different task under this XID, so it is withdrawn like a
+			// non-answer rather than released. So is any refusal that follows an
+			// unanswered attempt: the first may have been applied, and a refused replay
+			// does not say it was not.
+			if errors.As(err, &refused) && refused.Code != x1ErrXIDExists && !unanswered {
 				s.triggers.release(p.key)
 			} else if w, owned := s.triggers.takeFailedActivation(p.key, p.trigger.XID); owned {
 				// On its own goroutine: the retry loop runs until the POI
