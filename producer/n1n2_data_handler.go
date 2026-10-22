@@ -232,7 +232,7 @@ func HandleUpdateN1Msg(txn *transaction.Transaction, response *models.UpdateSmCo
 			} else {
 				smContext.SubPduSessLog.Errorf("Invalid PDU Session ID")
 				// Same cause key the reject is built from, so the record and the
-				// wire cannot disagree (design D7).
+				// wire cannot disagree.
 				lawfulintercept.ReportReleaseReject(smContext, smferrors.ErrorCause["InvalidPDUSessionIdentity"])
 				buildPDUSessionReleaseReject(smContext, response, pduSessIDRelReq, "InvalidPDUSessionIdentity")
 				smContext.ChangeState(context.SmStateModify)

@@ -712,7 +712,7 @@ func ReportReleaseReject(sc *smfctx.SMContext, cause uint8) {
 
 // reportUnsuccessful is the shared body. It cannot fail the procedure it reports:
 // every step is a read, deliverIRI swallows its own errors, and nothing here
-// returns to the caller (design D3). That matters more here than elsewhere —
+// returns to the caller. That matters more here than elsewhere —
 // these hooks sit on paths that are already failing, which is where error
 // handling is least exercised.
 func reportUnsuccessful(sc *smfctx.SMContext, procedure iri.SMFFailedProcedureType, cause uint8) {
@@ -1099,7 +1099,7 @@ func (s *subsystem) reportDeactivation(task types.InterceptTask) {
 // and finding out is the work — so what moves is the whole of it, not its cost.
 //
 // What must not move is the instant. It is the activation's, not the scan's, so it is
-// still taken here (design D5); reading it inside the goroutine would date every
+// still taken here; reading it inside the goroutine would date every
 // record by when this element got round to the session.
 // underAuthority says whether this scan *produces product*, and therefore whether the
 // warrant has to still authorise each session at the moment it is reached.
@@ -1366,8 +1366,8 @@ func (s *subsystem) deliverIRI(tasks []types.InterceptTask, corr [8]byte, subjec
 		// The number is taken here, per record *generated* for this task, and not below
 		// per record delivered. That ordering is deliberate twice over: a task resolving
 		// to no destination therefore consumes a number nobody receives, which is
-		// harmless because nobody is receiving a stream to see a gap in (design D3
-		// accepts the same effect for a destination added mid-task); and moving the call
+		// harmless because nobody is receiving a stream to see a gap in (a destination
+		// added mid-task sees the same effect, and is accepted for it); and moving the call
 		// inside the destination loop would number each destination separately, which is
 		// the per-connection numbering clause 5.3.9 forbids.
 		attrs := s.ids.Attributes(xid, corr, at,

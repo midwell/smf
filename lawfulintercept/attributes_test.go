@@ -112,8 +112,9 @@ func attrValue(t *testing.T, pdu *x2x3.PDU, typ uint16) []byte {
 	return nil
 }
 
-// TestInitRefusesWithoutAnElementIdentifier is design D9 for this POI: the refusal is
-// a returned error, so interception does not start and the SMF keeps serving sessions.
+// TestInitRefusesWithoutAnElementIdentifier: an element that cannot say which network
+// function produced a record does not deliver one. The refusal is a returned error, so
+// interception does not start and the SMF keeps serving sessions.
 func TestInitRefusesWithoutAnElementIdentifier(t *testing.T) {
 	if err := Init(Config{X1Listen: testListenEphemeral}); !errors.Is(err, errNoElementIdentifier) {
 		t.Errorf("Init without a network element identifier returned %v, want errNoElementIdentifier", err)

@@ -826,7 +826,7 @@ func HandlePDUSessionSMContextRelease(eventData any) error {
 		errResponse := models.NewUpdateSmContext400Response()
 		errResponse.SetJsonData(*jsonData)
 		// The reject carries a hardcoded 5GSM cause; report the same value so the
-		// record cannot disagree with the wire (design D7).
+		// record cannot disagree with the wire.
 		liReportReleaseReject(smContext, nasMessage.Cause5GSMRequestRejectedUnspecified)
 		if buf, err := smf_context.BuildGSMPDUSessionReleaseReject(smContext); err != nil {
 			smContext.SubPduSessLog.Errorf("PDUSessionSMContextRelease, build GSM PDUSessionReleaseReject failed: %+v", err)
@@ -862,7 +862,7 @@ func HandlePDUSessionSMContextRelease(eventData any) error {
 		errResponse := models.NewUpdateSmContext400Response()
 		errResponse.SetJsonData(*jsonData)
 		// The reject carries a hardcoded 5GSM cause; report the same value so the
-		// record cannot disagree with the wire (design D7).
+		// record cannot disagree with the wire.
 		liReportReleaseReject(smContext, nasMessage.Cause5GSMRequestRejectedUnspecified)
 		if buf, err := smf_context.BuildGSMPDUSessionReleaseReject(smContext); err != nil {
 			smContext.SubPduSessLog.Errorf("PDUSessionSMContextRelease, build GSM PDUSessionReleaseReject failed: %+v", err)

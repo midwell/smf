@@ -144,7 +144,7 @@ type conversionSite struct {
 // scanIRIConversions walks every non-test Go file in this module that imports `li/iri` and
 // returns each conversion whose argument is not one of that package's own constants.
 //
-// **The whole module, not just this package.** D5 places the check beside the conversions, and
+// **The whole module, not just this package.** The check belongs beside the conversions, and
 // this package is where they all are — but `amf/ngap` imports `li/iri` too, and a conversion
 // added in a sibling package would be invisible to a scan of one directory. Widening it costs a
 // directory walk and closes that by construction.

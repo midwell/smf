@@ -970,8 +970,8 @@ func unsuccessfulSM(t *testing.T, capture *captureSender) wireRecord {
 	return rec
 }
 
-// TestUnsuccessfulProcedureReportsRefusedEstablishment covers task 3.1 for the
-// sixteen establishment paths: a refused session for a tasked target produces a
+// TestUnsuccessfulProcedureReportsRefusedEstablishment covers the sixteen
+// establishment paths: a refused session for a tasked target produces a
 // record naming the procedure, the cause and the initiator.
 func TestUnsuccessfulProcedureReportsRefusedEstablishment(t *testing.T) {
 	capture := &captureSender{}
@@ -1032,7 +1032,7 @@ func TestUnsuccessfulProcedureSilentForUntaskedSubscriber(t *testing.T) {
 	}
 }
 
-// TestUnsuccessfulProcedureCannotWorsenTheFailure covers task 3.2 and design D3.
+// TestUnsuccessfulProcedureCannotWorsenTheFailure: reporting a failure must not add one.
 // These hooks sit on paths that are already failing, which is where error handling
 // is least exercised — so the reporter must survive a nil context, a delivery that
 // errors, and no subsystem at all, and must never panic or return anything the
@@ -1060,7 +1060,7 @@ func TestUnsuccessfulProcedureCannotWorsenTheFailure(t *testing.T) {
 	// or had a value the rejection path could propagate.
 }
 
-// TestUnsuccessfulProcedureCauseMatchesTheReject covers task 3.3: the record's
+// TestUnsuccessfulProcedureCauseMatchesTheReject: the record's
 // failureCause is whatever the reject put on the wire, read from the same table.
 //
 // The assertion is agreement, not distinctness — most keys share

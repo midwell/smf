@@ -1438,7 +1438,7 @@ func TestKeepalivesFollowTaskingRatherThanConfiguration(t *testing.T) {
 	}
 }
 
-// TestKeepalivesWaitForReconciliation is the inversion D3 exists for. A restarted
+// TestKeepalivesWaitForReconciliation is the inversion this ordering exists for. A restarted
 // SMF is *present*, so the POI's fail-safe will not act while it is being kept
 // alive — and until reconciliation completes, this process cannot name what that
 // POI holds and therefore could never withdraw it, not even when the warrant
@@ -1767,13 +1767,11 @@ func TestAKeepaliveAnsweredByTheWrongElementIsReported(t *testing.T) {
 	}
 }
 
-// TestAnUnattributableAnswerKeepsTheWithdrawalPending is task 3.8 of
-// `fix-li-x1-response-binding`, asserted rather than assumed.
+// TestAnUnattributableAnswerKeepsTheWithdrawalPending is asserted rather than assumed.
 //
 // Validating responses turns silent successes on the withdrawal path into visible
-// failures, and this change was sequenced behind `fix-li-withdrawal-durability`
-// precisely because a visible failure used to be discarded as silently as the
-// success was. So: a POI that acknowledges under the wrong NE identifier is
+// failures, and that is only safe because a withdrawal now survives a failed
+// attempt: a visible failure used to be discarded as silently as the success was. So: a POI that acknowledges under the wrong NE identifier is
 // refused, and the withdrawal it refused must stay pending and keep being retried
 // rather than being forgotten.
 func TestAnUnattributableAnswerKeepsTheWithdrawalPending(t *testing.T) {
@@ -1814,10 +1812,9 @@ func TestAnUnattributableAnswerKeepsTheWithdrawalPending(t *testing.T) {
 	}
 }
 
-// TestAWithdrawalStuckOnOurOwnRefusalIsDistinguishable is task 3.9, and it is the
-// one that decides whether an operator looks in the right place.
+// TestAWithdrawalStuckOnOurOwnRefusalIsDistinguishable is the test that decides whether an operator looks in the right place.
 //
-// A systematic validation mismatch is the failure mode this change introduces: the
+// A systematic validation mismatch is the failure mode validating responses introduces: the
 // pending entry never clears, the retries never stop, and because pending entries
 // keep their endpoint's keepalives flowing, the POI's own fail-safe cannot reclaim
 // the tasking either. Both remedies are held open by the same condition. Reported
