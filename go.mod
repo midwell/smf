@@ -65,4 +65,4 @@ require (
 	google.golang.org/protobuf v1.36.12 // indirect
 )
 
-replace github.com/omec-project/util => github.com/midwell/util v0.0.0-20261022210211-8cd02a43048e
+replace github.com/omec-project/util => github.com/midwell/util v0.0.0-20261022215033-4559b956fa50
