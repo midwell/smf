@@ -105,7 +105,7 @@ func scanFixture(t *testing.T, task types.InterceptTask, sessions int) (*subsyst
 
 		// And a PDU session type, which is the third mandatory member this fixture was
 		// missing. The two above were found by the record silently not being delivered;
-		// this one is refused by li/iri since v0.9.9, because pDUSessionType is mandatory
+		// this one is refused by li/iri, because pDUSessionType is mandatory
 		// in this record and its enumeration has no zero — so a session left at the Go
 		// zero value produced a record a conformant mediation function discards.
 		//
@@ -114,6 +114,10 @@ func scanFixture(t *testing.T, task types.InterceptTask, sessions int) (*subsyst
 		// request outright while SelectedPDUSessionType is still 0. So an address without
 		// a type is a session the SMF cannot produce, and the fixture was describing one.
 		sc.SelectedPDUSessionType = nasMessage.PDUSessionTypeIPv4
+
+		// And a DNN: the record's dNN is a mandatory string, and li/iri refuses an empty one
+		// because it names nothing. Every established session has one.
+		sc.Dnn = "internet"
 
 		// A default data path with a serving UPF, because the correlation the record
 		// carries is that UPF's PFCP session id, and a session without one is deferred
