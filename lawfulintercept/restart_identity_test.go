@@ -144,7 +144,7 @@ func TestARecognisedRestartIsReported(t *testing.T) {
 	s := namedTriggerSubsystem(t, poi, "upf", trigNodeA)
 
 	admf := newADMFStub(t)
-	s.reporter = x1.NewReporter(admf.srv.URL, testADMFID, testNEID, nil)
+	s.reporter = x1.NewReporter(admf.srv.URL, testADMFID, testNEID, admf.clientTLS())
 
 	active.Store(s)
 	t.Cleanup(func() { active.Store(nil) })

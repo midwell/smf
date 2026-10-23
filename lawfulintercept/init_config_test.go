@@ -4,104 +4,13 @@
 package lawfulintercept
 
 import (
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
-	"crypto/x509"
-	"crypto/x509/pkix"
-	"encoding/pem"
 	"errors"
-	"io"
-	"math/big"
-	"net/http"
-	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
 	"github.com/omec-project/util/li/x1"
 )
-
-// liPKI writes a throwaway LI certificate, key and trust anchor, and returns their
-// paths. Init loads credentials before it reads anything else, so a test that wants to
-// reach the configuration checks has to get past mtls.Load first.
-func liPKI(t *testing.T) (certPath, keyPath, caPath string) {
-	t.Helper()
-
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	tmpl := &x509.Certificate{
-		SerialNumber:          big.NewInt(1),
-		Subject:               pkix.Name{CommonName: testNEID},
-		NotBefore:             time.Now().Add(-time.Hour),
-		NotAfter:              time.Now().Add(time.Hour),
-		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
-		BasicConstraintsValid: true,
-		IsCA:                  true,
-	}
-	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	keyDER, err := x509.MarshalECPrivateKey(key)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	dir := t.TempDir()
-	certPath = filepath.Join(dir, "tls.crt")
-	keyPath = filepath.Join(dir, "tls.key")
-	caPath = filepath.Join(dir, "ca.crt")
-
-	write := func(path, blockType string, der []byte) {
-		if err := os.WriteFile(path, pem.EncodeToMemory(&pem.Block{Type: blockType, Bytes: der}), 0o600); err != nil {
-			t.Fatal(err)
-		}
-	}
-	write(certPath, "CERTIFICATE", der)
-	write(keyPath, "EC PRIVATE KEY", keyDER)
-	write(caPath, "CERTIFICATE", der)
-
-	return certPath, keyPath, caPath
-}
-
-// admfStub accepts NE issue reports and records their bodies.
-type admfStub struct {
-	srv *httptest.Server
-
-	mu     sync.Mutex
-	bodies []string
-}
-
-func newADMFStub(t *testing.T) *admfStub {
-	t.Helper()
-
-	a := &admfStub{}
-	a.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, _ := io.ReadAll(r.Body) //nolint:errcheck // test handler
-
-		a.mu.Lock()
-		a.bodies = append(a.bodies, string(body))
-		a.mu.Unlock()
-
-		w.WriteHeader(http.StatusOK)
-	}))
-	t.Cleanup(a.srv.Close)
-
-	return a
-}
-
-func (a *admfStub) received() []string {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
-	return append([]string(nil), a.bodies...)
-}
 
 // TestUnreadableKeepaliveWindowStopsInterceptionAndTellsTheADMF is the property that
 // makes this refusal better than the one it replaces.

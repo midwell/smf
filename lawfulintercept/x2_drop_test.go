@@ -4,19 +4,9 @@
 package lawfulintercept
 
 import (
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
 	"crypto/tls"
-	"crypto/x509"
-	"crypto/x509/pkix"
-	"encoding/pem"
 	"errors"
 	"fmt"
-	"math/big"
-	"net"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -27,56 +17,17 @@ import (
 	"github.com/omec-project/util/li/x2x3"
 )
 
-// loopbackPKI is liPKI with an IP SAN, so a stub mediation function on the loopback
-// can present the same certificate and be *verified* rather than merely trusted. The
-// distinction is the whole point of this test: a peer that fails the handshake is
-// unreachable, and what has to be reproduced here is a peer that is reachable.
+// loopbackPKI is liPKI with the key pair as well, so a stub mediation function on the
+// loopback can present the same certificate — which carries an IP SAN — and be *verified*
+// rather than merely trusted. The distinction is the whole point of this test: a peer that
+// fails the handshake is unreachable, and what has to be reproduced here is a peer that is
+// reachable.
 func loopbackPKI(t *testing.T) (certPath, keyPath, caPath string, pair tls.Certificate) {
 	t.Helper()
 
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	tmpl := &x509.Certificate{
-		SerialNumber:          big.NewInt(1),
-		Subject:               pkix.Name{CommonName: "mdf2"},
-		NotBefore:             time.Now().Add(-time.Hour),
-		NotAfter:              time.Now().Add(time.Hour),
-		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
-		BasicConstraintsValid: true,
-		IsCA:                  true,
-		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
-	}
-	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	keyDER, err := x509.MarshalECPrivateKey(key)
-	if err != nil {
-		t.Fatal(err)
-	}
+	certPath, keyPath, caPath = liPKI(t)
 
-	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
-	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
-
-	dir := t.TempDir()
-	certPath = filepath.Join(dir, "tls.crt")
-	keyPath = filepath.Join(dir, "tls.key")
-	caPath = filepath.Join(dir, "ca.crt")
-	for path, body := range map[string][]byte{certPath: certPEM, keyPath: keyPEM, caPath: certPEM} {
-		if err := os.WriteFile(path, body, 0o600); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	pair, pairErr := tls.X509KeyPair(certPEM, keyPEM)
-	if pairErr != nil {
-		t.Fatal(pairErr)
-	}
-
-	return certPath, keyPath, caPath, pair
+	return certPath, keyPath, caPath, liTrust(t).pair
 }
 
 // slowMDF2 completes the TLS handshake and then never reads. That is precisely the

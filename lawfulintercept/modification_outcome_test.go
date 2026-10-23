@@ -64,7 +64,7 @@ func outcomeFixture(t *testing.T) (*subsystem, *admfStub, func() int) {
 		store:    store.New(),
 		neID:     testNEID,
 		ids:      x2x3.NewIdentity(testNEID, smfInterceptionPoint),
-		reporter: x1.NewReporter(admf.srv.URL, testADMFID, testNEID, nil),
+		reporter: x1.NewReporter(admf.srv.URL, testADMFID, testNEID, admf.clientTLS()),
 	}
 	waitForScans(t, sub)
 
