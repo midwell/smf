@@ -146,8 +146,18 @@ func TestProductDroppedByAFullQueueIsReported(t *testing.T) {
 	s := sub.senderFor(mdf2)
 
 	// Comfortably past the queue's 1024, offered faster than a peer that never reads
-	// can take them.
-	pdu := &x2x3.PDU{Type: x2x3.PDUTypeX2, Payload: make([]byte, 512)}
+	// can take them. A PDU the framing accepts, as production builds one: a PDU Marshal
+	// refuses never reaches the peer, so the destination would read reachable because
+	// nothing was ever written to it, not because a slow peer was taking product.
+	pdu := &x2x3.PDU{
+		Type:          x2x3.PDUTypeX2,
+		PayloadFormat: x2x3.PayloadFormat3GPP33128,
+		Direction:     x2x3.DirectionNotApplicable,
+		Payload:       make([]byte, 512),
+	}
+	if _, err := pdu.Marshal(); err != nil {
+		t.Fatalf("the test PDU does not frame: %v", err)
+	}
 	for range 8000 {
 		//nolint:errcheck // enqueueing cannot fail in a way this test acts on
 		_ = s.Send(pdu)

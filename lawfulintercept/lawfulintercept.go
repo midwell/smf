@@ -258,13 +258,30 @@ func (s *subsystem) destinationUnreachable(addr string) bool {
 func (s *subsystem) destinationsInUse() []string {
 	var addrs []string
 	for _, t := range s.store.Snapshot() {
-		if !t.WantsProduct(types.ProductIRI) {
-			continue
-		}
-		addrs = append(addrs, s.x2Destinations(t)...)
+		addrs = append(addrs, s.iriDestinations(t)...)
 	}
 
 	return addrs
+}
+
+// iriDestinations is where t's xIRI goes, and nothing for a task that wants none. A task
+// ordering only content is triggered at the UPF and delivers no xIRI from here, so the
+// configured MDF2 is not one of its destinations even though it names none of its own.
+func (s *subsystem) iriDestinations(t types.InterceptTask) []string {
+	if !t.WantsProduct(types.ProductIRI) {
+		return nil
+	}
+	return s.x2Destinations(t)
+}
+
+// x2Health is what the destination watcher samples: the X2 destinations the tasking delivers
+// xIRI to, each with its reachability. It resolves through iriDestinations, the same question
+// destinationsInUse asks, so the configured MDF2 serving a task that named no DID is watched,
+// and an MDF2 no task delivers xIRI to is not: watched for a content-only task, an MDF2 whose
+// last delivery failed was reported unreachable for as long as that task lived, while the
+// status answer said nothing was in use.
+func (s *subsystem) x2Health(unreachableAt func(addr string) bool) []x1.DestinationHealth {
+	return x1.DestinationHealthOf(s.store.Snapshot(), types.DeliveryX2, s.iriDestinations, unreachableAt)
 }
 
 // active holds the running subsystem, or nil when LI is not configured.
@@ -521,11 +538,7 @@ func Init(cfg Config) error {
 	// questions.
 	if reporter != nil {
 		watcher = x1.NewDestinationWatcher(func() []x1.DestinationHealth {
-			// x2Destinations, not DeliveryAddresses: it is what delivery resolves, so
-			// the configured MDF2 serving a task that named no DID is watched too.
-			return x1.DestinationHealthOf(sub.store.Snapshot(), types.DeliveryX2,
-				sub.x2Destinations,
-				func(addr string) bool { return pool.UnreachableAt(addr) })
+			return sub.x2Health(pool.UnreachableAt)
 		}, reporter, 0)
 		go watcher.Watch(nil)
 	}
@@ -1485,7 +1498,7 @@ func (s *subsystem) deliverIRI(tasks []types.InterceptTask, corr [8]byte, subjec
 // refuses a task naming an identifier it cannot resolve with 2040, and one whose named
 // destinations give no X2 endpoint while its deliveryType orders xIRI with 3040 (TS 103
 // 221-1 clause 6.2.1.2), at activation and modification alike, and every caller asks only
-// for a task that wants xIRI. The branch stays as the backstop: removed, the same task
+// for a task that wants xIRI (iriDestinations, deliverIRI). The branch stays as the backstop: removed, the same task
 // would be served by the configured MDF2, which is the disclosure rather than a gap.
 func (s *subsystem) x2Destinations(t types.InterceptTask) []string {
 	if addrs := t.DeliveryAddresses(types.DeliveryX2); len(addrs) > 0 {
