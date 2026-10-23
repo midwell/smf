@@ -51,14 +51,14 @@ func TestSMFRecordsCarryTheAMFIdentity(t *testing.T) {
 
 	for _, tc := range []struct {
 		record string
-		got    iri.AMFID
+		got    *iri.AMFID
 	}{
 		{testRecEstablishment, smfEstablishment(sc).AMFID},
 		{testRecStartOfInterception, smfStartOfInterception(sc).AMFID},
 		{testRecUnsuccessful, smfUnsuccessful(sc, iri.SMFFailedPDUSessionEstablishment, 26).AMFID},
 	} {
 		t.Run(tc.record, func(t *testing.T) {
-			if tc.got != want {
+			if tc.got == nil || *tc.got != want {
 				t.Errorf("aMFID = %+v, want %+v. It is the AMF region/set/pointer of TS 23.003 "+
 					"clause 2.10.1, decomposed from the GUAMI the AMF sent on N11 — not "+
 					"ServingNfId, which is an instance UUID and yields no AMF identifier",
@@ -166,8 +166,8 @@ func TestSMFConditionalsAreAbsentWhenUnheld(t *testing.T) {
 			"an authentication status for an identity the record does not carry",
 			*est.SUPIUnauthenticated)
 	}
-	if est.AMFID != (iri.AMFID{}) {
-		t.Errorf("aMFID present with no GUAMI: %+v", est.AMFID)
+	if est.AMFID != nil {
+		t.Errorf("aMFID present with no GUAMI: %+v", *est.AMFID)
 	}
 	if est.RATType != 0 {
 		t.Errorf("rATType = %d, want absent", est.RATType)
@@ -180,9 +180,21 @@ func TestSMFConditionalsAreAbsentWhenUnheld(t *testing.T) {
 	for _, bad := range []string{"", "c8004", "c800433", "zzzzzz"} {
 		sc := fullSession()
 		sc.Guami.AmfId = bad
-		if got := smfEstablishment(sc).AMFID; got != (iri.AMFID{}) {
-			t.Errorf("AmfId %q yielded %+v; a wrong AMF identity is worse than a missing one", bad, got)
+		if got := smfEstablishment(sc).AMFID; got != nil {
+			t.Errorf("AmfId %q yielded %+v; a wrong AMF identity is worse than a missing one", bad, *got)
 		}
+	}
+}
+
+// An AMF identifier of all zeros is region 0, set 0, pointer 0 — a real identity, not a
+// missing one. It is reported, where a value type would have encoded it as absent.
+func TestAnAllZeroAMFIdentityIsReported(t *testing.T) {
+	sc := fullSession()
+	sc.Guami.AmfId = "000000"
+
+	got := smfEstablishment(sc).AMFID
+	if got == nil || *got != (iri.AMFID{}) {
+		t.Errorf("AmfId \"000000\" yielded %+v, want the all-zero identity", got)
 	}
 }
 
@@ -224,7 +236,7 @@ func TestTheN11RequestSuppliesTheAMFIdentityAndAuthenticationStatus(t *testing.T
 	est := smfEstablishment(sc)
 
 	want := iri.AMFID{AMFRegionID: 0xC8, AMFSetID: 1, AMFPointer: 3}
-	if est.AMFID != want {
+	if est.AMFID == nil || *est.AMFID != want {
 		t.Errorf("aMFID = %+v, want %+v — the AMF sent a GUAMI on N11 and the record does not "+
 			"carry it, so SetCreateData is dropping it again", est.AMFID, want)
 	}

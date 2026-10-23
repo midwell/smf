@@ -1475,15 +1475,18 @@ func (s *subsystem) deliverIRI(tasks []types.InterceptTask, corr [8]byte, subjec
 // list — and they are different facts. A task that named nothing is a gap the
 // provisioning function left, and the configured endpoint fills it, which is the case
 // every deployment predating that requirement is in. A task that named destinations and
-// yielded no X2 endpoint is an assertion this element cannot honour as stated: the live
-// shape is a warrant naming an X3-only destination, where substituting the configured
-// MDF2 sends an agency's signalling to an endpoint the warrant never named. On an element
-// serving several agencies it is worse than a gap — the product goes to whichever
-// endpoint local configuration happens to name, and li-security-isolation admits no
-// exception for it.
+// yielded no X2 endpoint is an assertion this element cannot honour as stated:
+// substituting the configured MDF2 sends an agency's signalling to an endpoint the
+// warrant never named. On an element serving several agencies it is worse than a gap —
+// the product goes to whichever endpoint local configuration happens to name, and
+// li-security-isolation admits no exception for it.
 //
-// So the fallback keys on len(t.DIDs). A task naming an identifier this element cannot
-// resolve at all no longer reaches here: x1 refuses it at activation.
+// So the fallback keys on len(t.DIDs). Neither failure reaches here from X1 any more: x1
+// refuses a task naming an identifier it cannot resolve with 2040, and one whose named
+// destinations give no X2 endpoint while its deliveryType orders xIRI with 3040 (TS 103
+// 221-1 clause 6.2.1.2), at activation and modification alike, and every caller asks only
+// for a task that wants xIRI. The branch stays as the backstop: removed, the same task
+// would be served by the configured MDF2, which is the disclosure rather than a gap.
 func (s *subsystem) x2Destinations(t types.InterceptTask) []string {
 	if addrs := t.DeliveryAddresses(types.DeliveryX2); len(addrs) > 0 {
 		return addrs
@@ -1637,19 +1640,19 @@ func servingNetworkOf(sc *smfctx.SMContext) iri.SMFServingNetwork {
 // AMF identifier at all. The AMF sends its GUAMI on N11 and SetCreateData retains it.
 //
 // AmfId is six hex digits — region (8 bits), set (10) and pointer (6) — and anything
-// else yields the zero value, which encodes as absent rather than as a guess about
-// which AMF served the session.
-func amfIDOf(sc *smfctx.SMContext) iri.AMFID {
+// else yields nil, which encodes as absent rather than as a guess about which AMF
+// served the session. "000000" is a real identifier and is reported.
+func amfIDOf(sc *smfctx.SMContext) *iri.AMFID {
 	id := sc.Guami.AmfId
 	if len(id) != 6 {
-		return iri.AMFID{}
+		return nil
 	}
 	raw, err := hex.DecodeString(id)
 	if err != nil {
-		return iri.AMFID{}
+		return nil
 	}
 
-	return iri.AMFID{
+	return &iri.AMFID{
 		AMFRegionID: iri.AMFRegionID(raw[0]),
 		AMFSetID:    iri.AMFSetID(uint16(raw[1])<<2 | uint16(raw[2])>>6),
 		AMFPointer:  iri.AMFPointer(raw[2] & 0x3f),

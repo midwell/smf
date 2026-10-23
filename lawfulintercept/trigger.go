@@ -1803,10 +1803,12 @@ type plannedTrigger struct {
 // **The configured MDF3 serves a task that named no destination, not one whose
 // destinations produced no X3 endpoint.** The two were the same test — an empty resolved
 // list — and they are different facts: a task that named nothing is a gap the
-// provisioning function left, and one that named an X2-only destination is an assertion
+// provisioning function left, and one that named only X2 destinations is an assertion
 // this element cannot honour by substituting an endpoint of its own. On an element
 // serving several agencies the substitution sends a warrant's content to whichever
-// address local configuration happens to name.
+// address local configuration happens to name. x1 now refuses that task with 3040 before
+// it is stored, so the branch below is a backstop, kept for the reason x2Destinations
+// keeps its own.
 //
 // Until the task's own destinations were consulted at all, the configured endpoint served
 // *every* task, so two agencies' content arrived at whichever address configuration

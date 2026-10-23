@@ -186,6 +186,11 @@ type fakePOI struct {
 	// and the POI is left holding whichever finished last.
 	delayOn string
 	delay   func()
+	// pendingOn answers the requests whose body contains it with an oK of "Acknowledged" —
+	// received and not completed (TS 103 221-1 clause 5.2.2) — instead of
+	// "AcknowledgedAndCompleted". The requester returns that as x1.ErrAcknowledgedPending,
+	// and nothing it answers may be recorded as done.
+	pendingOn string
 }
 
 // poiEnvelope builds the response envelope a conformant NE returns: the response
@@ -382,7 +387,14 @@ func newFakePOI(t *testing.T) *fakePOI {
 			misname = scriptedMisname
 		}
 
-		answer := poiEnvelope(t, body, `<x1:oK>AcknowledgedAndCompleted</x1:oK>`)
+		ok := "AcknowledgedAndCompleted"
+		p.mu.Lock()
+		if p.pendingOn != "" && strings.Contains(string(body), p.pendingOn) {
+			ok = "Acknowledged"
+		}
+		p.mu.Unlock()
+
+		answer := poiEnvelope(t, body, `<x1:oK>`+ok+`</x1:oK>`)
 		if misname != "" {
 			answer = strings.Replace(answer,
 				`<x1:neIdentifier>upf-1</x1:neIdentifier>`,
@@ -2430,8 +2442,9 @@ func TestTriggerFallsBackToTheConfiguredMDF3(t *testing.T) {
 // TestATaskWhoseDestinationsYieldNoX3EndpointIsNotServedFromConfiguration is the other
 // half, and the reason the two had to be told apart.
 //
-// A task that named where its content goes and yielded no X3 endpoint — a warrant naming
-// an X2-only destination is the live shape — is an assertion this element cannot honour.
+// A task that named where its content goes and yielded no X3 endpoint is an assertion
+// this element cannot honour. x1 now refuses one with 3040 before it reaches the store, so
+// this pins the backstop rather than a path X1 can drive.
 // Substituting the configured MDF3 sends an agency's content to an endpoint the warrant
 // never named, and on an element serving several agencies it goes to whichever address
 // local configuration happens to name. So nothing is provisioned, no trigger is installed,
@@ -2447,8 +2460,7 @@ func TestATaskWhoseDestinationsYieldNoX3EndpointIsNotServedFromConfiguration(t *
 		XID:      testXIDPrimary,
 		Products: []types.ProductType{types.ProductCC},
 		// Named a destination, and it resolved — to an X2 endpoint, which carries no
-		// content. x1 accepts such a task: the identifier is resolvable, and the IRI-POI
-		// half of the same warrant delivers to it.
+		// content. Built directly: x1 refuses this task with 3040.
 		DIDs: []string{testXIDOrphan},
 		Deliveries: []types.DeliveryEndpoint{
 			{DID: testXIDOrphan, Type: types.DeliveryX2, Address: testDestinationAddr},
@@ -3863,4 +3875,70 @@ func installedKeyFor(t *testing.T, s *subsystem) string {
 	}
 
 	return ""
+}
+
+func (p *fakePOI) setPendingOn(on string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.pendingOn = on
+}
+
+// TestAnActivationAnsweredAcknowledgedIsNotInstalled: "Acknowledged" says the POI received
+// the activation and has not completed it. The trigger is not running, so it must not be
+// recorded as installed — a registry that did would answer reconciliation, withdrawals and
+// relabels for a trigger the POI may never run. It is handled as an activation the POI may
+// hold: replayed unchanged, then withdrawn rather than forgotten.
+func TestAnActivationAnsweredAcknowledgedIsNotInstalled(t *testing.T) {
+	poi := newFakePOI(t)
+	s := triggerSubsystem(t, poi)
+	reports := &recordingTaskReporter{}
+	s.taskReporter = reports
+
+	poi.setPendingOn("ns1:ActivateTaskRequest")
+
+	s.installFor("session-ref-1", []types.InterceptTask{{
+		XID:      testXIDPrimary,
+		Products: []types.ProductType{types.ProductCC},
+	}}, []upfSession{{node: upfNode(trigNodeA), seid: 0x2632898145f4d191}}, 7)
+
+	if n := poi.countMessages("ActivateTaskRequest"); n != 2 {
+		t.Errorf("sent %d activations, want the original and one replay", n)
+	}
+	awaitMessages(t, poi, "DeactivateTaskRequest", 1)
+	awaitPending(t, s.triggers, 0)
+
+	s.triggers.mu.Lock()
+	installed := len(s.triggers.installed)
+	s.triggers.mu.Unlock()
+	if installed != 0 {
+		t.Errorf("registry holds %d installed triggers after an activation answered only "+
+			"\"Acknowledged\"; a request not completed is not a trigger running", installed)
+	}
+}
+
+// TestADeactivationAnsweredAcknowledgedStaysPending: a withdrawal the POI has received and
+// not completed has not landed. Clearing the pending entry on it would leave the POI holding
+// a trigger this element no longer tracks and will never withdraw again.
+func TestADeactivationAnsweredAcknowledgedStaysPending(t *testing.T) {
+	poi := newFakePOI(t)
+	s := triggerSubsystem(t, poi)
+	pending := withdrawOne(t, s)
+
+	poi.setPendingOn("ns1:DeactivateTaskRequest")
+
+	s.triggers.sleep = func(time.Duration) {
+		if poi.countMessages("DeactivateTaskRequest") >= 3 {
+			poi.setPendingOn("")
+		}
+	}
+
+	s.deactivate(pending)
+
+	if n := poi.countMessages("DeactivateTaskRequest"); n < 4 {
+		t.Errorf("DeactivateTaskRequest count = %d, want at least 4 — each \"Acknowledged\" "+
+			"answer leaves the withdrawal pending, and it is resent until completed", n)
+	}
+	if n := s.triggers.pendingCount(); n != 0 {
+		t.Errorf("pending = %d after the POI finally completed the withdrawal, want 0", n)
+	}
 }

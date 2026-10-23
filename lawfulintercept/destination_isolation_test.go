@@ -17,11 +17,10 @@ import (
 // destination requirement is in, and it stays served.
 //
 // A task that names destinations and yields no X2 endpoint is an assertion this element
-// cannot honour, and the live shape of it is a warrant naming an X3-only destination —
-// the CC half of a warrant whose IRI half this element produces. Substituting the
-// configured MDF2 there sends an agency's signalling to an endpoint the warrant never
-// named. The two used to be one test, an empty resolved list, and they are different
-// facts.
+// cannot honour: substituting the configured MDF2 sends an agency's signalling to an
+// endpoint the warrant never named. The two used to be one test, an empty resolved list,
+// and they are different facts. x1 now refuses such a task with 3040 before it reaches the
+// store, so this pins the backstop rather than a path X1 can drive.
 func TestTheConfiguredEndpointServesAnUnnamedDestinationOnly(t *testing.T) {
 	sub := &subsystem{mdf2: testDestinationAddr}
 
