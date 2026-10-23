@@ -210,6 +210,10 @@ var nasPDUSessionTypes = map[string]iri.PDUSessionType{
 // differently would be a record naming a different session type, which decodes, validates and
 // is indistinguishable from the truth at both ends.
 func TestPDUSessionTypeCorrespondsToTS24501(t *testing.T) {
+	// It parses definitions and builds records from sessions of its own; nothing package-level
+	// is read or written.
+	t.Parallel()
+
 	module := ts33128PDUSessionTypes(t, ts33128Module(t))
 
 	for name, nasValue := range nasPDUSessionTypes {
@@ -278,6 +282,10 @@ func TestPDUSessionTypeCorrespondsToTS24501(t *testing.T) {
 // TestAPDUSessionTypeMismatchWouldBeCaught proves the assertion above can fail. Without it, a
 // parser that produced no members and a table that mapped nothing would agree perfectly.
 func TestAPDUSessionTypeMismatchWouldBeCaught(t *testing.T) {
+	// It parses definitions and builds records from sessions of its own; nothing package-level
+	// is read or written.
+	t.Parallel()
+
 	module := ts33128PDUSessionTypes(t, ts33128Module(t))
 
 	// The value the record must carry for an Ethernet session, and the value it would carry if

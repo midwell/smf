@@ -156,6 +156,9 @@ func TestAFailedInitWithdrawsNothingAndLeavesNothingRunning(t *testing.T) {
 // ends up holding the first relabel's ProductID, and with them ordered the second
 // one is not sent until the first has returned.
 func TestTwoRelabelsReachThePOIInOrder(t *testing.T) {
+	// Its own subsystem and fake POI; nothing package-level is written.
+	t.Parallel()
+
 	poi := newFakePOI(t)
 	s := triggerSubsystem(t, poi)
 

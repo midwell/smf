@@ -50,6 +50,10 @@ func hangingPOI(t *testing.T) string {
 // **Asserted on the interval, not the call count.** A serial round signals every
 // endpoint too; it just does it too late, so a count assertion passes against the defect.
 func TestAnUnreachableEndpointDoesNotDelayAHealthyOnesKeepalive(t *testing.T) {
+	// It waits out the requester's 10s timeout, and touches no package state, so it waits
+	// alongside the other tests that do rather than after them.
+	t.Parallel()
+
 	poi := newFakePOI(t)
 
 	// One endpoint that answers, and several that never do.

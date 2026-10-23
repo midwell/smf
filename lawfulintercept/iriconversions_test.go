@@ -349,6 +349,9 @@ func declaredTests(t *testing.T) map[string]bool {
 // finding that had been made by reading, produced instead by the check that should have found
 // it.
 func TestEveryIRIConversionIsRecorded(t *testing.T) {
+	// It reads source files and nothing else.
+	t.Parallel()
+
 	sites := scanIRIConversions(t)
 	if len(sites) == 0 {
 		t.Fatal("the scan found no conversion into an li/iri type, so it is asserting nothing")

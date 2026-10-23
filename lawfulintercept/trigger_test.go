@@ -1639,6 +1639,10 @@ func TestFailSafeCannotReclaimAnOrphanBesideLiveTasking(t *testing.T) {
 // registry once, so a trigger for a session that survives the retarget is never
 // among what is withdrawn, whatever order the goroutines run in.
 func TestRetargetDoesNotReapTheTriggerItInstalled(t *testing.T) {
+	// Two hundred rounds, each on its own subsystem and fake POI: nothing package-level is
+	// written, so it runs beside the tests that wait out a timeout.
+	t.Parallel()
+
 	const warrant = types.XID(testXIDPrimary)
 
 	for range 200 {
@@ -3146,6 +3150,10 @@ func TestSessionsWithTriggersNamesOnlyThisWarrantsSessions(t *testing.T) {
 //     sleep hook restores the POI and the withdrawal converges instead of looping past
 //     the end of the test.
 func TestAnActivationThatTimesOutIsWithdrawnNotForgotten(t *testing.T) {
+	// It waits out the requester's 10s timeout, and touches no package state, so it waits
+	// alongside the other tests that do rather than after them.
+	t.Parallel()
+
 	poi := newFakePOI(t)
 	s := triggerSubsystem(t, poi)
 	s.taskReporter = &recordingTaskReporter{}
