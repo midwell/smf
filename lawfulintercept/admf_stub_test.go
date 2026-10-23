@@ -29,7 +29,8 @@ import (
 // testTrust is the LI trust anchor every test in this package shares. It is also the
 // element's own certificate, as liPKI has always written it: a self-signed CA standing for
 // both, with an IP SAN so a peer on the loopback presenting it is verified rather than merely
-// trusted. Sharing one is what lets the ADMF stub present a certificate the element verifies
+// trusted, and the annex G URN binding testNEID in the NE role, so the ADMF stub can hold the
+// element to the binding a real ADMF checks. Sharing one is what lets the ADMF stub present a certificate the element verifies
 // whichever of liPKI, loopbackPKI and newADMFStub a test happens to call first.
 type testTrust struct {
 	certPEM, keyPEM []byte
@@ -62,6 +63,10 @@ func newTestTrust() (*testTrust, error) {
 	if err != nil {
 		return nil, err
 	}
+	neBinding, err := url.Parse(certBindingURN + "NE:" + testNEID)
+	if err != nil {
+		return nil, err
+	}
 	tmpl := &x509.Certificate{
 		SerialNumber:          big.NewInt(1),
 		Subject:               pkix.Name{CommonName: testNEID},
@@ -72,6 +77,7 @@ func newTestTrust() (*testTrust, error) {
 		BasicConstraintsValid: true,
 		IsCA:                  true,
 		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
+		URIs:                  []*url.URL{neBinding},
 	}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
 	if err != nil {
@@ -111,7 +117,7 @@ func (tr *testTrust) admfCertificate(t *testing.T, admfID string) tls.Certificat
 	if err != nil {
 		t.Fatal(err)
 	}
-	binding, err := url.Parse("urn:etsi:li:103221-1:cert-binding:ADMF:" + admfID)
+	binding, err := url.Parse(certBindingURN + "ADMF:" + admfID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -153,16 +159,25 @@ func liPKI(t *testing.T) (certPath, keyPath, caPath string) {
 	return certPath, keyPath, caPath
 }
 
+// certBindingURN is the TS 103 221-1 annex G certificate-binding URN prefix; the role and the
+// identifier follow it.
+const certBindingURN = "urn:etsi:li:103221-1:cert-binding:"
+
 // admfStub is an ADMF that receives NE issue reports and records their bodies. It is what the
 // element's reporter talks to in production: an https endpoint presenting a certificate that
 // binds testADMFID, requiring the element's own certificate, and answering each report with a
 // response bound to it — so a report is committed as delivered, as it is against a real ADMF,
 // rather than refused unsent or left unacknowledged.
+//
+// It also checks what a real ADMF checks before acting on a report: that the element's
+// certificate binds testNEID in the NE role, and that the report names this ADMF and that
+// element. A report failing either is not answered, and fails the test at cleanup.
 type admfStub struct {
 	srv *httptest.Server
 
-	mu     sync.Mutex
-	bodies []string
+	mu       sync.Mutex
+	bodies   []string
+	refusals []string
 }
 
 func newADMFStub(t *testing.T) *admfStub {
@@ -173,11 +188,23 @@ func newADMFStub(t *testing.T) *admfStub {
 	a.srv = httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body) //nolint:errcheck // test handler
 
+		refusal := ""
+		if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 || !bindsNE(r.TLS.PeerCertificates[0], testNEID) {
+			refusal = "the element's certificate does not bind " + testNEID + " in the NE role"
+		}
+		answer, ok := admfAnswer(body)
+		if refusal == "" && !ok {
+			refusal = "the report names another ADMF or element, or is not one message"
+		}
+
 		a.mu.Lock()
 		a.bodies = append(a.bodies, string(body))
+		if refusal != "" {
+			a.refusals = append(a.refusals, refusal)
+		}
 		a.mu.Unlock()
 
-		if answer, ok := admfAnswer(body); ok {
+		if refusal == "" {
 			_, _ = w.Write([]byte(answer)) //nolint:errcheck // test handler
 		}
 	}))
@@ -188,9 +215,35 @@ func newADMFStub(t *testing.T) *admfStub {
 		MinVersion:   tls.VersionTLS12,
 	}
 	a.srv.StartTLS()
+	// Registered first so it runs last, once the server has finished every request.
+	t.Cleanup(func() {
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		for _, r := range a.refusals {
+			t.Errorf("the ADMF stub refused a report: %s", r)
+		}
+	})
 	t.Cleanup(a.srv.Close)
 
 	return a
+}
+
+// bindsNE is the rule util's li/x1 applies to a peer's certificate, certBinds, in the NE role:
+// a UID attribute equal to the identifier, or the annex G URN naming the role and the
+// identifier exactly.
+func bindsNE(cert *x509.Certificate, neID string) bool {
+	for _, n := range cert.Subject.Names {
+		if v, ok := n.Value.(string); ok && n.Type.Equal(oidUID) && v == neID {
+			return true
+		}
+	}
+	for _, u := range cert.URIs {
+		if u != nil && u.String() == certBindingURN+"NE:"+neID {
+			return true
+		}
+	}
+
+	return false
 }
 
 // clientTLS is the TLS configuration of an element whose reporter a test builds by hand
@@ -211,7 +264,9 @@ func (a *admfStub) received() []string {
 }
 
 // admfAnswer is the response an ADMF gives a report: the request's own response type, its
-// identifiers, version and transaction echoed, and an OK of AcknowledgedAndCompleted.
+// identifiers, version and transaction echoed, and an OK of AcknowledgedAndCompleted. It
+// answers nothing for a report naming an ADMF other than testADMFID or an element other than
+// testNEID.
 func admfAnswer(request []byte) (string, bool) {
 	var in struct {
 		Messages []struct {
@@ -227,6 +282,9 @@ func admfAnswer(request []byte) (string, bool) {
 		return "", false
 	}
 	m := in.Messages[0]
+	if m.AdmfIdentifier != testADMFID || m.NeIdentifier != testNEID {
+		return "", false
+	}
 	local := m.Type[strings.LastIndex(m.Type, ":")+1:]
 
 	return `<?xml version="1.0"?><x1:X1Response xmlns:x1="http://uri.etsi.org/03221/X1/2017/10" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">` +

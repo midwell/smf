@@ -393,6 +393,12 @@ var (
 	taskFaultStop     <-chan struct{}
 )
 
+// destinationWatchInterval and destinationWatchStop do the same for the destination watcher.
+var (
+	destinationWatchInterval time.Duration
+	destinationWatchStop     <-chan struct{}
+)
+
 // Init starts the SMF LI IRI-POI: it loads the LI credentials, opens the X1
 // listener (mutual TLS), and prepares X2 delivery to the MDF2. Call it once at
 // SMF startup, only when LI is configured.
@@ -539,8 +545,8 @@ func Init(cfg Config) error {
 	if reporter != nil {
 		watcher = x1.NewDestinationWatcher(func() []x1.DestinationHealth {
 			return sub.x2Health(pool.UnreachableAt)
-		}, reporter, 0)
-		go watcher.Watch(nil)
+		}, reporter, destinationWatchInterval)
+		go watcher.Watch(destinationWatchStop)
 	}
 	// Assign the interface only when a reporter exists: a typed-nil would pass the
 	// nil check in reportTaskIssue and then panic on use.
@@ -1719,10 +1725,11 @@ func smfEstablishment(sc *smfctx.SMContext) iri.SMFPDUSessionEstablishment {
 // correlates against.
 //
 // Nil when no address has been assigned, or the assigned one is unspecified (0.0.0.0, ::), so
-// the record does not claim an address the session does not have: the field is omitted where
-// it is optional, and in SMFStartOfInterceptionWithEstablishedPDUSession, where it is not, it
-// is sent as an empty list (the module's SEQUENCE OF has no lower bound; table 6.2.3-4 marks it
-// 0..N, "if available").
+// no record claims an address the session does not have. Where the field is optional it is
+// omitted. SMFStartOfInterceptionWithEstablishedPDUSession is the one record where it is not
+// optional — the module's SEQUENCE OF has no lower bound and table 6.2.3-4 marks it 0..N, "if
+// available", so an empty list would encode — but reportStartOfInterception does not report
+// that record at all for such a session, since an empty list would assert it has no endpoint.
 func ueEndpoint(sc *smfctx.SMContext) []any {
 	if sc == nil || sc.PDUAddress == nil {
 		return nil

@@ -97,9 +97,10 @@ func TestProductDroppedByAFullQueueIsReported(t *testing.T) {
 	s := sub.senderFor(mdf2)
 
 	// Comfortably past the queue's 1024, offered faster than a peer that never reads
-	// can take them. A PDU the framing accepts, as production builds one: a PDU Marshal
-	// refuses never reaches the peer, so the destination would read reachable because
-	// nothing was ever written to it, not because a slow peer was taking product.
+	// can take them. A PDU the framing accepts, in the shape production builds, so what
+	// reaches the slow peer is what production writes. The queue fills before anything is
+	// framed, so the report assertion below does not depend on it; the "still reachable"
+	// half does, since a PDU that never frames is never written to the peer at all.
 	pdu := &x2x3.PDU{
 		Type:          x2x3.PDUTypeX2,
 		PayloadFormat: x2x3.PayloadFormat3GPP33128,
