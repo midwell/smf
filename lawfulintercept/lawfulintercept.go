@@ -1718,8 +1718,11 @@ func smfEstablishment(sc *smfctx.SMContext) iri.SMFPDUSessionEstablishment {
 // which address the target was using, and the second is what an investigation
 // correlates against.
 //
-// Nil when no address has been assigned, so the record omits the field rather
-// than claiming the session has no endpoint address.
+// Nil when no address has been assigned, or the assigned one is unspecified (0.0.0.0, ::), so
+// the record does not claim an address the session does not have: the field is omitted where
+// it is optional, and in SMFStartOfInterceptionWithEstablishedPDUSession, where it is not, it
+// is sent as an empty list (the module's SEQUENCE OF has no lower bound; table 6.2.3-4 marks it
+// 0..N, "if available").
 func ueEndpoint(sc *smfctx.SMContext) []any {
 	if sc == nil || sc.PDUAddress == nil {
 		return nil
