@@ -174,6 +174,8 @@ func (smf *SMF) Start() {
 		// and adapter handlers is active in a deployment, and a remedy present in one of them
 		// is a remedy whose presence depends on enableUPFAdapter.
 		adapter.POIRestarted = lawfulintercept.POIRestarted
+		// And the restart hook upstream's session restoration hangs off. See gateRestorationOnLI.
+		gateRestorationOnLI()
 		// And the three establishment hooks, for the same reason. Only one of the native and
 		// adapter handlers is active in a deployment, so a hook present in one of them is a
 		// hook whose presence depends on enableUPFAdapter — and the adapter path had none of
@@ -377,6 +379,29 @@ func (smf *SMF) Terminate(cancelServices context.CancelFunc, wg *sync.WaitGroup)
 	nfregistration.DeregisterNF()
 	wg.Wait()
 	logger.InitLog.Infoln("SMF terminated")
+}
+
+// ungatedRestart is the restart hook as the producer installed it, kept so that applying the gate
+// again wraps that hook rather than the gate: a gate wrapping a gate takes the same node's lock
+// twice and deadlocks under UpfLock.
+var ungatedRestart func(smfContext.NodeID, time.Time)
+
+// gateRestorationOnLI wraps the restart hook upstream's session restoration hangs off, rather
+// than calling the interception discard beside it: the record of what a restarted UPF held is
+// settled before any of its sessions is re-installed, on every path that detects a restart,
+// because restoration can be reached only through this hook.
+func gateRestorationOnLI() {
+	if ungatedRestart == nil {
+		ungatedRestart = smfContext.OnRestart
+	}
+	if ungatedRestart == nil {
+		return
+	}
+	smfContext.OnRestart = lawfulintercept.GateRestoration(lawfulintercept.RestartHooks{
+		Restore: ungatedRestart,
+		Abandon: producer.AbandonRestorationOnUPF,
+		Release: producer.ReleaseSessionsOnUPF,
+	})
 }
 
 // liConfig maps the factory's li block onto the interception subsystem's configuration.

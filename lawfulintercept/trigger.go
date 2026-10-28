@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	smfctx "github.com/omec-project/smf/context"
@@ -77,7 +78,12 @@ type upfEndpoint struct {
 	// has, this triggering function cannot name that tasking and therefore could
 	// never withdraw it — so it owes the POI no liveness signal, and the POI's own
 	// fail-safe is left free to act. See keepaliveDue.
-	reconciled bool
+	//
+	// Atomic rather than under mu, because mu is held across X1 round trips
+	// (ensureDestinations holds it over CreateDestination) and ForgetPOI clears this while
+	// holding the registry lock, under a caller holding UpfLock. Through mu, a restart's
+	// discard could wait on one POI's X1 timeout with every PFCP send blocked behind it.
+	reconciled atomic.Bool
 	// reconciling guards against starting a second reconciliation for this endpoint while
 	// one is already retrying. See beginReconcile.
 	reconciling bool
@@ -91,9 +97,7 @@ type upfEndpoint struct {
 // this element's claims for a POI on a liveness timeout too, and after that this process can
 // no longer name what that POI holds. See forgetReconciled.
 func (e *upfEndpoint) markReconciled() {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	e.reconciled = true
+	e.reconciled.Store(true)
 }
 
 // forgetReconciled records that this element's account of what a POI holds is no longer good.
@@ -105,9 +109,7 @@ func (e *upfEndpoint) markReconciled() {
 // POI's own fail-safe would purge it along with the orphans. Re-reconciliation is what closes
 // that window; the silence is only safe because it is temporary.
 func (e *upfEndpoint) forgetReconciled() {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	e.reconciled = false
+	e.reconciled.Store(false)
 }
 
 // beginReconcile claims the right to reconcile this endpoint, so that a reconciliation asked for
@@ -134,10 +136,7 @@ func (e *upfEndpoint) endReconcile() {
 }
 
 func (e *upfEndpoint) isReconciled() bool {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-
-	return e.reconciled
+	return e.reconciled.Load()
 }
 
 // triggerRegistry holds the CC-TF's per-UPF endpoints and the trigger tasks it has
@@ -223,6 +222,26 @@ type triggerRegistry struct {
 	// Guarded by mu, unlike sleep and now, because the goroutine that reads it is
 	// this registry's own refresh loop rather than the caller's.
 	lookup func(ctx context.Context, host string) (string, error)
+	// refreshed is closed by the next refresh round to start after its creation, once that round
+	// has stored its answers; nextRefresh creates it on demand. It is how a restart whose node
+	// could not be matched waits for the condition that made it undecidable to change. Guarded
+	// by mu.
+	refreshed chan struct{}
+
+	// withheldMu guards the four maps below, all keyed by withheldKey. See GateRestoration.
+	// It is a leaf lock: nothing else is taken while it is held.
+	withheldMu sync.Mutex
+	// withheld holds the restorations held back because the node that restarted could not be
+	// matched to, or ruled out as, a configured point of interception.
+	withheld map[string]*withheldRestart
+	// settled is the recovery state of each node's last restart whose record was settled.
+	settled map[string]time.Time
+	// restartLocks order everything done about one node's restarts: settling its record,
+	// withholding, restoring and releasing it.
+	restartLocks map[string]*sync.Mutex
+	// addresses is each node's last known address. A restoration and a node's sessions are keyed
+	// by the address the node had, which may not resolve when the node restarts.
+	addresses map[string]string
 
 	// stop, stopOnce and wg are the registry's lifecycle. Its background work — the
 	// address refresh, the keepalive cadence, and the per-warrant propagations it
@@ -677,8 +696,13 @@ func (r *triggerRegistry) refreshResolved() {
 	// already running; using it outside is the point of the whole function, since the
 	// lookups are the slow part and holding the registry lock across them would move
 	// the stall from the session lock to the registry's.
+	//
+	// A waiter registered before this round starts is released when it ends; one registered
+	// while it runs waits for the next, because this round's lookups may predate its question.
 	r.mu.Lock()
 	lookup := r.lookup
+	done := r.refreshed
+	r.refreshed = nil
 	r.mu.Unlock()
 
 	if lookup == nil {
@@ -711,6 +735,22 @@ func (r *triggerRegistry) refreshResolved() {
 	for key, addr := range fresh {
 		r.resolved[key] = addr
 	}
+	if done != nil {
+		close(done)
+	}
+}
+
+// nextRefresh returns a channel that is closed when a refresh round that starts after this call
+// has stored its answers.
+func (r *triggerRegistry) nextRefresh() <-chan struct{} {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.refreshed == nil {
+		r.refreshed = make(chan struct{})
+	}
+
+	return r.refreshed
 }
 
 // resolveLoop keeps the address index current. Like the keepalive loop it runs for
@@ -1203,8 +1243,8 @@ func TriggerCC(sc *smfctx.SMContext) {
 }
 
 // POIRestarted tells the CC Triggering Function that a triggered point of interception
-// has restarted, so the tasking this element believes it holds there is discarded and
-// subsequent establishments -- including restored ones -- and scans re-install it. Silent no-op unless LI is configured.
+// has stopped answering, so the tasking this element believes it holds there is discarded and
+// subsequent establishments and scans re-install it. Silent no-op unless LI is configured.
 //
 // **It takes the node identity and its address, not a pre-resolved string**, because the
 // registry has to be allowed to apply its own matching rule. Trigger keys carry
@@ -1220,27 +1260,35 @@ func TriggerCC(sc *smfctx.SMContext) {
 // resolves them to a configured key — identity first, then the refreshed address index —
 // which is the same rule the trigger path uses. ForgetPOI stays as the key-level primitive.
 //
-// **Restoring the subscriber's sessions is upstream's, not this function's.** It is raised on
-// two kinds of path: a detected restart, where the callers sit inside the same branch that
-// starts upstream's session restoration (OnRestart) and ahead of it; and a UPF that has
-// stopped answering, where nothing is restored until it comes back and re-associates. Either
-// way the next establishment on the POI -- a restored one included, since it is answered
-// through the ordinary response handler -- reaches TriggerCC with no stale claim, and the
-// tasking is re-installed. e2e-li section 34 asserts the restored case on the rig, and fails
-// with the restart-path calls removed.
+// **A detected restart does not come through here.** It reaches the same discard through
+// GateRestoration, which wraps upstream's session restoration so the discard is settled before
+// any session is re-installed. This is for the paths on which a UPF stops answering, where
+// nothing is restored. If it comes back having restarted, its re-association reports a new
+// recovery timestamp and is gated in turn; if it comes back with the timestamp it had, nothing
+// is restored, and the discard here is what lets its next establishments re-install tasking.
 func POIRestarted(node smfctx.NodeID, addr string) {
-	sub := active.Load()
-	if sub == nil || sub.triggers == nil {
-		return
+	if sub := active.Load(); sub != nil {
+		sub.discardRestarted(upfSession{node: node, addr: addr})
 	}
-	if n := sub.triggers.forgetRestartedPOI(upfSession{node: node, addr: addr}); n > 0 && sub.reporter != nil {
+}
+
+// discardRestarted discards the claims held for the point of interception serving session's
+// node, reports a discard that dropped anything, and says what it concluded about the node.
+func (s *subsystem) discardRestarted(session upfSession) restartMatch {
+	if s.triggers == nil {
+		return restartNotAtPOI
+	}
+	n, match := s.triggers.forgetRestartedPOI(session)
+	if n > 0 && s.reporter != nil {
 		// NE-level and countable, naming no warrant: which interceptions were lost is
 		// the ADMF's to work out from its own provisioning, and this element cannot
 		// name them without disclosing tasking on a channel that must not carry it.
-		sub.reporter.NotifyAsync(x1.NEIssueReconcileFailed,
+		s.reporter.NotifyAsync(x1.NEIssueReconcileFailed,
 			"a triggered point of interception restarted; the tasking this element believed it held "+
 				"there has been discarded and will be re-installed as sessions are established or scanned")
 	}
+
+	return match
 }
 
 // UntriggerCC removes the LI_T3 triggers installed for sc. Call it when the
@@ -1281,11 +1329,9 @@ func UntriggerCC(sc *smfctx.SMContext) {
 // So the durable withdrawal stands: this element has withdrawn the triggers, the POI
 // has acknowledged, and content interception for this session is over until something
 // re-establishes it. What would re-establish it is the session's own user-plane state
-// coming back, which is the pre-existing upstream `// TODO: Session cleanup required`
-// (pfcp/handler/handler.go, pfcp/adapter/adapter.go) and a larger problem than this
-// one — the same entanglement ForgetPOI records. **Do not re-raise the re-install
-// here**: it is absent because it cannot work from a session with no tunnel, not
-// because it was overlooked.
+// coming back, which no path here provides and which is a larger problem than this one.
+// **Do not re-raise the re-install here**: it is absent because it cannot work from a
+// session with no tunnel, not because it was overlooked.
 func RestoreInterception(sc *smfctx.SMContext) {
 	sub := active.Load()
 	if sub == nil || sc == nil {
@@ -2047,19 +2093,56 @@ func (r *triggerRegistry) takeForWarrantExcept(warrant types.XID, keep map[strin
 // re-install one element's tasking at another's, which is the defect matchEndpoint's own
 // documentation exists to prevent.
 //
+// It also says which of three things is true, because a node that matched nothing is two
+// different cases. Either this element can rule the node out — it is not a configured point of
+// interception, and there was nothing to discard — or it cannot tell, because the address
+// either side would be compared by is not known yet. Only the second may hold anything back.
+//
 // The lock is taken twice deliberately. matchEndpoint documents needing r.mu and ForgetPOI
 // takes it itself; nothing between the two can invalidate the key, because endpoints and
 // order are written once at construction.
-func (r *triggerRegistry) forgetRestartedPOI(session upfSession) int {
+func (r *triggerRegistry) forgetRestartedPOI(session upfSession) (int, restartMatch) {
 	r.mu.Lock()
 	key, _, ok := r.matchEndpoint(session)
+	ruledOut := !ok && r.canRuleOut(session)
 	r.mu.Unlock()
 
-	if !ok {
-		return 0
+	switch {
+	case ok:
+		return r.ForgetPOI(key), restartAtPOI
+	case ruledOut:
+		return 0, restartNotAtPOI
+	default:
+		return 0, restartUndecidable
+	}
+}
+
+// knownAddress reports whether addr is an address a node can be compared by: what ResolveNodeIdToIp
+// returns for a node it could not resolve is the unspecified address, and a nil IP prints as
+// "<nil>".
+func knownAddress(addr string) bool {
+	ip := net.ParseIP(addr)
+	return ip != nil && !ip.IsUnspecified()
+}
+
+// canRuleOut reports whether a node matchEndpoint did not match is known not to be a configured
+// point of interception. It is not when the comparison matchEndpoint falls back to could not be
+// made: the node's own address is unknown, or a configured name has not resolved yet and so
+// might be that node. The caller holds r.mu.
+func (r *triggerRegistry) canRuleOut(session upfSession) bool {
+	if len(r.order) == 0 {
+		return true
+	}
+	if !knownAddress(session.addr) {
+		return false
+	}
+	for _, key := range r.order {
+		if r.resolved[key] == "" {
+			return false
+		}
 	}
 
-	return r.ForgetPOI(key)
+	return true
 }
 
 // ForgetPOI discards this element's record of what a triggered point of interception
@@ -2084,12 +2167,12 @@ func (r *triggerRegistry) forgetRestartedPOI(session upfSession) int {
 // right answer — keeping a restarted POI alive on the strength of tasking that no longer
 // exists is what disables its own fail-safe.
 //
-// **What this does not do is restore the subscriber's sessions.** Those are lost on the
-// same path, which is the pre-existing `// TODO: Session cleanup required` beside the
-// caller and a larger problem than this one. What is in scope is that the interception
-// bookkeeping stops being the reason re-tasking cannot happen once that TODO is
-// addressed: after this, an establishment or a scan at the restarted POI installs the
-// trigger instead of skipping it as already claimed.
+// **What this does not do is restore the subscriber's sessions.** That is upstream's
+// restoration, which GateRestoration starts for a detected restart only once this has run.
+// What is in scope is that the interception bookkeeping is not the reason re-tasking cannot
+// happen: after this, an establishment at the restarted POI — a restored one included, since
+// it is answered through the ordinary response handler — or a scan installs the trigger
+// instead of skipping it as already claimed.
 func (r *triggerRegistry) ForgetPOI(nodeID string) int {
 	r.mu.Lock()
 	defer r.mu.Unlock()

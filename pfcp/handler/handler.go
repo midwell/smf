@@ -49,17 +49,16 @@ func FindFTEID(createdPDRIEs []*ie.IE) (*ie.FTEIDFields, error) {
 	return nil, fmt.Errorf("FTEID not found in CreatedPDR")
 }
 
-// POIRestarted is the Lawful Interception restart notification this package raises: a
-// triggered point of interception has restarted, so the tasking this element believes it
-// holds there must be discarded and re-installed.
+// POIRestarted is the Lawful Interception notification this package raises when a UPF reports
+// no established association: what that point of interception holds is no longer knowable, so
+// the tasking this element believes it holds there is discarded.
 //
-// Reached through a package variable so a test can observe *which* of this package's paths
-// raise it, which is the whole of what was wrong — it fired only from the heartbeat
-// recovery-timestamp mismatch, while both association handlers overwrote the recovery
-// timestamp silently and re-association is the common way a restart is discovered. Without a
-// seam a path that stopped raising it would look exactly like a path that raises it.
+// A detected restart does not raise it. Those paths call smf_context.OnRestart, which the LI
+// wiring wraps so the same discard is settled before any session is restored; see
+// lawfulintercept.GateRestoration.
 //
-// Production behaviour is unchanged: it is the same function.
+// Reached through a package variable so a test can substitute it. Production behaviour is
+// unchanged: it is the same function.
 var POIRestarted = lawfulintercept.POIRestarted
 
 // LIModificationAnswered is the Lawful Interception hook carrying the outcome of a
@@ -143,16 +142,6 @@ func HandlePfcpHeartbeatResponse(msg *udp.Message) {
 		// PFCP Association can be initiated again
 		upf.UPFStatus = smf_context.NotAssociated
 		logger.PfcpLog.Warnf("PFCP Heartbeat Response, upf [%v] recovery timestamp changed, previous [%v], new [%v] ", upf.NodeID, upf.RecoveryTimeStamp, *rsp.RecoveryTimeStamp)
-
-		// Lawful Interception: this UPF restarted, so the LI_T3 triggers this element
-		// believes it installed there are gone with its memory. Discard the record, or
-		// the planning path finds every triple already claimed and installs nothing —
-		// the restarted UPF holding no tasking, discarding the copies it is told to
-		// make as untasked, while this element reports the interception as running.
-		//
-		// The node identity travels with its address, because the registry is keyed by
-		// the configured node name and only the registry can match one to the other.
-		POIRestarted(upf.NodeID, upf.NodeID.ResolveNodeIdToIp().String())
 
 		if smf_context.OnRestart != nil {
 			smf_context.OnRestart(upf.NodeID, rspRecoveryTimeStamp)
@@ -261,9 +250,6 @@ func HandlePfcpAssociationSetupRequest(msg *udp.Message) {
 	if upf.HasRestarted(recoveryTimestamp) {
 		logger.PfcpLog.Warnf("PFCP Association Setup Request, upf [%v] recovery timestamp changed, previous [%v], new [%v]",
 			upf.NodeID, upf.RecoveryTimeStamp.RecoveryTimeStamp, recoveryTimestamp)
-		// Lawful Interception: discard the trigger claims the restarted UPF no longer
-		// holds, as at the heartbeat site.
-		POIRestarted(upf.NodeID, upf.NodeID.ResolveNodeIdToIp().String())
 		if smf_context.OnRestart != nil {
 			smf_context.OnRestart(upf.NodeID, recoveryTimestamp)
 		}
@@ -345,8 +331,6 @@ func HandlePfcpAssociationSetupResponse(msg *udp.Message) {
 		if upf.HasRestarted(recoveryTimestamp) {
 			logger.PfcpLog.Warnf("PFCP Association Setup Response, upf [%v] recovery timestamp changed, previous [%v], new [%v]",
 				upf.NodeID, upf.RecoveryTimeStamp.RecoveryTimeStamp, recoveryTimestamp)
-			// Lawful Interception: as in the request handler above.
-			POIRestarted(upf.NodeID, upf.NodeID.ResolveNodeIdToIp().String())
 			if smf_context.OnRestart != nil {
 				smf_context.OnRestart(upf.NodeID, recoveryTimestamp)
 			}

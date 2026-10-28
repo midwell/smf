@@ -124,10 +124,16 @@ func TestARestartAtAnUnconfiguredNodeDiscardsNothing(t *testing.T) {
 	awaitMessages(t, poi, "ActivateTaskRequest", 1)
 
 	held := len(s.triggers.installed)
-	if n := s.triggers.forgetRestartedPOI(upfSession{
+	n, match := s.triggers.forgetRestartedPOI(upfSession{
 		node: upfNode(trigNodeElsewhere), addr: trigNodeElsewhere,
-	}); n != 0 {
+	})
+	if n != 0 {
 		t.Errorf("a restart at a node this element does not task discarded %d claims", n)
+	}
+	// Ruled out, not undecidable: every configured name has resolved and none is this node, so
+	// nothing about it may hold that node's restoration back.
+	if match != restartNotAtPOI {
+		t.Errorf("a restart at a node this element can rule out was classified %d, want restartNotAtPOI", match)
 	}
 	if now := len(s.triggers.installed); now != held {
 		t.Errorf("claims went from %d to %d for a restart at another node", held, now)

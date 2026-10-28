@@ -23,9 +23,10 @@ func init() {
 	PfcpTxns = make(map[uint32]*context.NodeID)
 }
 
-// POIRestarted is the Lawful Interception hook this package calls when a UPF's recovery
-// timestamp shows it restarted, or when it stops answering. Nil unless LI is wired, and
-// nil-checked at every call site.
+// POIRestarted is the Lawful Interception hook this package calls when a UPF stops answering.
+// Nil unless LI is wired, and nil-checked at every call site. A detected restart does not call
+// it: it calls context.OnRestart, which the LI wiring wraps so the same discard is settled
+// before any session is restored (lawfulintercept.GateRestoration).
 //
 // **A package variable rather than a direct call, because this package may not import
 // lawfulintercept.** pfcp/message imports this one, and lawfulintercept's own tests import
@@ -234,10 +235,6 @@ func HandlePfcpAssociationSetupResponse(msg *udp.Message) {
 		// state that hides it.
 		if upf.HasRestarted(recoveryTimestamp) {
 			logger.PfcpLog.Warnf("PFCP Association Setup Response, upf [%v] recovery timestamp changed", upf.NodeID)
-			// Lawful Interception: discard the trigger claims the restarted UPF no longer
-			// holds, as the native handler does. Only one of the two handlers is active in a
-			// deployment, so a remedy in the native one alone would depend on enableUPFAdapter.
-			notifyPOIRestarted(upf.NodeID, upf.NodeID.ResolveNodeIdToIp().String())
 			if context.OnRestart != nil {
 				context.OnRestart(upf.NodeID, recoveryTimestamp)
 			}
@@ -292,12 +289,6 @@ func HandlePfcpHeartbeatResponse(msg *udp.Message) {
 		// PFCP Association can be initiated again
 		upf.UPFStatus = context.NotAssociated
 		logger.PfcpLog.Warnf("PFCP Heartbeat Response, upf [%v] recovery timestamp changed", upf.NodeID)
-
-		// Lawful Interception: the adapter's copy of the native handler's remedy. This UPF
-		// restarted, so the LI_T3 triggers this element believes it installed there are gone
-		// with its memory — and keeping the claims makes the planning path skip every triple
-		// as claimed, so nothing re-installs.
-		notifyPOIRestarted(upf.NodeID, upf.NodeID.ResolveNodeIdToIp().String())
 
 		if context.OnRestart != nil {
 			context.OnRestart(upf.NodeID, recoveryTimestamp)
