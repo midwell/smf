@@ -161,7 +161,7 @@ func TestSendPfcpSessionEstablishmentRequestUpNodeExists(t *testing.T) {
 		Conn: conn,
 	})
 
-	err = message.SendPfcpSessionEstablishmentRequest(upNodeID, smContext, pdrList, farList, barList, qerList, 8803)
+	err = message.SendPfcpSessionEstablishmentRequest(upNodeID, smContext, upNodeIDStr, pdrList, farList, barList, qerList, 8803)
 	if err != nil {
 		t.Errorf("error sending PFCP Session Establishment Request: %v", err)
 	}
@@ -202,7 +202,7 @@ func TestSendPfcpSessionEstablishmentRequestUpNodeDoesNotExist(t *testing.T) {
 		Conn: conn,
 	})
 
-	err = message.SendPfcpSessionEstablishmentRequest(upNodeID, smContext, pdrList, farList, barList, qerList, 8804)
+	err = message.SendPfcpSessionEstablishmentRequest(upNodeID, smContext, upNodeIDStr, pdrList, farList, barList, qerList, 8804)
 	if err == nil {
 		t.Errorf("expected error sending PFCP Session Establishment Request")
 	}
@@ -587,6 +587,30 @@ func TestATimeoutNobodyIsWaitingForLeavesNothingBehind(t *testing.T) {
 	}
 }
 
+// A revert is waited on whatever the session's state, so its timeout is answered whatever the state
+// too. The revert is sent in the state the session is in and leaves it alone; a transaction's
+// trailing state write can change it before the user plane has answered, and the response handlers
+// deliver a revert's answer by RevertOwed for that reason. A timeout read only the state: it was
+// dropped, the revert waited on its channel for good, and nothing queued for the session ran again.
+func TestARevertTheUserPlaneNeverAnswersAnswersItsWaiterInAnyState(t *testing.T) {
+	upNodeID, smContext, port := unansweredUserPlane(t, context.SmStateActive)
+	smContext.RevertOwed.Store(true)
+
+	if err := message.SendAwaitedPfcpSessionModificationRequest(upNodeID, smContext,
+		nil, nil, nil, nil, nil, nil, nil, port); err != nil {
+		t.Fatalf("the request was not sent: %v", err)
+	}
+
+	verdict, arrived := awaitVerdict(smContext)
+	if !arrived {
+		t.Fatal("the revert timed out and nothing answered it, because the session had left SmStatePfcpModify")
+	}
+
+	if verdict != context.SessionUpdateTimeout {
+		t.Errorf("verdict = %v, want SessionUpdateTimeout", verdict)
+	}
+}
+
 // Nor is a modification its sender does not wait on answered, even while the session waits on
 // another one. Restoration reissues rules to every user plane of a session without waiting, and a
 // policy update can be holding the session in SmStatePfcpModify at the time: taking that state to
@@ -732,7 +756,8 @@ func TestARequestThatNeverWentOutLeavesNoPendingEntry(t *testing.T) {
 	// No server, so udp.SendPfcp refuses after the entry has been made.
 	setTestServer(t, nil)
 
-	if err := message.SendPfcpSessionEstablishmentRequest(upNodeID, smContext, nil, nil, nil, nil, 8808); err == nil {
+	if err := message.SendPfcpSessionEstablishmentRequest(upNodeID, smContext, upNodeID.ResolveNodeIdToIp().String(),
+		nil, nil, nil, nil, 8808); err == nil {
 		t.Fatal("an establishment the socket refused was reported as sent")
 	}
 
@@ -770,7 +795,7 @@ func TestAnEstablishmentTheUserPlaneNeverAnswersLeavesNoPendingEntry(t *testing.
 
 	before := pendingRequestsFor(upNodeID)
 
-	if err := message.SendPfcpSessionEstablishmentRequest(upNodeID, smContext,
+	if err := message.SendPfcpSessionEstablishmentRequest(upNodeID, smContext, upNodeID.ResolveNodeIdToIp().String(),
 		nil, nil, nil, nil, port); err != nil {
 		t.Fatalf("the request was not sent: %v", err)
 	}
@@ -800,7 +825,7 @@ func TestAnUnansweredEstablishmentFailsTheCreateBatch(t *testing.T) {
 
 	before := pendingRequestsFor(upNodeID)
 
-	if err := message.SendPfcpSessionEstablishmentRequest(upNodeID, smContext,
+	if err := message.SendPfcpSessionEstablishmentRequest(upNodeID, smContext, upfKey,
 		nil, nil, nil, nil, port); err != nil {
 		t.Fatalf("the request was not sent: %v", err)
 	}
@@ -852,7 +877,7 @@ func TestMissingPFCPContextFoldsIntoCreateBatch(t *testing.T) {
 	// A second, still-outstanding UPF of the same create batch.
 	smContext.ResetPendingUPF(context.PendingUPF{upNodeIDStr: true, "127.0.0.2": true})
 
-	if err := message.SendPfcpSessionEstablishmentRequest(upNodeID, smContext, nil, nil, nil, nil, 8810); err == nil {
+	if err := message.SendPfcpSessionEstablishmentRequest(upNodeID, smContext, upNodeIDStr, nil, nil, nil, nil, 8810); err == nil {
 		t.Fatal("expected an error sending the PFCP Session Establishment Request")
 	}
 

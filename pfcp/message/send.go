@@ -285,6 +285,7 @@ func SendPfcpAssociationReleaseResponse(upNodeID smf_context.NodeID, cause uint8
 func SendPfcpSessionEstablishmentRequest(
 	upNodeID smf_context.NodeID,
 	ctx *smf_context.SMContext,
+	ip string,
 	pdrList []*smf_context.PDR,
 	farList []*smf_context.FAR,
 	barList []*smf_context.BAR,
@@ -312,7 +313,6 @@ func SendPfcpSessionEstablishmentRequest(
 	// directly.
 	var localSEID uint64
 	var haveLocalSEID bool
-	var upNodeIDStr string
 	defer func() {
 		if err == nil {
 			return
@@ -321,14 +321,13 @@ func SendPfcpSessionEstablishmentRequest(
 			foldEstablishmentFailureIntoBatch(ctx, localSEID)
 			return
 		}
-		if foldEstablishmentFailureIntoBatchByKey(ctx, upNodeIDStr) {
+		if foldEstablishmentFailureIntoBatchByKey(ctx, ip) {
 			return
 		}
 		answerTheWaitingSession(ctx, awaitingEstablishment, smf_context.SessionEstablishFailed)
 	}()
 
-	upNodeIDStr = upNodeID.ResolveNodeIdToIp().String()
-	pfcpContext, ok := ctx.PFCPContext[upNodeIDStr]
+	pfcpContext, ok := ctx.PFCPContext[ip]
 	if !ok {
 		return fmt.Errorf("PFCP Context not found for NodeID[%v]", upNodeID)
 	}
@@ -350,10 +349,13 @@ func SendPfcpSessionEstablishmentRequest(
 		return err
 	}
 	logger.PfcpLog.Debugf("in SendPfcpSessionEstablishmentRequest pfcpMsg.CPFSEID.Seid %v\n", pfcpMsg.SEID())
-	ip := upNodeID.ResolveNodeIdToIp()
+	// The caller's already-resolved address, not a fresh ResolveNodeIdToIp() here: a second,
+	// independent resolution of an FQDN UPF could land on a different IP than the one keying
+	// pfcpContext/PendingUPF above if a DNS refresh falls between the two.
+	upIP := net.ParseIP(ip)
 
 	upaddr := &net.UDPAddr{
-		IP:   ip,
+		IP:   upIP,
 		Port: int(upfPort),
 	}
 	ctx.SubPduSessLog.Debugln("[SMF] Send SendPfcpSessionEstablishmentRequest")
@@ -441,7 +443,7 @@ func SendPfcpSessionEstablishmentRequest(
 			return err
 		}
 	}
-	ctx.SubPfcpLog.Infof("sent PFCP Session Establish Request to NodeID[%s]", ip.String())
+	ctx.SubPfcpLog.Infof("sent PFCP Session Establish Request to NodeID[%s]", upIP.String())
 	return nil
 }
 
@@ -693,11 +695,14 @@ func SendPfcpSessionDeletionRequest(upNodeID smf_context.NodeID, ctx *smf_contex
 	}()
 
 	seqNum := getSeqNumber()
+	// Found by the NodeID the session was allocated under, not by a fresh resolution of it: an FQDN
+	// UPF's address can have moved since, and a key built from the new address names no entry.
 	upNodeIDStr := upNodeID.ResolveNodeIdToIp().String()
-	pfcpContext, ok := ctx.PFCPContext[upNodeIDStr]
+	pfcpKey, ok := ctx.PFCPContextKeyForNode(upNodeID)
 	if !ok {
 		return fmt.Errorf("PFCP Context not found for NodeID[%s]", upNodeIDStr)
 	}
+	pfcpContext := ctx.PFCPContext[pfcpKey]
 	pfcpMsg := BuildPfcpSessionDeletionRequest(seqNum, pfcpContext.LocalSEID, pfcpContext.RemoteSEID, smf_context.SMF_Self().CPNodeID.ResolveNodeIdToIp())
 
 	upaddr := &net.UDPAddr{
@@ -1188,8 +1193,11 @@ func handleSendPfcpSessModReqError(msg message.Message, pfcpErr error, localSEID
 	smContext.SubPfcpLog.Errorf("PFCP Session Modification send failure, %v", pfcpErr.Error())
 
 	// Only for a request its sender waits on, and only while the session still waits: the state
-	// alone is shared by every modification in flight on the session, awaited or not.
-	answerFailedRequest(smContext, awaited && smContext.SMContextState == smf_context.SmStatePfcpModify,
+	// alone is shared by every modification in flight on the session, awaited or not. A revert waits
+	// whatever the state, which a transaction's trailing state change can move on while the revert is
+	// in flight; the response handlers deliver its answer by RevertOwed, and so does this.
+	answerFailedRequest(smContext,
+		awaited && (smContext.SMContextState == smf_context.SmStatePfcpModify || smContext.RevertOwed.Load()),
 		smf_context.SessionUpdateTimeout)
 }
 

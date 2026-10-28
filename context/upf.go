@@ -563,7 +563,12 @@ func (upf *UPF) BuildCreatePdrFromPccRule(rule *models.PccRule) (*PDR, error) {
 	}
 
 	pdr.PDI = pdi
-	pdr.Precedence = uint32(rule.GetPrecedence())
+	// A negative precedence is out of a PDR's unsigned range, and converted it wrapped to about 4
+	// billion and put the rule last. Left zero it reads as unset, and the tunnel build gives the PDR
+	// its default.
+	if precedence := rule.GetPrecedence(); precedence > 0 {
+		pdr.Precedence = uint32(precedence)
+	}
 
 	return pdr, nil
 }
@@ -652,6 +657,18 @@ func (upf *UPF) RemovePDR(pdr *PDR) (err error) {
 	upf.pdrIDGenerator.FreeID(int64(pdr.PDRID))
 	upf.pdrPool.Delete(pdr.PDRID)
 	return nil
+}
+
+// HoldsPDR reports whether the PDR with this identifier is still allocated from this UPF's pool.
+func (upf *UPF) HoldsPDR(pdrID uint16) bool {
+	_, ok := upf.pdrPool.Load(pdrID)
+	return ok
+}
+
+// HoldsFAR reports whether the FAR with this identifier is still allocated from this UPF's pool.
+func (upf *UPF) HoldsFAR(farID uint32) bool {
+	_, ok := upf.farPool.Load(farID)
+	return ok
 }
 
 // *** add unit test ***//

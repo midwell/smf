@@ -7,14 +7,19 @@ package context
 
 import (
 	"errors"
+	"fmt"
 	"net"
-	"os"
-	"strconv"
 	"sync"
 
 	"github.com/omec-project/smf/logger"
 )
 
+// IPAllocator hands out the UE addresses of one DNN's pool.
+//
+// A method can be reached on an allocator that has no pool: buildSnssaiSmfInfo stores a DNN whose
+// ipDomain carries no usable ueSubnet with UeIPAllocator nil, and an SMContext read back from
+// MongoDB carries an allocator that marshalled as {}, the type having only unexported fields.
+// Each method answers such a receiver instead of dereferencing it.
 type IPAllocator struct {
 	ipNetwork *net.IPNet
 	g         *_IDPool
@@ -76,36 +81,50 @@ func IPAddrOffset(in, base net.IP) int {
 	return offset
 }
 
+// StaticIpForImsi returns the address configured for imsi in staticIpInfo, or nil for none.
+func (a *IPAllocator) StaticIpForImsi(imsi string) net.IP {
+	if a.g.staticIps == nil {
+		return nil
+	}
+	ipStr := (*a.g.staticIps)[imsi]
+	if ipStr == "" {
+		return nil
+	}
+	return net.ParseIP(ipStr).To4()
+}
+
 // Allocate will allocate the IP address and returns it
 func (a *IPAllocator) Allocate(imsi string) (net.IP, error) {
-	// check if static IP already reserved for this IMSI
-	if a.g.staticIps != nil {
-		staticIps := *a.g.staticIps
-		if ipStr := staticIps[imsi]; ipStr != "" {
-			return net.ParseIP(ipStr).To4(), nil
-		}
+	// No pool, no addresses; the caller answers this error with IpAllocError.
+	if a == nil || a.g == nil || a.ipNetwork == nil {
+		return nil, errors.New("ip allocation failed: this DNN has no usable UE subnet")
 	}
 
-	if offset, err := a.g.allocate(); err != nil {
-		return nil, errors.New("ip allocation failed" + err.Error())
-	} else {
-		smfCountStr := os.Getenv("SMF_COUNT")
-		if smfCountStr == "" {
-			smfCountStr = "1"
-		}
-		smfCount, err := strconv.Atoi(smfCountStr)
-		if err != nil {
-			logger.CtxLog.Errorf("failed to convert SMF_COUNT to int: %v", err)
-		}
-		ip := IPAddrWithOffset(a.ipNetwork.IP, int(offset)+(smfCount-1)*5000)
-		logger.CtxLog.Infof("unique id - ip %v", ip)
-		logger.CtxLog.Infof("unique id - offset %v", offset)
-		logger.CtxLog.Infof("unique id - smfCount %v", smfCount)
+	// check if static IP already reserved for this IMSI
+	if ip := a.StaticIpForImsi(imsi); ip != nil {
 		return ip, nil
 	}
+
+	// The offset is the address's place in the pool; nothing is added to it. The old
+	// (SMF_COUNT-1)*5000 shift meant a range per instance, but SMF_COUNT counts starts and not
+	// instances (see SetupSmfCollection), so it did not survive a restart; nothing bounded it by
+	// the pool either, and Release and BlockIp never applied it.
+	offset, err := a.g.allocate()
+	if err != nil {
+		return nil, fmt.Errorf("ip allocation failed: %w", err)
+	}
+
+	ip := IPAddrWithOffset(a.ipNetwork.IP, int(offset))
+	logger.CtxLog.Infof("allocated UE address %v, offset %v in pool %v", ip, offset, a.ipNetwork)
+
+	return ip, nil
 }
 
 func (a *IPAllocator) ReserveStaticIps(ips *map[string]string) {
+	if a == nil || a.g == nil || a.ipNetwork == nil {
+		return
+	}
+
 	a.g.staticIps = ips
 	for _, ipStr := range *ips {
 		if ip := net.ParseIP(ipStr).To4(); ip != nil {
@@ -116,17 +135,27 @@ func (a *IPAllocator) ReserveStaticIps(ips *map[string]string) {
 }
 
 func (a *IPAllocator) BlockIp(ip net.IP) {
+	if a == nil || a.g == nil || a.ipNetwork == nil {
+		return
+	}
+
 	offset := IPAddrOffset(ip, a.ipNetwork.IP)
 	a.g.block(int64(offset))
 }
 
 func (a *IPAllocator) Release(imsi string, ip net.IP) {
+	// There is no pool to return the address to, so the release is skipped and logged rather
+	// than passed over. Reconciling the running pool with restored sessions is out of scope.
+	if a == nil || a.g == nil || a.ipNetwork == nil {
+		logger.CtxLog.Warnf("cannot release UE address %v for %s: this allocator has no pool, "+
+			"so the release is skipped", ip, imsi)
+
+		return
+	}
+
 	// Don't release static IPs
-	if a.g.staticIps != nil {
-		staticIps := *a.g.staticIps
-		if ipStr := staticIps[imsi]; ipStr != "" {
-			return
-		}
+	if a.StaticIpForImsi(imsi) != nil {
+		return
 	}
 
 	offset := IPAddrOffset(ip, a.ipNetwork.IP)

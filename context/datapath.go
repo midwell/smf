@@ -8,6 +8,7 @@ package context
 
 import (
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -383,6 +384,80 @@ func (dataPathPool DataPathPool) GetDefaultPath() (dataPath *DataPath) {
 	return
 }
 
+// FindNode returns the node on this data path whose UPF is configured with nodeID, or nil if none is.
+//
+// The match is on the configured NodeID (NodeID.Equal), not on a resolved address: a response's UPF
+// and the node describing it share the same configured NodeID, so comparing those identities
+// correlates them without resolving either -- even for an FQDN UPF whose address has drifted since
+// dispatch. An earlier version resolved both sides to an IP and compared the strings; a DNS refresh
+// landing between the caller's resolution and this one made the same configured UPF fail to match, so
+// its F-TEID update was skipped while its acceptance still counted -- and a successful create could
+// then advertise the access tunnel's old TEID. Used to apply an establishment response's F-TEID to the
+// node that actually sent it, instead of assuming it is the access node.
+func (dataPath *DataPath) FindNode(nodeID NodeID) *DataPathNode {
+	for node := dataPath.FirstDPNode; node != nil; node = node.Next() {
+		if node.UPF != nil && node.UPF.NodeID.Equal(nodeID) {
+			return node
+		}
+	}
+	return nil
+}
+
+// OwnsUplinkPDR reports whether pdrID is one of the PDRs of this node's uplink tunnel.
+func (node *DataPathNode) OwnsUplinkPDR(pdrID uint16) bool {
+	if node == nil || node.UpLinkTunnel == nil {
+		return false
+	}
+	for _, pdr := range node.UpLinkTunnel.PDR {
+		if pdr != nil && pdr.PDRID == pdrID {
+			return true
+		}
+	}
+	return false
+}
+
+// FindNode returns the node, across every path in the pool, that the establishment response from
+// nodeID describes, or nil if the UPF is on none of them.
+//
+// A response can come from a UPF that sits only on a non-default path (SendPFCPRules sends to every
+// activated path, and EstablishPSA2 to the branch's activating path, which is a pool member), so
+// searching the default path alone rejects valid answers. pdrID is the PDR the response created; a
+// UPF shared by several paths has one tunnel per path, and the node whose tunnel owns that PDR is the
+// one the F-TEID belongs to. When no tunnel claims the PDR (or pdrID is unknown) the first matching
+// node is returned, preferring the default path, so the choice does not depend on map order.
+func (dataPathPool DataPathPool) FindNode(nodeID NodeID, pdrID uint16, havePDRID bool) *DataPathNode {
+	keys := make([]int64, 0, len(dataPathPool))
+	for key := range dataPathPool {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		pi, pj := dataPathPool[keys[i]], dataPathPool[keys[j]]
+		if pi != nil && pj != nil && pi.IsDefaultPath != pj.IsDefaultPath {
+			return pi.IsDefaultPath
+		}
+		return keys[i] < keys[j]
+	})
+
+	var fallback *DataPathNode
+	for _, key := range keys {
+		path := dataPathPool[key]
+		if path == nil {
+			continue
+		}
+		node := path.FindNode(nodeID)
+		if node == nil {
+			continue
+		}
+		if havePDRID && node.OwnsUplinkPDR(pdrID) {
+			return node
+		}
+		if fallback == nil {
+			fallback = node
+		}
+	}
+	return fallback
+}
+
 func (dataPath *DataPath) String() string {
 	firstDPNode := dataPath.FirstDPNode
 
@@ -458,9 +533,12 @@ func (dpNode *DataPathNode) CreatePccRuleQer(smContext *SMContext, qosData strin
 	if len(smContext.SmPolicyUpdates) == 0 {
 		return nil, fmt.Errorf("no pending SM policy update for UE [%s]: the rule's QER cannot be built", smContext.Supi)
 	}
+	// Read as the session will have them once the update is applied, not from the decision alone:
+	// a decision that repeats a rule can leave out QoS data or traffic control data it does not
+	// change, and a QER built without them failed for the one or opened a closed gate for the other.
 	smPolicyDec := smContext.SmPolicyUpdates[0].SmPolicyDecision
-	refQos := qos.GetQoSDataFromPolicyDecision(smPolicyDec, qosData)
-	tc := qos.GetTcDataFromPolicyDecision(smPolicyDec, tcData)
+	refQos := qos.DecidedQosData(smPolicyDec, &smContext.SmPolicyData, qosData)
+	tc := qos.DecidedTcData(smPolicyDec, &smContext.SmPolicyData, tcData)
 	if refQos == nil {
 		return nil, fmt.Errorf("missing QoS data reference %q", qosData)
 	}
@@ -505,10 +583,12 @@ func (dpNode *DataPathNode) CreatePccRuleQer(smContext *SMContext, qosData strin
 			dlMbr = *maxbrDl
 		}
 
-		// Rates
+		// Rates, normalized as the guaranteed ones are: a policy's "10.0 Mbps" or "10Mbps" read
+		// raw is 0 kbps. Policy updates build their QERs here, and the builder they used before
+		// normalized.
 		newQER.MBR = &MBR{
-			ULMBR: util.BitRateTokbps(ulMbr),
-			DLMBR: util.BitRateTokbps(dlMbr),
+			ULMBR: util.BitRateTokbps(util.NormalizeBitRate(ulMbr)),
+			DLMBR: util.BitRateTokbps(util.NormalizeBitRate(dlMbr)),
 		}
 
 		// The guaranteed rate is programmed here as well as on the policy-update path. Setting it
@@ -550,10 +630,13 @@ func (dpNode *DataPathNode) CreateSessRuleQer(smContext *SMContext) (*QER, error
 	// The default QoS flow comes from the pending update where there is one and from committed
 	// state otherwise. The user plane is also rebuilt with nothing pending -- reverting an
 	// undelivered modification discards the update first -- and indexing there took the SMF down.
+	// A pending decision need not repeat a default flow it leaves unchanged, and then the committed
+	// one is the session's.
 	var defQosData *models.QosData
 	if len(smContext.SmPolicyUpdates) > 0 {
 		defQosData = qos.GetDefaultQoSDataFromPolicyDecision(smContext.SmPolicyUpdates[0].SmPolicyDecision)
-	} else {
+	}
+	if defQosData == nil {
 		defQosData = qos.GetCommittedDefaultQosData(&smContext.SmPolicyData)
 	}
 
@@ -580,111 +663,24 @@ func (dpNode *DataPathNode) CreateSessRuleQer(smContext *SMContext) (*QER, error
 	return flowQER, nil
 }
 
-// CreateDedicatedQosQer creates a dedicated QER (QoS Enforcement Rule) for a PDU session in the given UPF.
-// It processes the SM Policy decision for the UE and creates QERs for each dedicated QoS flow (non-default).
-func (dpNode *DataPathNode) CreateDedicatedQosQer(smContext *SMContext) ([]*QER, error) {
-	var createdQERs []*QER
-
-	// Log start of QER creation
-	logger.PduSessLog.Infof("CreateDedicatedQosQer: start for UE [%s], PDU Session ID [%d]",
-		smContext.Supi, smContext.PDUSessionID)
-
-	// Nothing pending. Reachable whenever the user plane is rebuilt after the pending update has
-	// been discarded — which is exactly what reverting an undelivered modification does — and
-	// indexing here would take the SMF down.
-	if len(smContext.SmPolicyUpdates) == 0 {
-		logger.PduSessLog.Warnf("no pending SM policy update while building QERs for UE [%s]; nothing to program",
-			smContext.Supi)
-		return nil, nil
-	}
-	smPolicyDec := smContext.SmPolicyUpdates[0].SmPolicyDecision
-	logger.PduSessLog.Infof("CreateDedicatedQosQer: total QoSData entries = %d", len(smPolicyDec.GetQosDecs()))
-
-	// Iterate over all QoSData in SM Policy decision
-	for qosID, qosData := range smPolicyDec.GetQosDecs() {
-		// Skip default QoS flows
-		if qosData.GetDefQosFlowIndication() {
-			logger.PduSessLog.Infof("CreateDedicatedQosQer: skipping default QoSData [QosId=%s]", qosID)
-			continue
-		}
-
-		logger.PduSessLog.Infof("CreateDedicatedQosQer: processing dedicated QoSData [QosId=%s, 5QI=%d]", qosData.GetQosId(), qosData.GetVar5qi())
-
-		// Attempt to add a new QER in the UPF
-		if newQER, err := dpNode.UPF.AddQER(); err != nil {
-			// Error creating QER
-			logger.PduSessLog.Errorf("CreateDedicatedQosQer: AddQER failed for UE [%s], QoSId [%s], error: %v",
-				smContext.Supi, qosData.GetQosId(), err)
-			return nil, err
-		} else {
-			// Successfully created QER, set QFI
-			newQER.QFI.QFI = qos.GetQosFlowIdFromQosId(qosData.QosId)
-
-			// Set GateStatus: open UL and DL gates by default
-			newQER.GateStatus = &GateStatus{
-				ULGate: GateOpen,
-				DLGate: GateOpen,
-			}
-			if newQER.GBR = BuildGBR(&qosData); newQER.GBR != nil {
-				logger.PduSessLog.Infof("CreateDedicatedQosQer: GBR set [UL=%d kbps, DL=%d kbps] for QoSId [%s]",
-					newQER.GBR.ULGBR, newQER.GBR.DLGBR, qosData.GetQosId())
-			} else {
-				logger.PduSessLog.Infof("CreateDedicatedQosQer: no GBR configured for QoSId [%s]", qosData.GetQosId())
-			}
-
-			// Set Maximum Bit Rate (MBR) if configured
-			var maxbrul string
-			var maxbrdl string
-			// Set Guaranteed Bit Rate (GBR) if configured
-			if maxbrUl, ok := qosData.GetMaxbrUlOk(); ok && maxbrUl != nil && *maxbrUl != "" {
-				maxbrul = *maxbrUl
-			}
-			if maxbrDl, ok := qosData.GetMaxbrDlOk(); ok && maxbrDl != nil && *maxbrDl != "" {
-				maxbrdl = *maxbrDl
-			}
-
-			if maxbrul != "" && maxbrdl != "" {
-				newQER.MBR = &MBR{
-					ULMBR: util.BitRateTokbps(util.NormalizeBitRate(maxbrul)),
-					DLMBR: util.BitRateTokbps(util.NormalizeBitRate(maxbrdl)),
-				}
-				logger.PduSessLog.Infof("CreateDedicatedQosQer: MBR set [UL=%d kbps, DL=%d kbps]",
-					newQER.MBR.ULMBR, newQER.MBR.DLMBR)
-			} else {
-				logger.PduSessLog.Infof("CreateDedicatedQosQer: no MBR configured for QoSId [%s]", qosData.GetQosId())
-			}
-
-			// Log the created QER
-			logger.PduSessLog.Infof("CreateDedicatedQosQer: QER created [QER-ID=%d, QFI=%d] for UE [%s], QoSId [%s]",
-				newQER.QERID, newQER.QFI.QFI, smContext.Supi, qosData.GetQosId())
-
-			// Track the last created QER
-			createdQERs = append(createdQERs, newQER)
-		}
+// ueIpAddressIE builds the UE IP Address IE for a PDI of this session.
+//
+// A UPF that allocates is asked to choose (CHV4), except for a session on a staticIpInfo address:
+// that one is named, or the UPF allocates over it and the SMF adopts its choice.
+//
+// Where the UPF allocates, a staticIpInfo address has to be outside the UPF's own pool. PFCP
+// cannot reserve it there, and the SMF cannot check it: the UPF's pool is not signalled over N4.
+func ueIpAddressIE(smContext *SMContext, upf *UPF) UEIPAddress {
+	if upf.IsUpfSupportUeIpAddrAlloc() && !smContext.HasStaticUeIpAddr() {
+		return UEIPAddress{CHV4: true}
 	}
 
-	// If no dedicated QERs was created, log a warning
-	if len(createdQERs) == 0 {
-		logger.PduSessLog.Warnf("CreateDedicatedQosQer: no dedicated QER created for UE [%s]", smContext.Supi)
-		return nil, nil
-	}
-
-	// Log success with last created QER
-	logger.PduSessLog.Infof("CreateDedicatedQosQer: success, created %d QER(s) for UE [%s]",
-		len(createdQERs), smContext.Supi)
-
-	return createdQERs, nil
+	return UEIPAddress{V4: true, Ipv4Address: smContext.PDUAddress.Ip.To4()}
 }
 
 // ActivateUpLinkPdr
 func (dpNode *DataPathNode) ActivateUpLinkPdr(smContext *SMContext, defQER *QER, defPrecedence uint32) error {
-	ueIpAddr := UEIPAddress{}
-	if dpNode.UPF.IsUpfSupportUeIpAddrAlloc() {
-		ueIpAddr.CHV4 = true
-	} else {
-		ueIpAddr.V4 = true
-		ueIpAddr.Ipv4Address = smContext.PDUAddress.Ip.To4()
-	}
+	ueIpAddr := ueIpAddressIE(smContext, dpNode.UPF)
 
 	curULTunnel := dpNode.UpLinkTunnel
 	for name, ULPDR := range curULTunnel.PDR {
@@ -758,14 +754,7 @@ func (dpNode *DataPathNode) ActivateDlLinkPdr(smContext *SMContext, defQER *QER,
 	var iface *UPFInterfaceInfo
 	curDLTunnel := dpNode.DownLinkTunnel
 
-	// UPF provided UE ip-addr
-	ueIpAddr := UEIPAddress{}
-	if dpNode.UPF.IsUpfSupportUeIpAddrAlloc() {
-		ueIpAddr.CHV4 = true
-	} else {
-		ueIpAddr.V4 = true
-		ueIpAddr.Ipv4Address = smContext.PDUAddress.Ip.To4()
-	}
+	ueIpAddr := ueIpAddressIE(smContext, dpNode.UPF)
 
 	for name, DLPDR := range curDLTunnel.PDR {
 		logger.CtxLog.Infof("activate Downlink PDR[%v]:[%v]", name, DLPDR)
@@ -878,6 +867,12 @@ func (dataPath *DataPath) ActivateTunnelAndPDR(smContext *SMContext, precedence 
 
 		logger.CtxLog.Debugln("calculate", curDataPathNode.UPF.PFCPAddr().String())
 
+		if curDataPathNode.UPF.IsUpfSupportUeIpAddrAlloc() && smContext.HasStaticUeIpAddr() {
+			logger.CtxLog.Infof("UPF[%s] allocates UE addresses; naming %s's static address %s in "+
+				"its rules, which the UPF's own pool must not contain",
+				curDataPathNode.UPF.PFCPAddr(), smContext.Supi, smContext.PDUAddress.Ip)
+		}
+
 		// Setup UpLink PDR
 		if curDataPathNode.UpLinkTunnel != nil {
 			if err := curDataPathNode.ActivateUpLinkPdr(smContext, defQER, precedence); err != nil {
@@ -892,13 +887,7 @@ func (dataPath *DataPath) ActivateTunnelAndPDR(smContext *SMContext, precedence 
 			}
 		}
 
-		ueIpAddr := UEIPAddress{}
-		if curDataPathNode.UPF.IsUpfSupportUeIpAddrAlloc() {
-			ueIpAddr.CHV4 = true
-		} else {
-			ueIpAddr.V4 = true
-			ueIpAddr.Ipv4Address = smContext.PDUAddress.Ip.To4()
-		}
+		ueIpAddr := ueIpAddressIE(smContext, curDataPathNode.UPF)
 
 		if curDataPathNode.DownLinkTunnel != nil {
 			if curDataPathNode.DownLinkTunnel.SrcEndPoint == nil {
