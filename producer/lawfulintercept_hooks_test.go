@@ -67,6 +67,25 @@ func TestContextReplacementReportsAndUntasks(t *testing.T) {
 	}
 }
 
+// TestARestoredSessionReleasedOnReestablishmentReportsAndUntasks is the replacement case for a
+// session read back from the datastore: the subscriber established the same PDU session ID again
+// after an SMF restart, so the stored session ends without being released.
+func TestARestoredSessionReleasedOnReestablishmentReportsAndUntasks(t *testing.T) {
+	calls := captureLI(t)
+	sc := teardownSession(t)
+
+	ReleaseRestoredSession(sc)
+
+	if calls.released != 1 {
+		t.Errorf("release reported %d times, want 1 — the agency holds the stored session's "+
+			"establishment and would never see it end", calls.released)
+	}
+	if calls.untasked != 1 {
+		t.Errorf("triggers withdrawn %d times, want 1 — a trigger installed for the stored "+
+			"session would outlive it", calls.untasked)
+	}
+}
+
 // TestTeardownHooksTravelTogether pins the pairing itself. Reporting without
 // withdrawing is the more damaging half-measure, because the record makes the
 // teardown look handled while the trigger stays installed.

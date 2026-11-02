@@ -23,7 +23,7 @@ import (
 // the shape `li-content-interception` forbids outright: the trigger stays installed at a UPF for a
 // session that no longer exists, and the agency is never told the session ended.
 //
-// This is a source-level assertion because the alternative is five integration fixtures for a
+// This is a source-level assertion because the alternative is an integration fixture per path for a
 // property that is really about placement. It fails when a call site is removed, and it fails when
 // a teardown path is renamed — at which point the person renaming it decides whether the
 // obligation moved with it.
@@ -38,6 +38,10 @@ func TestEveryTeardownPathReportsAndUntasks(t *testing.T) {
 		{
 			pduSession, "HandlePduSessionContextReplacement",
 			"a session replaced by a new one for the same subscriber ends without ever being released",
+		},
+		{
+			pduSession, "ReleaseRestoredSession",
+			"a session read back from the datastore ends when its PDU session ID is established again",
 		},
 		{
 			pduSession, "HandlePDUSessionSMContextUpdate",

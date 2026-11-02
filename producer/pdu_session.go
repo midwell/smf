@@ -181,6 +181,14 @@ func ReleaseRestoredSession(smContext *smf_context.SMContext) {
 	defer smContext.SMLock.Unlock()
 
 	smContext.LocalPurged.Store(true)
+
+	// Lawful Interception IRI-POI: the session ends here as it does on an in-memory replacement,
+	// and owes the same record and withdrawal. A stored session is reportable however its
+	// establishment was reported: the flag that would say so is not stored. Before
+	// RemoveSMContextLocked and releaseTunnel, while the session's tunnel and PFCP contexts can
+	// still be read. Silent no-op unless LI is configured.
+	reportAndUntask(smContext)
+
 	smf_context.RemoveSMContextLocked(smContext)
 	if smContext.Tunnel != nil {
 		releaseTunnel(smContext)
