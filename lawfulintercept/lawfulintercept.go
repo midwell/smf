@@ -1243,6 +1243,19 @@ func (s *subsystem) scanSessions(task types.InterceptTask, underAuthority bool, 
 			}
 
 			sc.SMLock.Lock()
+			// **And that the session has not ended since it was matched.** The match was taken
+			// under an earlier hold of this lock. A teardown in between owns the session's
+			// release record and the withdrawal of its triggers. Most teardowns also nil the
+			// tunnel, which makes everything below a no-op, but a restoration's release does
+			// not: the UPF restarted, so no deletion is sent and the tunnel stays. Acting on
+			// it then would send a modification for a dead SEID and claim a trigger nothing
+			// withdraws again. A deactivation scan loses nothing by the skip, since the
+			// teardown took the duplication down.
+			if sc.SMContextState == smfctx.SmStateRelease || sc.LocalPurged.Load() || sc.SupersededByAnother() {
+				sc.SMLock.Unlock()
+
+				continue
+			}
 			// **And that the task still names this session's subject.** The re-read above
 			// establishes that the task exists, and — because everything below is derived
 			// from `task` — which products it wants and where its product goes. It did not

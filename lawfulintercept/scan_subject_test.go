@@ -145,3 +145,40 @@ func TestADeactivationScanIsNotSubjectChecked(t *testing.T) {
 		}
 	}
 }
+
+// TestAScanSkipsASessionThatEndedAfterItWasMatched: the scan matches sessions in one pass and
+// acts on them in another, and a session can end in between. A restoration's release leaves the
+// session's tunnel in place, so nothing downstream notices: the scan would emit a record for a
+// session already reported released, and could claim a trigger nothing withdraws again.
+func TestAScanSkipsASessionThatEndedAfterItWasMatched(t *testing.T) {
+	task := types.InterceptTask{
+		XID:      testXIDPrimary,
+		Targets:  []types.TargetIdentifier{{Type: types.TargetSUPI, Value: "262019876543210"}},
+		Products: []types.ProductType{types.ProductIRI},
+		State:    types.TaskActive,
+	}
+
+	sub, _, snd := scanFixture(t, task, 3)
+
+	// After the first record, every matched session ends, as markReleasedAndBuild ends one: the
+	// state changes under the lock, and the tunnel stays.
+	beforeScanRecord = func() {
+		smfctx.RangeSMContexts(func(sc *smfctx.SMContext) bool {
+			sc.SMLock.Lock()
+			sc.SMContextState = smfctx.SmStateRelease
+			sc.SMLock.Unlock()
+
+			return true
+		})
+		beforeScanRecord = nil
+	}
+	t.Cleanup(func() { beforeScanRecord = nil })
+
+	sub.reportStartOfInterception(task, nil)
+	sub.scans.Wait()
+
+	if n := snd.count(); n > 1 {
+		t.Errorf("the scan delivered %d records, want at most 1 (the one before the sessions ended): "+
+			"each later one reports interception starting on a session already released", n)
+	}
+}
