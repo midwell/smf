@@ -97,3 +97,24 @@ func TestAbandoningStopsOnlyARestorationForAnotherRestart(t *testing.T) {
 		t.Error("a restoration for an earlier restart was not abandoned when a later one was withheld")
 	}
 }
+
+// A session released or replaced after the release enumerated it is not one left without service.
+// Counting it as a failed release would have the gauge report a session the node no longer has.
+func TestAReleaseDoesNotCountASessionGoneMeanwhileAsWithoutService(t *testing.T) {
+	restoreQuickly(t)
+	const nodeIP = "10.30.1.9"
+	nodeID := *context.NewNodeID(nodeIP)
+	associatedUpfAt(t, nodeIP)
+
+	// Replaced by its subscriber between the enumeration and the release: purged, still pooled.
+	gone := sessionOn(t, "imsi-208930000000909", 1, nodeIP)
+	t.Cleanup(func() { context.RemoveSMContext(gone.Ref) })
+	gone.LocalPurged.Store(true)
+
+	releaseAnchored(nodeID, nodeIP, &restorationRun{recovery: time.Now()})
+
+	if got := unrestoredOn(t, nodeIP); got != 0 {
+		t.Errorf("the node reports %v sessions without service, want 0: the only session was released "+
+			"or replaced before this release reached it", got)
+	}
+}

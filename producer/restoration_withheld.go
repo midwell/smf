@@ -4,6 +4,7 @@
 package producer
 
 import (
+	"errors"
 	"net"
 	"runtime/debug"
 	"time"
@@ -92,7 +93,7 @@ func releaseAnchored(nodeID context.NodeID, nodeIP string, run *restorationRun) 
 	logger.PfcpLog.Errorf("UPF[%s] restarted and its %d session(s) are being released rather than restored",
 		nodeIP, len(anchored))
 
-	released, notReleased := 0, 0
+	released, notReleased, gone := 0, 0, 0
 	for i, smContext := range anchored {
 		// Stopped by a restoration for a later restart, which enumerates these sessions again
 		// against the incarnation that is current; the gauge is that run's to set.
@@ -103,12 +104,21 @@ func releaseAnchored(nodeID context.NodeID, nodeIP string, run *restorationRun) 
 			return
 		}
 		smContext.SubPfcpLog.Errorf("session could not be restored on UPF[%s]; releasing it", nodeIP)
-		if err := releaseOneSession(smContext); err != nil {
+		if err := releaseOneSession(smContext); errors.Is(err, errSessionGone) {
+			// Released, or replaced by its subscriber, since it was enumerated: not a session left
+			// without service, so not counted as one.
+			smContext.SubPfcpLog.Infof("session was released or replaced meanwhile; not releasing it again")
+			gone++
+			continue
+		} else if err != nil {
 			smContext.SubPfcpLog.Errorf("releasing the unrestorable session failed: %v", err)
 			notReleased++
 			continue
 		}
 		released++
+	}
+	if gone > 0 {
+		logger.PfcpLog.Infof("UPF[%s] %d session(s) were released or replaced meanwhile", nodeIP, gone)
 	}
 	metrics.AddUpfRestorationStats(smfID, nodeIP, "released", released)
 	metrics.SetUpfUnrestoredSessions(smfID, nodeIP, notReleased+attributableTo(nodeIP, unexaminable))
