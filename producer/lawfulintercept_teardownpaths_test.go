@@ -44,6 +44,10 @@ func TestEveryTeardownPathReportsAndUntasks(t *testing.T) {
 			"a session read back from the datastore ends when its PDU session ID is established again",
 		},
 		{
+			"restoration.go", "markReleasedAndBuild",
+			"a restoration releases the sessions a restarted UPF would not take back, and those read back from the datastore",
+		},
+		{
 			pduSession, "HandlePDUSessionSMContextUpdate",
 			"an update that deletes the session is a teardown the release handler never sees",
 		},

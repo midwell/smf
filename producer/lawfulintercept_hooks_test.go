@@ -8,6 +8,7 @@ import (
 
 	smf_context "github.com/omec-project/smf/context"
 	"github.com/omec-project/smf/factory"
+	"github.com/omec-project/smf/util"
 )
 
 // liCalls records which teardown hooks ran, by swapping the package seam.
@@ -83,6 +84,28 @@ func TestARestoredSessionReleasedOnReestablishmentReportsAndUntasks(t *testing.T
 	if calls.untasked != 1 {
 		t.Errorf("triggers withdrawn %d times, want 1 — a trigger installed for the stored "+
 			"session would outlive it", calls.untasked)
+	}
+}
+
+// TestARestorationReleaseReportsAndUntasks covers the release a restoration makes of a session
+// it will not re-install. Whether the release command could be built does not matter here: the
+// session has left the pool either way.
+func TestARestorationReleaseReportsAndUntasks(t *testing.T) {
+	calls := captureLI(t)
+	sc := teardownSession(t)
+
+	n1n2Request, err := markReleasedAndBuild(sc)
+	if n1n2Request != nil {
+		util.CleanupMultipartTempFiles(n1n2Request)
+	}
+	if err != nil {
+		t.Logf("the release command was not built (%v); the session was removed regardless", err)
+	}
+
+	if calls.released != 1 || calls.untasked != 1 {
+		t.Errorf("release reported %d times and triggers withdrawn %d times, want 1 and 1 — the "+
+			"agency would never see the session end, and its triggers would outlive it",
+			calls.released, calls.untasked)
 	}
 }
 
