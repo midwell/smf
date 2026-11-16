@@ -4,14 +4,14 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 
-FROM golang:1.27.3-bookworm@sha256:d9b6a1beb9474adc2a1ce842573639b44b2a0dd49b6669f51d3821baf9ec37c9 AS builder
+FROM golang:1.27.4-bookworm@sha256:4fa7c968ba93f1635670522dbb01a2c78150443e1385746924566079f36570ea AS builder
 
 WORKDIR $GOPATH/src/smf
 COPY . .
 ARG MAKEFLAGS
 RUN make all
 
-FROM alpine:3.24@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a AS smf
+FROM alpine:3.24@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf AS smf
 
 # Build arguments for dynamic labels
 ARG VERSION=dev
@@ -38,5 +38,10 @@ RUN apk add --no-cache bash && \
         apk add --no-cache vim nano strace net-tools curl netcat-openbsd bind-tools; \
     fi
 
+# Run as an unprivileged user
+RUN addgroup -S -g 1000 aether && adduser -S -u 1000 -G aether aether
+
 # Copy executable
-COPY --from=builder /go/src/smf/bin/* /usr/local/bin/.
+COPY --chmod=755 --from=builder /go/src/smf/bin/* /usr/local/bin/.
+
+USER 1000:1000
