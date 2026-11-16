@@ -48,7 +48,21 @@ func targetSM() *smfctx.SMContext {
 		// An established session has an address assigned, and it is the subject's
 		// own — not the serving UPF's, which servingUPFTEID reports separately.
 		PDUAddress: &smfctx.UeIpAddr{Ip: net.ParseIP("10.45.0.2")},
+		// And its uplink tunnel: gTPTunnelInfo is mandatory in the establishment,
+		// modification and start-of-interception records, and the codec refuses one
+		// without it.
+		Tunnel: establishedTunnel(),
 	}
+}
+
+// establishedTunnel is the default data path of an established session: the serving UPF
+// and the uplink TEID servingUPFTEID reports.
+func establishedTunnel() *smfctx.UPTunnel {
+	node := smfctx.NewDataPathNode()
+	node.UpLinkTunnel.TEID = 0x0a0b0c0d
+	node.UPF = &smfctx.UPF{NodeID: smfctx.NodeID{NodeIdType: smfctx.NodeIdTypeIpv4Address, NodeIdValue: net.ParseIP("10.100.0.9").To4()}}
+
+	return &smfctx.UPTunnel{DataPathPool: smfctx.DataPathPool{1: &smfctx.DataPath{IsDefaultPath: true, FirstDPNode: node}}}
 }
 
 func TestTargetsOf(t *testing.T) {
@@ -168,7 +182,8 @@ func TestGTPTunnelInfoIsReported(t *testing.T) {
 	}
 
 	// With no data path the POI has no tunnel to report, so the field stays empty
-	// and the codec omits it rather than reporting a tunnel with endpoint zero.
+	// rather than reporting a tunnel with endpoint zero, and the codec refuses the
+	// record: the payload tables make the field mandatory.
 	empty := smfModification(&smfctx.SMContext{}).GTPTunnelInfo.FiveGSGTPTunnels.ULNGUUPTunnelInformation
 	if empty.TEID != 0 || empty.IPv4Address != nil || empty.IPv6Address != nil {
 		t.Errorf("tunnel-less context produced %+v, want a zero F-TEID", empty)

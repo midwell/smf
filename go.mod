@@ -9,7 +9,7 @@ require (
 	github.com/omec-project/nas/v2 v2.2.7
 	github.com/omec-project/ngap/v2 v2.1.10
 	github.com/omec-project/openapi/v2 v2.4.1
-	github.com/omec-project/util v1.9.3
+	github.com/omec-project/util v1.10.0
 	github.com/prometheus/client_golang v1.25.0
 	github.com/prometheus/client_model v0.6.3
 	github.com/segmentio/kafka-go v0.4.51
@@ -64,5 +64,3 @@ require (
 	golang.org/x/text v0.43.0 // indirect
 	google.golang.org/protobuf v1.36.12 // indirect
 )
-
-replace github.com/omec-project/util => github.com/midwell/util v0.0.0-20261023180626-bc6bf3a9199a

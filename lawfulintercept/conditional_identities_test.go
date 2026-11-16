@@ -41,6 +41,9 @@ func fullSession() *smfctx.SMContext {
 	// has no zero — see the note in scan_authority_test.go. A session holding an address
 	// has completed establishment, so it always has one.
 	sc.SelectedPDUSessionType = nasMessage.PDUSessionTypeIPv4
+	// gTPTunnelInfo is mandatory in three of its records, and an established session has
+	// its uplink tunnel.
+	sc.Tunnel = establishedTunnel()
 
 	return sc
 }

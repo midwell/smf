@@ -482,7 +482,7 @@ func Init(cfg Config) error {
 		watcher *x1.DestinationWatcher
 		sub     *subsystem
 	)
-	pool := x2x3.NewPool(mat.ClientTLS(),
+	pool, err := x2x3.NewPool(mat.ClientTLS(),
 		keepaliveConfig(cfg, reporter),
 		// **The error is inspected, not discarded.** ErrUnitDropped says delivery to
 		// this destination is working and one product unit of it was lost: a partial
@@ -524,6 +524,13 @@ func Init(cfg Config) error {
 				"xIRI dropped from the X2 delivery queue")
 		},
 	)
+	if err != nil {
+		// NewPool refuses a nil TLS configuration and keepalive timers Validate refuses.
+		// Neither reaches it today: the configuration comes from the loaded material, and
+		// keepaliveConfig falls back to the defaults on timers it cannot use. Checked so
+		// that a change to either refuses the start instead of failing every delivery.
+		return fmt.Errorf("lawful interception: X2 delivery: %w", err)
+	}
 	sub = &subsystem{
 		store:     st,
 		senderFor: func(addr string) sender { return pool.For(addr) },
