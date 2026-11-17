@@ -1047,6 +1047,76 @@ func (s *subsystem) reconcileEndpoint(nodeID string, endpoint *upfEndpoint) {
 	// Synchronously, on this endpoint's own goroutine: a POI that will not
 	// acknowledge holds up nothing but its own reconciliation.
 	s.deactivate(orphans)
+
+	// And then what the current warrants call for at this POI is installed again. After the
+	// withdrawal, so what it installs is not withdrawn as an orphan.
+	s.retriggerAt(nodeID)
+}
+
+// retriggerAt installs the triggers the current CC warrants call for on the live sessions
+// served by the POI configured as nodeID.
+//
+// ForgetPOI drops this element's claims at a POI that stopped answering, and reconciliation
+// then withdraws whatever that POI still holds, because nothing here can name it any more. When
+// the POI did not restart, its sessions are live and their FARs still duplicate, and nothing else
+// installs their triggers again: establishment installs them for a new session, and a scan only
+// on a warrant change. Content interception at that POI would stop with nothing reported.
+//
+// Claims make it idempotent. plan skips a (warrant, session, POI) already claimed, so a trigger
+// that was never discarded, or that an establishment has installed again, is not installed twice.
+// At start-up no warrant is held yet, and nothing is installed.
+//
+// A session is skipped unless the node's current incarnation acknowledged it. After a restart,
+// a session that restoration has not re-established yet still carries the SEID the previous
+// incarnation assigned: a trigger planned on it would match nothing, and its claim would make
+// the re-establishment skip the trigger it should install.
+func (s *subsystem) retriggerAt(nodeID string) {
+	smfctx.RangeSMContexts(func(sc *smfctx.SMContext) bool {
+		sc.SMLock.Lock()
+		defer sc.SMLock.Unlock()
+
+		// The same skip the activation scan makes: a session that has ended belongs to its
+		// teardown, which withdraws its triggers.
+		if sc.SMContextState == smfctx.SmStateRelease || sc.LocalPurged.Load() || sc.SupersededByAnother() {
+			return true
+		}
+		if s.servedByCurrentIncarnation(sc, nodeID) {
+			s.triggerCC(sc)
+		}
+
+		return true
+	})
+}
+
+// servedByCurrentIncarnation reports whether the POI configured as nodeID serves sc on a PFCP
+// session that the node's current incarnation acknowledged. Caller holds sc.SMLock, and not
+// r.mu: the node's held recovery timestamp is read under UpfLock, which a restart path holds
+// while it waits for r.mu.
+func (s *subsystem) servedByCurrentIncarnation(sc *smfctx.SMContext, nodeID string) bool {
+	if sc.Tunnel == nil {
+		return false
+	}
+	for _, dp := range sc.Tunnel.DataPathPool {
+		for node := dp.FirstDPNode; node != nil; node = node.Next() {
+			if node.UPF == nil {
+				continue
+			}
+			// Keyed and matched as sessionUPFs keys and plan matches.
+			addr := node.UPF.NodeID.ResolveNodeIdToIp().String()
+			pfcpCtx := sc.PFCPContext[addr]
+			if pfcpCtx == nil || pfcpCtx.RemoteSEID == 0 {
+				continue
+			}
+			s.triggers.mu.Lock()
+			key, _, ok := s.triggers.matchEndpoint(upfSession{node: node.UPF.NodeID, addr: addr})
+			s.triggers.mu.Unlock()
+			if ok && key == nodeID && pfcpCtx.AcknowledgedAtRecovery.Unix() == node.UPF.HeldRecovery().Unix() {
+				return true
+			}
+		}
+	}
+
+	return false
 }
 
 // noteTaskHealth reports every trigger this element holds that the POI says is not running.
@@ -1242,8 +1312,9 @@ func TriggerCC(sc *smfctx.SMContext) {
 }
 
 // POIRestarted tells the CC Triggering Function that a triggered point of interception
-// has stopped answering, so the tasking this element believes it holds there is discarded and
-// subsequent establishments and scans re-install it. Silent no-op unless LI is configured.
+// has stopped answering, so the tasking this element believes it holds there is discarded. The
+// endpoint's reconciliation that follows re-installs it for the POI's live sessions (see
+// retriggerAt), and establishments install it for new ones. Silent no-op unless LI is configured.
 //
 // **It takes the node identity, not a pre-resolved string**, because the
 // registry has to be allowed to apply its own matching rule. Trigger keys carry
@@ -1264,7 +1335,8 @@ func TriggerCC(sc *smfctx.SMContext) {
 // any session is re-installed. This is for the paths on which a UPF stops answering, where
 // nothing is restored. If it comes back having restarted, its re-association reports a new
 // recovery timestamp and is gated in turn; if it comes back with the timestamp it had, nothing
-// is restored, and the discard here is what lets its next establishments re-install tasking.
+// is restored, and the discard here is what lets reconciliation and its next establishments
+// re-install tasking.
 func POIRestarted(node smfctx.NodeID) {
 	if sub := active.Load(); sub != nil {
 		// Resolved here, not by the caller, so an element without LI does no lookup.
@@ -1284,8 +1356,9 @@ func (s *subsystem) discardRestarted(session upfSession) restartMatch {
 		// the ADMF's to work out from its own provisioning, and this element cannot
 		// name them without disclosing tasking on a channel that must not carry it.
 		s.reporter.NotifyAsync(x1.NEIssueReconcileFailed,
-			"a triggered point of interception restarted; the tasking this element believed it held "+
-				"there has been discarded and will be re-installed as sessions are established or scanned")
+			"a triggered point of interception restarted or stopped answering; the tasking this element "+
+				"believed it held there has been discarded, and is re-installed for its live sessions once "+
+				"it has reported what it holds, and for re-established sessions as they are established")
 	}
 
 	return match

@@ -3610,6 +3610,143 @@ func TestAPOIWhoseClaimsWereDiscardedIsReconciledAgain(t *testing.T) {
 	}
 }
 
+// liveCCSession is a target's live session at trigNodeA, acknowledged by the incarnation of
+// the node acknowledgedAt names, with a CC warrant covering it activated in s's store.
+func liveCCSession(t *testing.T, s *subsystem, acknowledgedAt time.Time) *smfctx.SMContext {
+	t.Helper()
+
+	sc := pooledSession(t, testSUPI, 7)
+	node := smfctx.NewDataPathNode()
+	node.UPF = &smfctx.UPF{NodeID: upfNode(trigNodeA)}
+	node.UpLinkTunnel.PDR["default"] = &smfctx.PDR{FAR: &smfctx.FAR{
+		ApplyAction: smfctx.ApplyAction{Forw: true, Dupl: true},
+		State:       smfctx.RULE_CREATE,
+	}}
+	sc.SMLock.Lock()
+	sc.Tunnel = &smfctx.UPTunnel{DataPathPool: smfctx.DataPathPool{
+		1: &smfctx.DataPath{FirstDPNode: node, IsDefaultPath: true, Activated: true},
+	}}
+	sc.PFCPContext = map[string]*smfctx.PFCPSessionContext{trigNodeA: {
+		NodeID:                 upfNode(trigNodeA),
+		RemoteSEID:             0x2632898145f4d191,
+		AcknowledgedAtRecovery: acknowledgedAt,
+	}}
+	sc.SMLock.Unlock()
+
+	if !s.store.Activate(types.InterceptTask{
+		XID:      testXIDSecondary,
+		Targets:  []types.TargetIdentifier{{Type: types.TargetSUPI, Value: "262019876543210"}},
+		Products: []types.ProductType{types.ProductCC},
+		State:    types.TaskActive,
+	}) {
+		t.Fatal("failed to activate the warrant")
+	}
+
+	return sc
+}
+
+// waitForMessages waits until poi has received n messages of msgType.
+func waitForMessages(poi *fakePOI, msgType string, n int) bool {
+	deadline := time.Now().Add(5 * time.Second)
+	for poi.countMessages(msgType) < n && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	return poi.countMessages(msgType) >= n
+}
+
+// TestALiveSessionIsRetriggeredAfterItsPOIIsReconciled follows a POI whose claims were
+// discarded on a liveness timeout and which did not restart. Reconciliation withdraws the
+// tasking it still holds, because this element can no longer name it; the session is live and
+// its FARs still duplicate, so its trigger must be installed again, after the withdrawal.
+// Nothing else does it: establishment installs a trigger for a new session, and a scan runs
+// only on a warrant change.
+func TestALiveSessionIsRetriggeredAfterItsPOIIsReconciled(t *testing.T) {
+	poi := newFakePOI(t)
+	s := triggerSubsystem(t, poi)
+	s.reconcileOne()
+
+	sc := liveCCSession(t, s, time.Time{})
+	sc.SMLock.Lock()
+	s.triggerCC(sc)
+	sc.SMLock.Unlock()
+	if !waitForMessages(poi, "ActivateTaskRequest", 1) {
+		t.Fatal("the session's trigger was never installed, so this test would prove nothing")
+	}
+
+	var mine []string
+	s.triggers.mu.Lock()
+	for _, installed := range s.triggers.installed {
+		mine = append(mine, string(installed.xid))
+	}
+	s.triggers.mu.Unlock()
+	poi.mu.Lock()
+	poi.holds = mine
+	poi.mu.Unlock()
+
+	if n := s.triggers.ForgetPOI(trigNodeA); n == 0 {
+		t.Fatal("ForgetPOI discarded nothing, so this test would prove nothing")
+	}
+	s.triggers.keepaliveRound()
+
+	if !waitForMessages(poi, "DeactivateTaskRequest", 1) {
+		t.Fatal("the tasking the POI still held was never withdrawn")
+	}
+	if !waitForMessages(poi, "ActivateTaskRequest", 2) {
+		t.Fatal("the live session's trigger was not installed again after reconciliation: its " +
+			"FARs duplicate and the POI holds no trigger for them, so content interception " +
+			"has stopped with nothing reported")
+	}
+
+	// After the withdrawal, or the withdrawal took the new trigger with it.
+	lastDeactivate, lastActivate := -1, -1
+	for i, body := range poi.sent() {
+		switch {
+		case strings.Contains(body, `xsi:type="ns1:DeactivateTaskRequest"`):
+			lastDeactivate = i
+		case strings.Contains(body, `xsi:type="ns1:ActivateTaskRequest"`):
+			lastActivate = i
+		}
+	}
+	if lastActivate < lastDeactivate {
+		t.Error("the trigger was installed again before reconciliation withdrew the POI's tasking")
+	}
+	s.triggers.mu.Lock()
+	_, claimed := s.triggers.installed[triggerKey(testXIDSecondary, sc.Ref, trigNodeA)]
+	s.triggers.mu.Unlock()
+	if !claimed {
+		t.Error("the trigger installed again is not claimed, so nothing withdraws it when the session ends")
+	}
+}
+
+// TestASessionAnEarlierIncarnationAcknowledgedIsNotRetriggered is the restart side of the
+// above. A session that restoration has not re-established yet still carries the SEID the
+// previous incarnation assigned; a trigger planned on it matches nothing, and its claim would
+// make the re-establishment skip the trigger it should install.
+func TestASessionAnEarlierIncarnationAcknowledgedIsNotRetriggered(t *testing.T) {
+	poi := newFakePOI(t)
+	s := triggerSubsystem(t, poi)
+
+	// The node is held at a recovery timestamp later than the one the session was acknowledged
+	// at: it restarted, and has been associated again since.
+	sc := liveCCSession(t, s, time.Unix(1_700_000_000, 0))
+	sc.SMLock.Lock()
+	sc.Tunnel.DataPathPool[1].FirstDPNode.UPF.RecoveryTimeStamp.RecoveryTimeStamp = time.Unix(1_700_000_600, 0)
+	sc.SMLock.Unlock()
+
+	s.reconcileOne()
+
+	if n := poi.countMessages("ActivateTaskRequest"); n != 0 {
+		t.Errorf("%d triggers were installed for a session the node's current incarnation does not hold", n)
+	}
+	s.triggers.mu.Lock()
+	n := len(s.triggers.installed)
+	s.triggers.mu.Unlock()
+	if n != 0 {
+		t.Errorf("%d claims recorded for a session the node's current incarnation does not hold", n)
+	}
+}
+
 // TestAFaultyTriggerIsAnsweredAndNotOnlyPushed covers the other obligation.
 //
 // `The element reports the fault conditions that currently hold` requires a condition the element
