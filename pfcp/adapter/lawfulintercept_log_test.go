@@ -68,7 +68,10 @@ func TestTheAdapterResponseLogsDoNotNameAnInterceptedSubscriber(t *testing.T) {
 		ie.NewCause(ie.CauseRequestAccepted), ie.NewNodeID(ip, "", ""))
 	// No transaction is pending for the sequence, so the handler refuses the response; the
 	// session has been logged by then.
-	_ = adapter.HandlePfcpSessionEstablishmentResponse(rsp)
+	if err := adapter.HandlePfcpSessionEstablishmentResponse(rsp); err == nil {
+		t.Fatal("the establishment response was accepted with no transaction pending, so this " +
+			"test is not driving the path it describes")
+	}
 
 	rsp.PfcpMessage = message.NewSessionModificationResponse(0, 0, seid, 9192, 0,
 		ie.NewCause(ie.CauseRequestAccepted))
