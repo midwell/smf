@@ -154,7 +154,7 @@ func ModifySessionForLI(smContext *context.SMContext) error {
 					ip := node.GetNodeIP()
 					g := groups[ip]
 					if g == nil {
-						g = &group{nodeID: node.UPF.NodeID, port: node.UPF.Port, seen: map[*context.FAR]bool{}}
+						g = &group{nodeID: node.UPF.NodeID, port: node.UPF.PFCPPort(), seen: map[*context.FAR]bool{}}
 						groups[ip] = g
 					}
 					if !g.seen[pdr.FAR] {
