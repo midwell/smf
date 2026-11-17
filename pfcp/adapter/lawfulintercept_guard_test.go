@@ -18,6 +18,10 @@ import (
 
 // modificationResponse builds an accepted Session Modification Response carrying the
 // given sequence number, addressed to seid.
+
+// liTestUPFNode is the UPF the LI modifications in these tests are recorded against.
+const liTestUPFNode = "1.1.1.1"
+
 func modificationResponse(seq uint32, seid uint64) *udp.Message {
 	return &udp.Message{
 		RemoteAddr:  &net.UDPAddr{IP: net.ParseIP("1.1.1.1"), Port: 8805},
@@ -71,7 +75,7 @@ func TestLIModificationResponseDoesNotCompleteTheSessionsOwnProcedureInAdapterMo
 	// The request the modification carried, as the send site records it: the answer is
 	// correlated with what was asked, because the send clears the FAR state that would
 	// otherwise say.
-	lisequence.Mark(liSeq, lisequence.Request{SEID: seid, NodeID: "1.1.1.1", Duplicating: true})
+	lisequence.Mark(liSeq, lisequence.Request{SEID: seid, NodeID: liTestUPFNode, Duplicating: true})
 
 	if err := adapter.HandlePfcpSessionModificationResponse(modificationResponse(liSeq, seid)); err != nil {
 		t.Fatalf("the response was refused: %v", err)
@@ -158,7 +162,7 @@ func TestAnLIAnswerWithoutACauseIsHandedOnAsUnansweredInAdapterMode(t *testing.T
 	_, seid := modifyingSession(t)
 
 	const liSeq = uint32(5254)
-	lisequence.Mark(liSeq, lisequence.Request{SEID: seid, NodeID: "1.1.1.1", Duplicating: true})
+	lisequence.Mark(liSeq, lisequence.Request{SEID: seid, NodeID: liTestUPFNode, Duplicating: true})
 
 	var (
 		calls    int
@@ -200,7 +204,7 @@ func TestARepeatedLIModificationResponseIsStillLIInAdapterMode(t *testing.T) {
 	t.Cleanup(func() { adapter.LIModificationAnswered = orig })
 
 	const liSeq = uint32(5255)
-	lisequence.Mark(liSeq, lisequence.Request{SEID: seid, NodeID: "1.1.1.1", Duplicating: true})
+	lisequence.Mark(liSeq, lisequence.Request{SEID: seid, NodeID: liTestUPFNode, Duplicating: true})
 
 	for range 2 {
 		if err := adapter.HandlePfcpSessionModificationResponse(modificationResponse(liSeq, seid)); err != nil {
