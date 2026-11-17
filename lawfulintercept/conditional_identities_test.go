@@ -215,7 +215,7 @@ func TestTheN11RequestSuppliesTheAMFIdentityAndAuthenticationStatus(t *testing.T
 
 	supi, dnn := testSUPI, testDNN
 	rat := models.RATTYPE_NR
-	pei := "imeisv-3534250000000151"
+	pei := "imeisv-4901542032375181"
 	create := &models.SmContextCreateData{
 		Supi:                &supi,
 		Pei:                 &pei,
