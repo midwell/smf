@@ -22,8 +22,8 @@ import (
 // what needs asserting is which of *this* package's paths call the hooks, not
 // anything about the subsystem behind them.
 //
-// Production behaviour is unchanged: these are the same two functions, and both
-// remain silent no-ops when LI is not configured.
+// In production these are the lawfulintercept functions themselves, silent no-ops
+// when LI is not configured.
 var (
 	liReportRelease             = lawfulintercept.ReportRelease
 	liUntriggerCC               = lawfulintercept.UntriggerCC

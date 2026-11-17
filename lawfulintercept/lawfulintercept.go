@@ -600,7 +600,7 @@ func Init(cfg Config) error {
 	// to the caller, rather than being swallowed in a goroutine while LI already
 	// looks enabled (active.Store below) — otherwise no X1 tasking can be received.
 	// ListenConfig.Listen rather than net.Listen so the listen carries a context
-	// (the linter's noctx rule); the bind is otherwise unchanged.
+	// (the linter's noctx rule).
 	ln, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", cfg.X1Listen)
 	if err != nil {
 		if sub.reporter != nil {
@@ -1029,8 +1029,7 @@ func (s *subsystem) modifyInterception(prev, next types.InterceptTask) {
 	// The record scope belongs in the same test, and for the same reason the products do:
 	// widening it makes records due that the narrower scope excluded, for subjects the task
 	// already covered — so a scope-only modification *can* produce a record and must not take
-	// the early return. The AMF's predicate says the same three things; they had no business
-	// disagreeing.
+	// the early return. The AMF's predicate says the same three things.
 	if slices.Equal(prev.Targets, next.Targets) && wantedCC == wantsCC && wantedIRI == wantsIRI &&
 		prev.RecordScope == next.RecordScope {
 		// Nothing about *which* traffic is intercepted has moved. What may still have
@@ -1055,15 +1054,13 @@ func (s *subsystem) modifyInterception(prev, next types.InterceptTask) {
 	// content interception for a session whose tasking did not change.
 	s.retriggerWarrant(next)
 
-	// And the labelling, on this branch too. relabelWarrant was reached only from the
-	// early-return branch, so a ModifyTask that changed the targets *and* the productID
-	// or the X3 destinations took this path — where retriggerWarrant withdraws triggers
-	// for sessions the task no longer covers and leaves the rest untouched, still
-	// labelling their content with the superseded value. That reintroduces, for the
-	// combined case, exactly the divergence the labelling requirement was written to
-	// close: signalling arrives at the mediation function under one warrant identifier
-	// and content under another, both well-formed, with nothing in either stream to
-	// show they were meant to join.
+	// And the labelling, on this branch too. A ModifyTask that changes the targets *and*
+	// the productID or the X3 destinations takes this path, where retriggerWarrant
+	// withdraws triggers for sessions the task no longer covers and leaves the rest
+	// untouched. Without relabelling, those would keep labelling their content with the
+	// superseded value: signalling would arrive at the mediation function under one
+	// warrant identifier and content under another, both well-formed, with nothing in
+	// either stream to show they were meant to join.
 	//
 	// The combined case is where it is hardest to notice, because part of the
 	// modification visibly took effect. Called after the reconciliation so it acts on

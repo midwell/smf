@@ -1079,6 +1079,8 @@ func (smContext *SMContext) SetCreateData(createData *models.SmContextCreateData
 		smContext.Guami = *guami
 	}
 	smContext.UnauthenticatedSupi = createData.GetUnauthenticatedSupi()
+	// The PEI is a Lawful Interception target identity and a field of its records.
+	smContext.Pei = createData.GetPei()
 }
 
 // RebuildCommunicationClient reconstructs the Namf_Communication API client

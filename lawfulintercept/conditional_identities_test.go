@@ -12,6 +12,7 @@ import (
 	"github.com/omec-project/smf/factory"
 	"github.com/omec-project/smf/logger"
 	"github.com/omec-project/util/li/iri"
+	"github.com/omec-project/util/li/types"
 )
 
 // The conditional members of TS 33.128 the SMF holds and reports.
@@ -202,21 +203,22 @@ func TestAnAllZeroAMFIdentityIsReported(t *testing.T) {
 // The retention step, which the tests above do not reach.
 //
 // They build an SMContext directly, so they prove the builders map what the context
-// holds and nothing about whether the context ever holds it. SetCreateData retains
-// fifteen fields of the N11 request and dropped these two, so the builders could have
-// been correct while every real record carried neither — a field populated in a
-// builder and never supplied by the peer is this series' signature failure, and it is
-// invisible from inside the builder's own test.
+// holds and nothing about whether the context ever holds it. Without these three lines
+// of SetCreateData the builders could be correct while every real record carried none
+// of them, and a PEI warrant could match nothing — a field populated in a builder and
+// never supplied by the peer is invisible from inside the builder's own test.
 //
-// Reverting the two lines in SetCreateData must fail here, and does.
+// Reverting any of the three lines in SetCreateData fails here.
 func TestTheN11RequestSuppliesTheAMFIdentityAndAuthenticationStatus(t *testing.T) {
 	guami := models.Guami{AmfId: "c80043", PlmnId: models.PlmnIdNid{Mcc: "262", Mnc: "01"}}
 	unauthenticated := true
 
 	supi, dnn := testSUPI, testDNN
 	rat := models.RATTYPE_NR
+	pei := "imeisv-3534250000000151"
 	create := &models.SmContextCreateData{
 		Supi:                &supi,
+		Pei:                 &pei,
 		Dnn:                 &dnn,
 		Guami:               &guami,
 		UnauthenticatedSupi: &unauthenticated,
@@ -250,6 +252,16 @@ func TestTheN11RequestSuppliesTheAMFIdentityAndAuthenticationStatus(t *testing.T
 	}
 	if est.RATType != iri.RATNR {
 		t.Errorf("rATType = %d, want %d", est.RATType, iri.RATNR)
+	}
+	var peiTargets int
+	for _, id := range targetsOf(sc) {
+		if id.Type == types.TargetPEI {
+			peiTargets++
+		}
+	}
+	if peiTargets == 0 {
+		t.Error("the AMF sent a PEI on N11 and the session offers none as a target, so a " +
+			"warrant naming that PEI or IMEI matches nothing")
 	}
 	if got, want := est.ServingNetwork.PLMNID.MCC, iri.MCC("262"); got != want {
 		t.Errorf("servingNetwork MCC = %q, want %q", got, want)

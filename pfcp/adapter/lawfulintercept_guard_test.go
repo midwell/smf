@@ -150,3 +150,37 @@ func TestLIAnswerSurvivesAReleasedSessionInAdapterMode(t *testing.T) {
 		t.Errorf("answered with the wrong request: got %+v, want %+v", gotReq, req)
 	}
 }
+
+// An answer to an LI modification whose Cause cannot be read says nothing about whether the
+// datapath applied it, and is handed on as unanswered — which the LI subsystem retries —
+// rather than discarded with the response, as an ordinary response without a Cause is.
+func TestAnLIAnswerWithoutACauseIsHandedOnAsUnansweredInAdapterMode(t *testing.T) {
+	_, seid := modifyingSession(t)
+
+	const liSeq = uint32(5254)
+	lisequence.Mark(liSeq, lisequence.Request{SEID: seid, NodeID: "1.1.1.1", Duplicating: true})
+
+	var (
+		calls    int
+		answered bool
+	)
+	orig := adapter.LIModificationAnswered
+	adapter.LIModificationAnswered = func(_ lisequence.Request, _ uint8, a bool) {
+		calls++
+		answered = a
+	}
+	t.Cleanup(func() { adapter.LIModificationAnswered = orig })
+
+	noCause := &udp.Message{
+		RemoteAddr:  &net.UDPAddr{IP: net.ParseIP("1.1.1.1"), Port: 8805},
+		PfcpMessage: message.NewSessionModificationResponse(0, 0, seid, liSeq, 0),
+	}
+	if err := adapter.HandlePfcpSessionModificationResponse(noCause); err != nil {
+		t.Fatalf("the LI answer was refused: %v", err)
+	}
+
+	if calls != 1 || answered {
+		t.Errorf("LI answer hook called %d times with answered=%v, want once with false: a "+
+			"duplication change the datapath may not have applied is then never retried", calls, answered)
+	}
+}

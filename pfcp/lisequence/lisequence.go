@@ -45,9 +45,9 @@ type Request struct {
 // Bounded on purpose. Entries are normally consumed by the response they describe, but a
 // response that never arrives — a lost datagram, a UPF that restarts — would otherwise
 // leave one behind forever, and an unbounded map that grows with traffic while nothing
-// prunes it is a fault in its own right. Expired records the
-// interception subsystem to sweep; Mark drops anything far past the window as the backstop
-// for a deployment where nothing sweeps.
+// prunes it is a fault in its own right. Expired hands the interception subsystem the
+// records to sweep; Mark drops anything far past the window as the backstop for a
+// deployment where nothing sweeps.
 var (
 	pending = map[uint32]entry{}
 	lock    sync.Mutex
@@ -121,7 +121,7 @@ func Expired() []Request {
 	return out
 }
 
-// Outstanding is how many LI modifications await an answer.
+// Outstanding is how many LI modifications await an answer. For tests.
 func Outstanding() int {
 	lock.Lock()
 	defer lock.Unlock()

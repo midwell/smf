@@ -60,8 +60,8 @@ func FindFTEID(createdPDRIEs []*ie.IE) (*ie.FTEIDFields, error) {
 // wiring wraps so the same discard is settled before any session is restored; see
 // lawfulintercept.GateRestoration.
 //
-// Reached through a package variable so a test can substitute it. Production behaviour is
-// unchanged: it is the same function.
+// Reached through a package variable so a test can substitute it; in production it is
+// lawfulintercept.POIRestarted itself.
 var POIRestarted = lawfulintercept.POIRestarted
 
 // LIModificationAnswered is the Lawful Interception hook carrying the outcome of a

@@ -1839,9 +1839,8 @@ type plannedTrigger struct {
 // x3Destinations is where this task's content goes.
 //
 // The task's own destinations first, which is what TS 33.128 requires and what the
-// IRI path already does (see x2Destinations, which this mirrors deliberately —
-// the two answer the same question for the two interfaces and had no business
-// answering it differently).
+// IRI path does (see x2Destinations, which this mirrors deliberately: the two
+// answer the same question for the two interfaces).
 //
 // **The configured MDF3 serves a task that named no destination, not one whose
 // destinations produced no X3 endpoint.** The two were the same test — an empty resolved
@@ -2406,8 +2405,7 @@ func parseTriggerKey(key string) (warrant, session, nodeID string, ok bool) {
 // sessions the modified task newly covers. Moving this to a goroutine would let that
 // installation land between the registry read here and takeForWarrantExcept below — and
 // the new trigger's session, absent from `keep`, would then be withdrawn by the pass that
-// was meant to leave it alone. Which is the race the ordering above exists to prevent,
-// reintroduced by the fix for a different problem.
+// was meant to leave it alone, which is the race the ordering above exists to prevent.
 //
 // It is safe to keep here because it costs no walk of the session pool: the work is
 // bounded by this warrant's own triggers (see sessionsWithTriggers), so a provisioning

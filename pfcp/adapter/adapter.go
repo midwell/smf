@@ -498,6 +498,45 @@ func HandlePfcpSessionModificationResponse(msg *udp.Message) error {
 	}
 	logger.PfcpLog.Infoln("in HandlePfcpSessionModificationResponse")
 
+	// A modification this element sent for Lawful Interception, not one the session's
+	// own procedures sent — the same guard the native handler applies, on the path
+	// taken when enableUPFAdapter is set. sendSessionModification routes the response
+	// through HandleAdapterPfcpRsp in that mode. Without it, an LI modification's
+	// response landing during SmStatePfcpModify would clear the pending-UPF entry the
+	// subscriber's own concurrent modification is waiting on and complete that procedure
+	// on an answer never sent to it. The correlation below — SEID, serving UPF, procedure
+	// state — cannot tell the two apart, which is why the sequence number is what answers
+	// it.
+	//
+	// Note that Take *consumes* the record, so an LI-originated sequence number does not
+	// linger until the age-out.
+	//
+	// **And the answer is read.** Keeping it out of the subscriber's procedure is one
+	// obligation and reading it is a second: the Cause says whether the datapath applied
+	// the duplication this element had already recorded as applied, and with it discarded
+	// a refused activation would never be retried — the element holding a task it reports
+	// as intercepting and a datapath that declined it, with nothing left to re-send and
+	// nothing reported. A refused withdrawal would leave duplication running while the
+	// element believed it was off.
+	//
+	// Ahead of the Cause checks below, as in the native handler: an answer with no Cause
+	// this element can read is treated as not applied, and so retried, rather than
+	// discarded.
+	if req, ok := lisequence.Take(pfcpRsp.Sequence()); ok {
+		var (
+			liCause  uint8
+			answered bool
+		)
+		if pfcpRsp.Cause != nil {
+			if value, causeErr := pfcpRsp.Cause.Cause(); causeErr == nil {
+				liCause, answered = value, true
+			}
+		}
+		notifyLIModificationAnswered(req, liCause, answered)
+
+		return nil
+	}
+
 	cause := pfcpRsp.Cause
 	if cause == nil {
 		return errors.New("PFCP Session Modification Response found invalid cause, response discarded")
@@ -522,32 +561,6 @@ func HandlePfcpSessionModificationResponse(msg *udp.Message) error {
 
 	smContext := context.GetSMContextBySEID(SEID)
 	logger.PfcpLog.Infof("in HandlePfcpSessionModificationResponse smContext found by SEID %v", smContext)
-
-	// A modification this element sent for Lawful Interception, not one the session's
-	// own procedures sent — the same guard the native handler applies, on the path
-	// taken when enableUPFAdapter is set. sendSessionModification routes the response
-	// through HandleAdapterPfcpRsp in that mode. Without it, an LI modification's
-	// response landing during SmStatePfcpModify would clear the pending-UPF entry the
-	// subscriber's own concurrent modification is waiting on and complete that procedure
-	// on an answer never sent to it. The correlation below — SEID, serving UPF, procedure
-	// state — cannot tell the two apart, which is why the sequence number is what answers
-	// it.
-	//
-	// Note that Take *consumes* the record, so an LI-originated sequence number does not
-	// linger until the age-out.
-	//
-	// **And the answer is read.** Keeping it out of the subscriber's procedure is one
-	// obligation and reading it is a second: the Cause says whether the datapath applied
-	// the duplication this element had already recorded as applied, and with it discarded
-	// a refused activation would never be retried — the element holding a task it reports
-	// as intercepting and a datapath that declined it, with nothing left to re-send and
-	// nothing reported. A refused withdrawal would leave duplication running while the
-	// element believed it was off.
-	if req, ok := lisequence.Take(pfcpRsp.Sequence()); ok {
-		notifyLIModificationAnswered(req, causeValue, true)
-
-		return nil
-	}
 
 	// After the interception block, as in the native handler: that block answers a
 	// modification this element sent itself, keyed on the sequence number alone, and it must
