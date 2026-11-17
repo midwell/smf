@@ -184,3 +184,40 @@ func TestAnLIAnswerWithoutACauseIsHandedOnAsUnansweredInAdapterMode(t *testing.T
 			"duplication change the datapath may not have applied is then never retried", calls, answered)
 	}
 }
+
+// TestARepeatedLIModificationResponseIsStillLIInAdapterMode is the native handler's
+// TestARepeatedLIModificationResponseIsStillLI on the adapter path. A UPF can answer both an LI
+// modification and the SMF's retransmission of it; the second answer must still be recognised
+// as LI, kept out of the subscriber's concurrent procedure, and not read a second time.
+func TestARepeatedLIModificationResponseIsStillLIInAdapterMode(t *testing.T) {
+	smContext, seid := modifyingSession(t)
+	// Buffered, so a wrongly completed procedure is observed rather than blocking the handler.
+	smContext.SBIPFCPCommunicationChan = make(chan context.PFCPSessionResponseStatus, 1)
+
+	answers := 0
+	orig := adapter.LIModificationAnswered
+	adapter.LIModificationAnswered = func(lisequence.Request, uint8, bool) { answers++ }
+	t.Cleanup(func() { adapter.LIModificationAnswered = orig })
+
+	const liSeq = uint32(5255)
+	lisequence.Mark(liSeq, lisequence.Request{SEID: seid, NodeID: "1.1.1.1", Duplicating: true})
+
+	for range 2 {
+		if err := adapter.HandlePfcpSessionModificationResponse(modificationResponse(liSeq, seid)); err != nil {
+			t.Fatalf("the response was refused: %v", err)
+		}
+	}
+
+	if answers != 1 {
+		t.Errorf("the LI answer was read %d times, want once", answers)
+	}
+	if smContext.PendingUPF.IsEmpty() {
+		t.Error("the repeated LI answer cleared the UPF the subscriber's own modification " +
+			"was waiting on")
+	}
+	select {
+	case got := <-smContext.SBIPFCPCommunicationChan:
+		t.Errorf("the repeated LI answer completed the session's own procedure with %v", got)
+	default:
+	}
+}
