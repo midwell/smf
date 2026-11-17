@@ -47,8 +47,8 @@ type Request struct {
 // response that never arrives — a lost datagram, a UPF that restarts — would otherwise
 // leave one behind forever, and an unbounded map that grows with traffic while nothing
 // prunes it is a fault in its own right. Expired hands the interception subsystem the
-// records to sweep; Mark drops anything far past the window as the backstop for a
-// deployment where nothing sweeps.
+// records to sweep; Mark drops anything far past the window, at most once per pruneInterval,
+// as the backstop for a deployment where nothing sweeps.
 //
 // **An answered entry stays as a tombstone for tombstoneAge.** A UPF can answer the same
 // modification twice — once for the request and once for the SMF's retransmission of it —
@@ -66,7 +66,14 @@ var (
 	maxAge = 30 * time.Second
 	// now is the clock, held here so a test can move it rather than wait.
 	now = time.Now
+	// lastPrune is when prune last ran.
+	lastPrune time.Time
 )
+
+// pruneInterval is the least time between two prunes from Mark. A prune walks the whole table,
+// which holds every modification of the last tombstoneAge, and Mark runs on the send path under
+// the session's lock. Expired prunes on every sweep regardless.
+const pruneInterval = time.Second
 
 // tombstoneAge is how long an answered or expired entry is kept to recognise a repeated or
 // late answer: well past the SMF's retransmission schedule for one request.
@@ -84,6 +91,7 @@ func (e entry) isTombstone() bool { return !e.closed.IsZero() }
 // prune drops tombstones past tombstoneAge, and entries still awaiting an answer far past
 // the window. The caller holds lock.
 func prune(at time.Time) {
+	lastPrune = at
 	tombstoneCutoff := at.Add(-tombstoneAge())
 	// The backstop: entries far past the window belong to a deployment where nothing is
 	// sweeping, and they may not accumulate.
@@ -104,8 +112,11 @@ func Mark(seqNum uint32, req Request) {
 	lock.Lock()
 	defer lock.Unlock()
 
-	prune(now())
-	pending[seqNum] = entry{req: req, sent: now()}
+	at := now()
+	if at.Sub(lastPrune) >= pruneInterval {
+		prune(at)
+	}
+	pending[seqNum] = entry{req: req, sent: at}
 }
 
 // Take reports whether seqNum was an LI-initiated modification, what it asked for, and

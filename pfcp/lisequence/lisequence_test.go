@@ -13,10 +13,11 @@ func setClock(t *testing.T) *time.Time {
 	t.Helper()
 
 	at := time.Unix(1_000_000, 0)
-	origNow, origPending := now, pending
+	origNow, origPending, origLastPrune := now, pending, lastPrune
 	now = func() time.Time { return at }
 	pending = map[uint32]entry{}
-	t.Cleanup(func() { now, pending = origNow, origPending })
+	lastPrune = time.Time{}
+	t.Cleanup(func() { now, pending, lastPrune = origNow, origPending, origLastPrune })
 
 	return &at
 }
@@ -81,5 +82,32 @@ func TestAnExpiredSequenceRecognisesALateAnswer(t *testing.T) {
 	Expired()
 	if len(pending) != 0 {
 		t.Errorf("%d entries left after every tombstone aged out", len(pending))
+	}
+}
+
+// TestMarkPrunesAtMostOncePerInterval: a prune walks the whole table, which holds every
+// modification of the last tombstoneAge, and Mark runs on the send path under the session's
+// lock. So Mark prunes at most once per pruneInterval, and still prunes once it has passed.
+func TestMarkPrunesAtMostOncePerInterval(t *testing.T) {
+	at := setClock(t)
+
+	req := Request{SEID: 9, NodeID: "3.3.3.3"}
+	Mark(1, req)
+
+	// A tombstone already past its age, which any prune drops.
+	const aged = 99
+	pending[aged] = entry{req: req, sent: at.Add(-3 * maxAge), closed: at.Add(-tombstoneAge() - time.Second)}
+
+	*at = at.Add(pruneInterval / 2)
+	Mark(2, req)
+	if _, held := pending[aged]; !held {
+		t.Error("Mark pruned twice within pruneInterval, walking the whole table on the send path")
+	}
+
+	*at = at.Add(pruneInterval)
+	Mark(3, req)
+	if _, held := pending[aged]; held {
+		t.Error("Mark did not prune once pruneInterval had passed, so nothing bounds the table " +
+			"where nothing sweeps")
 	}
 }
