@@ -10,15 +10,14 @@ import (
 	"testing"
 )
 
-// TestStrictLiBlockDoesNotFailTheConfigurationLoad is a source-level assertion, and it exists
-// because the property it guards was already established once and then lost.
+// TestStrictLiBlockDoesNotFailTheConfigurationLoad is a source-level assertion, and it covers
+// the frame `service/li_block_containment_test.go` cannot see.
 //
-// `service/li_block_containment_test.go` asserts that the Lawful Interception block cannot return
-// from Start. Both of its guards passed while this network function was, in fact, refusing to
-// start over a single mistyped LI key — because the refusal had moved one call frame earlier and
-// into this package, where neither guard could see it. A guard scoped to where a defect was last
-// found does not follow the defect, and it reads as coverage while the property is violated
-// somewhere else.
+// That test asserts that the Lawful Interception block cannot return from Start. Both of its
+// guards would pass while this network function refused to start over a single mistyped LI key,
+// if the refusal sat one call frame earlier, in this package. A guard scoped to one place does
+// not follow the property, and it reads as coverage while the property is violated somewhere
+// else.
 //
 // So the rule here is the other half: `strictLiBlock`'s verdict is *recorded*, never returned.
 // Returning it fails InitConfigFactory, which fails Initialize, which reaches a Fatalf — taking
@@ -27,8 +26,8 @@ import (
 // LI-provisioned: a network function that will not start is visible to every operator, every peer
 // and every monitoring system, where a log line is visible only to whoever reads logs.
 //
-// The refusal still happens, and interception still does not start on it. What changed is who acts
-// on it: the LI subsystem, at a point where the ADMF can be told. See LiBlockError.
+// The refusal still happens, and interception does not start on it. The LI subsystem acts on it,
+// at a point where the ADMF can be told. See LiBlockError.
 func TestStrictLiBlockDoesNotFailTheConfigurationLoad(t *testing.T) {
 	const file = "factory.go"
 
@@ -67,8 +66,8 @@ func TestStrictLiBlockDoesNotFailTheConfigurationLoad(t *testing.T) {
 	}
 
 	// The call must be the right-hand side of an assignment to liBlockErr, and nothing else. An
-	// `if err := strictLiBlock(...); err != nil { return err }` is the exact shape that caused
-	// the regression, and it is an assignment too — so the guard checks the target, not merely
+	// `if err := strictLiBlock(...); err != nil { return err }` is the shape that stops the
+	// network function, and it is an assignment too — so the guard checks the target, not merely
 	// that an assignment happened.
 	ast.Inspect(parsed, func(n ast.Node) bool {
 		assign, isAssign := n.(*ast.AssignStmt)

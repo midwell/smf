@@ -150,8 +150,8 @@ func TestServingUPFTEIDNilTunnel(t *testing.T) {
 // round-trip, golden or live-decode check could ever have noticed. Only the
 // payload tables say it is mandatory.
 //
-// For SMFPDUSessionModification it is the sole mandatory field, so that record
-// previously satisfied none of its mandatory set.
+// For SMFPDUSessionModification it is the sole mandatory field, so without it
+// that record satisfies none of its mandatory set.
 func TestGTPTunnelInfoIsReported(t *testing.T) {
 	sc := targetSM()
 	node := smfctx.NewDataPathNode()
@@ -256,7 +256,7 @@ func TestApplyCCTriggerSetsDuplication(t *testing.T) {
 
 func TestApplyCCTriggerClearsWhenNotCCTasked(t *testing.T) {
 	// An IRI-only task must not trigger CC duplication, and must clear a FAR that
-	// was previously duplicating.
+	// is already duplicating.
 	activateWith(t, types.InterceptTask{
 		XID:      testTaskIRI,
 		Targets:  []types.TargetIdentifier{{Type: types.TargetSUPI, Value: "262019876543210"}},
@@ -598,10 +598,10 @@ func TestSessionTargets(t *testing.T) {
 }
 
 // TestEstablishmentReportsTheRealRequestAndAccessType: both fields are mandatory
-// in the TS 33.128 establishment record and both used to be hard-coded, so every
-// session reached the law-enforcement agency described as an initial request over
-// 3GPP access — hiding an emergency session, and misstating whether the UE asked
-// for a new session or resumed an existing one.
+// in the TS 33.128 establishment record and both come from the session. Hard-coded,
+// every session would reach the law-enforcement agency described as an initial
+// request over 3GPP access — hiding an emergency session, and misstating whether the
+// UE asked for a new session or resumed an existing one.
 func TestEstablishmentReportsTheRealRequestAndAccessType(t *testing.T) {
 	cases := []struct {
 		request models.RequestType
@@ -858,10 +858,9 @@ func TestDestinationsInUseFollowsTheTasking(t *testing.T) {
 	}
 }
 
-// TestUEEndpointMapping covers the gap this change exists to close: the records
-// carried the serving UPF's tunnel endpoint but never the subject's own address,
-// so an agency could not tell what address the target was using. The two are
-// different fields and must not be confused.
+// TestUEEndpointMapping: the records carry the subject's own address as well as
+// the serving UPF's tunnel endpoint, so an agency can tell what address the target
+// is using. The two are different fields and must not be confused.
 func TestUEEndpointMapping(t *testing.T) {
 	sc := targetSM()
 
@@ -1127,11 +1126,11 @@ func TestUnsuccessfulProcedureCauseMatchesTheReject(t *testing.T) {
 //
 // A warrant can activate while one of the target's sessions is still being
 // established, and the X1 scan reaches sessions by tasking rather than by
-// lifecycle. applyCC used to mark every FAR it touched RULE_UPDATE, and the
-// establishment builder emits a Create FAR only for RULE_INITIAL — so the FAR
-// vanished from the request while the PDR referring to it was sent anyway. The
-// UPF was left holding a detection rule pointing at a forwarding rule it had
-// never been given: no forwarding action for the subject at all.
+// lifecycle. The establishment builder emits a Create FAR only for RULE_INITIAL, so
+// an applyCC that marked every FAR it touched RULE_UPDATE would drop the FAR from
+// the request while the PDR referring to it was sent anyway. The UPF would hold a
+// detection rule pointing at a forwarding rule it had never been given: no
+// forwarding action for the subject at all.
 //
 // Asserting on far.State alone would pass with the builder's rule inverted; what
 // the subscriber's service depends on is the IE actually being in the message.

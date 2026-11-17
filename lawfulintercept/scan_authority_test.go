@@ -103,11 +103,11 @@ func scanFixture(t *testing.T, task types.InterceptTask, sessions int) (*subsyst
 		// own race rather than the element's.
 		sc.PDUAddress = &smfctx.UeIpAddr{Ip: net.ParseIP("10.250.0.9"), UpfProvided: true}
 
-		// And a PDU session type, which is the third mandatory member this fixture was
-		// missing. The two above were found by the record silently not being delivered;
-		// this one is refused by li/iri, because pDUSessionType is mandatory
-		// in this record and its enumeration has no zero — so a session left at the Go
-		// zero value produced a record a conformant mediation function discards.
+		// And a PDU session type, the third mandatory member. Without the two above the
+		// record is silently not delivered; without this one it is refused by li/iri,
+		// because pDUSessionType is mandatory in this record and its enumeration has no
+		// zero — so a session left at the Go zero value would produce a record a
+		// conformant mediation function discards.
 		//
 		// A session that has an address has completed establishment, and establishment is
 		// where the type is chosen: HandlePDUSessionEstablishmentRequest refuses the
@@ -225,19 +225,19 @@ func TestAScanDeliversToTheDestinationsTheTaskNowNames(t *testing.T) {
 	}
 }
 
-// TestAModificationThatAddsIRIBeginsIt is the defect the early-return test used to
-// swallow, and its control.
+// TestAModificationThatAddsIRIBeginsIt: a modification that adds a product passes the
+// early return, and its control.
 //
-// modifyInterception decided "nothing about this interception has moved" by comparing
-// the target identifiers and the CC flag. Adding IRI to a task that already had CC
-// changes neither, so it returned before reportStartOfInterception and the target's
-// already-established sessions produced no start-of-interception record at all —
-// interception of a second product beginning, at a moment the ADMF chose, with the only
-// record that would say so skipped. No test on either element covered this case.
+// modifyInterception decides "nothing about this interception has moved" by comparing
+// the targets and each product. Comparing the target identifiers and the CC flag alone,
+// adding IRI to a task that already has CC changes neither, so it would return before
+// reportStartOfInterception and the target's already-established sessions would produce
+// no start-of-interception record at all — interception of a second product beginning,
+// at a moment the ADMF chose, with the only record that would say so skipped.
 //
-// The control matters as much as the case: changing the targets took the other branch
-// and always worked, so a test that only exercised that would have passed against the
-// defect and reported the feature as covered.
+// The control matters as much as the case: changing the targets takes the other branch,
+// so a test that only exercised that would pass against the narrower comparison and
+// report the feature as covered.
 func TestAModificationThatAddsIRIBeginsIt(t *testing.T) {
 	targets := []types.TargetIdentifier{{Type: types.TargetSUPI, Value: "262019876543210"}}
 
@@ -288,9 +288,8 @@ func TestAModificationThatAddsIRIBeginsIt(t *testing.T) {
 	}
 }
 
-// TestAWithdrawalStopsDuplicationEvenThoughTheTaskIsGone is the regression this
-// change's own revalidation introduced, and it is the one a cluster run caught rather
-// than a unit test.
+// TestAWithdrawalStopsDuplicationEvenThoughTheTaskIsGone: the per-session revalidation
+// must not apply to a deactivation scan.
 //
 // A deactivation scan exists to take duplication down, and it runs *because* the task
 // was removed from the store — removal is what triggers the callback. Applying the
@@ -300,13 +299,11 @@ func TestAModificationThatAddsIRIBeginsIt(t *testing.T) {
 // authority — the failure the rule is about, reached by applying the rule to the path
 // that enforces it.
 //
-// **Driven through reportDeactivation, not through scanSessions.** The first version of
-// this test called the scan directly and passed the flag itself, so flipping the
-// production call site back to the defect left it green: it asserted that a function
-// does what its argument says, one layer below the decision that was wrong. Every other
-// scan test exercised activation and modification, where the task *is* in the store,
-// which is why the whole suite passed while the cluster reported "the datapath stops
-// duplicating once the warrant is withdrawn" and it did not.
+// **Driven through reportDeactivation, not through scanSessions.** A test that called the
+// scan directly and passed the flag itself would stay green with the production call site
+// passing the wrong value: it would assert that a function does what its argument says,
+// one layer below the decision that matters. Every other scan test exercises activation
+// and modification, where the task *is* in the store, so only this one reaches the case.
 func TestAWithdrawalStopsDuplicationEvenThoughTheTaskIsGone(t *testing.T) {
 	task := types.InterceptTask{
 		XID:      testXIDPrimary,

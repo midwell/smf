@@ -184,7 +184,7 @@ func (smf *SMF) Start() {
 		// and adapter handlers is active in a deployment, and a remedy present in one of them
 		// is a remedy whose presence depends on enableUPFAdapter.
 		adapter.POIRestarted = lawfulintercept.POIRestarted
-		// And the restart hook upstream's session restoration hangs off. See gateRestorationOnLI.
+		// And the restart hook the SMF's session restoration hangs off. See gateRestorationOnLI.
 		gateRestorationOnLI()
 		// And the three establishment hooks, for the same reason. Only one of the native and
 		// adapter handlers is active in a deployment, so a hook present in one of them is a
@@ -396,7 +396,7 @@ func (smf *SMF) Terminate(cancelServices context.CancelFunc, wg *sync.WaitGroup)
 // twice and deadlocks under UpfLock.
 var ungatedRestart func(smfContext.NodeID, time.Time)
 
-// gateRestorationOnLI wraps the restart hook upstream's session restoration hangs off, rather
+// gateRestorationOnLI wraps the restart hook the SMF's session restoration hangs off, rather
 // than calling the interception discard beside it: the record of what a restarted UPF held is
 // settled before any of its sessions is re-installed, on every path that detects a restart,
 // because restoration can be reached only through this hook.

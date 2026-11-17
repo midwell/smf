@@ -197,9 +197,8 @@ type fakePOI struct {
 // type derived from the request's, and the five fields of the schema's
 // X1ResponseMessage base type — the peer's echoed back, its own stated.
 //
-// This fake used to answer with a bare <oK> and nothing else, which is not a
-// response any conformant NE sends and which the CC-TF now refuses as
-// unattributable. A stub that is not conformant tests this element against a
+// A bare <oK> and nothing else is not a response any conformant NE sends, and the
+// CC-TF refuses it as unattributable. A stub that is not conformant tests this element against a
 // fiction — and what this file is about is precisely what the CC-TF does with the
 // answers it gets back.
 func poiEnvelope(t *testing.T, request []byte, payload string) string {
@@ -343,8 +342,8 @@ func newFakePOI(t *testing.T) *fakePOI {
 
 			var details string
 			for _, xid := range held {
-				// taskStatus is a complex type in the schema; a bare string there is the
-				// shape this project used to emit and no longer does.
+				// taskStatus is a complex type in the schema; a bare string there is not
+				// what a conformant POI emits.
 				status := "complete"
 				if s, ok := unhealthy[xid]; ok {
 					status = s
@@ -899,11 +898,11 @@ func (s *subsystem) installFor(ref string, tasks []types.InterceptTask, upfs []u
 // TestTriggerInstalledAfterReleaseIsWithdrawn: the X1 exchange runs off the
 // signalling path, so a short-lived session can be released while its trigger is
 // still being installed. The withdrawal then runs against a registry entry whose
-// trigger does not exist at the POI yet, and used to withdraw nothing — leaving a
-// trigger in place that reconciliation (startup only) and the POI's own fail-safe
-// (this SMF is alive and sending keepalives) would both never reach.
+// trigger does not exist at the POI yet. Withdrawing nothing would leave a trigger
+// in place that reconciliation (startup only) and the POI's own fail-safe (this SMF
+// is alive and sending keepalives) would both never reach.
 //
-// The pending-removal state is what closes it now, and it closes it in either
+// The pending-removal state is what closes it, and it closes it in either
 // order: the withdrawal that arrives before the trigger exists stays pending and
 // retries, so the install need only leave it alone. Exactly one party withdraws,
 // which is the point — two would each read an answer meant for the other.
@@ -984,12 +983,12 @@ func TestTriggerNotInstalledBeforeCorrelationExists(t *testing.T) {
 // datapath keeps duplicating, and the content is dropped as unattributable — so
 // each of these asserts a property that produced silence rather than an error.
 
-// TestMatchEndpointFollowsAUPFThatChangesAddress is the regression test. The
-// registry used to store the address its configured NodeID resolved to at
-// construction, which froze a value that moves: recreating the UPF's Service gave
-// it a new address, the session path followed within the minute (the SMF refreshes
-// its DNS cache on a ticker) and the registry did not, so every CC warrant for that
-// UPF reported "no triggering endpoint" until the SMF was restarted.
+// TestMatchEndpointFollowsAUPFThatChangesAddress: a registry that stored the address
+// its configured NodeID resolved to at construction would freeze a value that moves.
+// Recreating the UPF's Service gives it a new address, the session path follows
+// within the minute (the SMF refreshes its DNS cache on a ticker), and such a
+// registry would not, so every CC warrant for that UPF would report "no triggering
+// endpoint" until the SMF was restarted.
 func TestMatchEndpointFollowsAUPFThatChangesAddress(t *testing.T) {
 	const name = "upf-moving.test"
 
@@ -1018,8 +1017,8 @@ func TestMatchEndpointFollowsAUPFThatChangesAddress(t *testing.T) {
 
 // TestMatchEndpointNeverMatchesUnresolvableNodes is the one with a security
 // consequence. Failed resolution yields 0.0.0.0, so matching on a resolved address
-// made every unresolvable name equal to every other — the defect upstream fixed for
-// gNB names in nodeInLinks (#613). Here it would hand one UPF's CC-POI a different
+// would make every unresolvable name equal to every other — the defect nodeInLinks
+// avoids for gNB names (#613). Here it would hand one UPF's CC-POI a different
 // UPF's warrant, delivering content under a warrant that does not cover it.
 func TestMatchEndpointNeverMatchesUnresolvableNodes(t *testing.T) {
 	reg := mustRegistry(Config{
@@ -1066,10 +1065,10 @@ func TestMatchEndpointPrefersIdentityOverResolution(t *testing.T) {
 }
 
 // TestTriggerRegistryRejectsAmbiguousNode covers the silent half of it. Two
-// entries naming one node used to collapse into a single registry entry, the second
-// overwriting the first, so a two-UPF configuration presented as a one-UPF registry
-// and the displaced UPF's content was never attributable — with nothing logged and
-// no fault raised.
+// entries naming one node, collapsed into a single registry entry with the second
+// overwriting the first, would present a two-UPF configuration as a one-UPF registry,
+// and the displaced UPF's content would never be attributable — with nothing logged
+// and no fault raised.
 func TestTriggerRegistryRejectsAmbiguousNode(t *testing.T) {
 	_, err := newTriggerRegistry(Config{
 		NEID: testNEID, MDF3: testMDF3Addr,
@@ -1088,8 +1087,7 @@ func TestTriggerRegistryRejectsAmbiguousNode(t *testing.T) {
 // can resolve to one address — transiently while a Service is recreated, or
 // permanently by mistake — and picking between them by Go's map order would send a
 // session's triggers to a different UPF from one establishment to the next, each
-// carrying the X3 destination with it. The final review found this same
-// nondeterminism in warrant selection at the CC-POI.
+// carrying the X3 destination with it.
 func TestMatchEndpointIsDeterministic(t *testing.T) {
 	reg := mustRegistry(Config{
 		NEID: testNEID, MDF3: testMDF3Addr,
@@ -1118,18 +1116,15 @@ func TestMatchEndpointIsDeterministic(t *testing.T) {
 // warrant, that the POI is not actually running.
 //
 // Nothing else can report it. The POI answers to this SMF over the internal
-// triggering interface, not to the ADMF, so the ADMF cannot ask it directly — and
-// this SMF used to read the POI's reply for XIDs and discard everything else,
-// including the task's provisioning status and its unresolved faults. The
-// interception was stopped and every party believed it was running.
+// triggering interface, not to the ADMF, so the ADMF cannot ask it directly. Reading
+// the POI's reply for XIDs and discarding everything else — the task's provisioning
+// status and its unresolved faults — would leave the interception stopped while every
+// party believed it was running.
 //
-// **The report is against the warrant, and that is the half this test used to have
-// backwards.** It asserted an element-scoped report and treated the presence of a task XID in
-// it as a defect — correctly, for a report at that scope. But an element-scoped report says
-// only that something among the interceptions this element triggers has stopped, and a LIPF
-// holding several warrants cannot act on it. `triggerFaulty` is defined for the attribution,
-// and the reason this element could not make it was that a POI's answer carried no per-task
-// fault to attribute; now it can.
+// **The report is against the warrant.** An element-scoped report says only that
+// something among the interceptions this element triggers has stopped, and a LIPF holding
+// several warrants cannot act on it. `triggerFaulty` is defined for the attribution, and
+// the POI's answer carries the per-task fault to attribute.
 func TestReconcileReportsATriggerThePOISaysIsNotRunning(t *testing.T) {
 	admf := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		//nolint:errcheck // test handler write
@@ -1223,17 +1218,16 @@ func installOneTrigger(t *testing.T, s *subsystem) (warrant types.InterceptTask,
 	return warrant, trigger
 }
 
-// TestWithdrawnWarrantIsStillTrackedWhenThePOIRefuses is the regression test for
-// the defect this change exists for, and it is worth exactly what watching it fail
-// is worth: on the previous code it fails on the first assertion.
+// TestWithdrawnWarrantIsStillTrackedWhenThePOIRefuses: a refused withdrawal keeps
+// its bookkeeping.
 //
 // A warrant is withdrawn while its session is live. The X1 DeactivateTask to the
-// serving UPF fails. The bookkeeping had already been deleted on the way to that
-// attempt, so nothing retried and nothing remembered: the UPF kept the trigger,
-// kept the DUPL FAR, and kept delivering the subject's content to MDF3 under a
-// warrant that no longer authorised it. No participant was in a position to notice
-// — the SMF believed it had withdrawn the trigger, the UPF was never told, and the
-// mediation function received well-formed, correctly attributed product.
+// serving UPF fails. Bookkeeping deleted on the way to that attempt would leave
+// nothing to retry and nothing to remember: the UPF would keep the trigger, keep the
+// DUPL FAR, and keep delivering the subject's content to MDF3 under a warrant that no
+// longer authorised it. No participant would be in a position to notice — the SMF
+// believing it had withdrawn the trigger, the UPF never told, and the mediation
+// function receiving well-formed, correctly attributed product.
 func TestWithdrawnWarrantIsStillTrackedWhenThePOIRefuses(t *testing.T) {
 	poi := newFakePOI(t)
 	s := triggerSubsystem(t, poi)
@@ -1551,8 +1545,8 @@ func TestReconcileRetriesUntilThePOIAnswers(t *testing.T) {
 }
 
 // TestReconcileWithdrawalIsRetriedLikeAnyOther: reconciliation's own withdrawals
-// used to be the one unchecked path left — the tasking least able to survive being
-// forgotten, since by definition nothing else knows it exists.
+// are retried too — the tasking least able to survive being forgotten, since by
+// definition nothing else knows it exists.
 func TestReconcileWithdrawalIsRetriedLikeAnyOther(t *testing.T) {
 	poi := newFakePOI(t)
 	poi.mu.Lock()
@@ -1755,17 +1749,15 @@ func TestAReactivatedWarrantDoesNotDisplaceTheWithdrawalInFlight(t *testing.T) {
 	}
 }
 
-// TestAKeepaliveAnsweredByTheWrongElementIsReported is the gap verification found
-// after the rest of this change was written: every tasking path reported an
-// unattributable answer and the keepalive discarded one.
+// TestAKeepaliveAnsweredByTheWrongElementIsReported: the keepalive reports an
+// unattributable answer, as every tasking path does.
 //
-// The discard was deliberate and right about transport — a missed keepalive is
-// transient and the POI's own fail-safe covers a POI that has gone. It was wrong
+// Discarding keepalive failures is right about transport — a missed keepalive is
+// transient and the POI's own fail-safe covers a POI that has gone. It is wrong
 // about binding. The keepalive is the exchange whose entire purpose is to say the
 // peer is still there, so an answer from an element this SMF did not address means
-// it believes a POI is alive on the strength of a stranger's answer. That is the
-// silent condition this change exists to remove, on the one exchange where nothing
-// downstream would ever contradict it.
+// it believes a POI is alive on the strength of a stranger's answer: a silent
+// condition, on the one exchange where nothing downstream would ever contradict it.
 func TestAKeepaliveAnsweredByTheWrongElementIsReported(t *testing.T) {
 	poi := newFakePOI(t)
 	s := triggerSubsystem(t, poi)
@@ -1814,10 +1806,10 @@ func TestAKeepaliveAnsweredByTheWrongElementIsReported(t *testing.T) {
 // TestAnUnattributableAnswerKeepsTheWithdrawalPending is asserted rather than assumed.
 //
 // Validating responses turns silent successes on the withdrawal path into visible
-// failures, and that is only safe because a withdrawal now survives a failed
-// attempt: a visible failure used to be discarded as silently as the success was. So: a POI that acknowledges under the wrong NE identifier is
-// refused, and the withdrawal it refused must stay pending and keep being retried
-// rather than being forgotten.
+// failures, and that is only safe because a withdrawal survives a failed attempt.
+// So: a POI that acknowledges under the wrong NE identifier is refused, and the
+// withdrawal it refused must stay pending and keep being retried rather than being
+// forgotten.
 func TestAnUnattributableAnswerKeepsTheWithdrawalPending(t *testing.T) {
 	poi := newFakePOI(t)
 	s := triggerSubsystem(t, poi)
@@ -1939,16 +1931,12 @@ func TestAWithdrawalStuckOnOurOwnRefusalIsDistinguishable(t *testing.T) {
 	}
 }
 
-// TestAnUnbindableActivationAnswerIsReportedAsElementLevel is the gap the
-// end-to-end suite found, and the reason it is worth running a section against a
-// real deployment even when the unit tests are green.
+// TestAnUnbindableActivationAnswerIsReportedAsElementLevel: the unattributable
+// condition is reported on the activation path as well as the withdrawal path.
 //
-// The unattributable condition was wired into the withdrawal path only, because
-// that is where this change's risk register put it. On the activation path the
-// element reported a task issue and nothing else — the same report whether the POI
-// refused the warrant or this element refused to believe the POI's answer. Those
-// need opposite actions: one is a POI to go and look at, the other a configuration
-// mismatch on this side.
+// A task issue alone is the same report whether the POI refused the warrant or this
+// element refused to believe the POI's answer. Those need opposite actions: one is a
+// POI to go and look at, the other a configuration mismatch on this side.
 //
 // The task issue stays. On this path the element does know which warrant it was
 // installing, so naming it is true and useful; what the task issue cannot convey
@@ -2403,14 +2391,14 @@ func TestTriggerNamesTheTasksOwnX3Destinations(t *testing.T) {
 	}
 }
 
-// TestTriggerFallsBackToTheConfiguredMDF3 keeps the fix a conformance fix rather than an
-// outage. An ADMF is entitled to task an element that names **no** destination, which is
+// TestTriggerFallsBackToTheConfiguredMDF3 keeps destination handling conformant without
+// making it an outage. An ADMF is entitled to task an element that names **no** destination, which is
 // what every deployment predating the destination requirement does, and the configured
 // endpoint serves it — exactly as the configured MDF2 serves the equivalent IRI task, and
 // without the task being refused.
 //
-// This used to be asserted with a task that named a destination and resolved none of it,
-// which is a different fact and the wrong one to serve from configuration: naming an
+// A task that named a destination and resolved none of it is a different fact, and the
+// wrong one to serve from configuration: naming an
 // endpoint the warrant did not is the element deciding where a warrant's content goes,
 // and on an element serving several agencies it goes to whichever address configuration
 // happens to name. See x3Destinations.
@@ -2447,7 +2435,7 @@ func TestTriggerFallsBackToTheConfiguredMDF3(t *testing.T) {
 // half, and the reason the two had to be told apart.
 //
 // A task that named where its content goes and yielded no X3 endpoint is an assertion
-// this element cannot honour. x1 now refuses one with 3040 before it reaches the store, so
+// this element cannot honour. x1 refuses one with 3040 before it reaches the store, so
 // this pins the backstop rather than a path X1 can drive.
 // Substituting the configured MDF3 sends an agency's content to an endpoint the warrant
 // never named, and on an element serving several agencies it goes to whichever address
@@ -2777,14 +2765,14 @@ func TestWarrantWithdrawnAfterAnAmbiguousActivationStillReachesThePOI(t *testing
 	}
 }
 
-// TestMatchEndpointPerformsNoResolution is the property M5 exists for.
+// TestMatchEndpointPerformsNoResolution: matching performs no I/O.
 //
-// matchEndpoint ran on the PDU-session establishment path of the subscriber being
-// intercepted — triggerCC holds that session's lock, plan holds the registry's — and
-// resolved both sides of its comparison there. On a cache miss that was a
-// synchronous LookupHost with context.Background() and no timeout, and the SMF's own
-// cache *deletes* an entry whenever a lookup fails, so a transient resolver outage
-// put every subsequent call on the live path. A stall there delays a targeted
+// matchEndpoint runs on the PDU-session establishment path of the subscriber being
+// intercepted — triggerCC holds that session's lock, plan holds the registry's. Resolving
+// both sides of its comparison there would, on a cache miss, be a synchronous LookupHost
+// with context.Background() and no timeout, and the SMF's own cache *deletes* an entry
+// whenever a lookup fails, so a transient resolver outage would put every subsequent call
+// on the live path. A stall there delays a targeted
 // subscriber's session establishment while holding a lock every other trigger
 // operation waits on — the target-observable timing difference this capability names
 // as the concrete, testable form of undetectability.
@@ -2807,8 +2795,8 @@ func TestMatchEndpointPerformsNoResolution(t *testing.T) {
 	}
 
 	// Every shape of match: by identity, by a resolved name, by a literal, and no
-	// match at all — the last being the one that used to resolve the most, since it
-	// exhausted the identity pass and then resolved every configured node in turn.
+	// match at all — the last being the one that would resolve the most, since it
+	// exhausts the identity pass and then would resolve every configured node in turn.
 	for _, session := range []upfSession{
 		{node: upfNode(name), addr: trigNodeA},
 		{node: upfNode(trigNodeA), addr: trigNodeA},
@@ -2853,10 +2841,10 @@ func TestResolvingATriggeringEndpointIsSilent(t *testing.T) {
 	}
 }
 
-// TestSessionUPFsCarriesTheAddressItAlreadyResolved pins the other half of M5: the
-// session side must hand on the address it derived for the PFCP context key rather
-// than leave matchEndpoint to derive it again. Two derivations of one value is one
-// lookup too many, and the second was the one on the locked path.
+// TestSessionUPFsCarriesTheAddressItAlreadyResolved pins the other half of matching
+// without I/O: the session side must hand on the address it derived for the PFCP
+// context key rather than leave matchEndpoint to derive it again. Two derivations of
+// one value is one lookup too many, and the second would be on the locked path.
 func TestSessionUPFsCarriesTheAddressItAlreadyResolved(t *testing.T) {
 	// A bare context, not one from NewSMContext: sessionUPFs reads only Tunnel and
 	// PFCPContext, and a registered context has to be released — which returns its
@@ -2886,11 +2874,11 @@ func TestSessionUPFsCarriesTheAddressItAlreadyResolved(t *testing.T) {
 // An ADMF may change the identifier a warrant's product is labelled with. This
 // element reads that identifier from the task each time it builds a record, so its own
 // xIRI picks the new value up at once; a triggered CC-POI reads it from a trigger built
-// once. modifyInterception returned early whenever the target identifiers and the
-// required products were unchanged — which a productID change leaves alone — so the
-// trigger kept the old label. Signalling then arrived at the mediation function under
-// one warrant identifier and content under another, both well-formed, both separately
-// deliverable, with nothing in either stream to show they were meant to join.
+// once. A modifyInterception that returned early whenever the target identifiers and the
+// required products were unchanged — which a productID change leaves alone — would leave
+// the trigger with the old label. Signalling would then arrive at the mediation function
+// under one warrant identifier and content under another, both well-formed, both
+// separately deliverable, with nothing in either stream to show they were meant to join.
 func TestProductIDChangeReachesTheInstalledTrigger(t *testing.T) {
 	poi := newFakePOI(t)
 	s := triggerSubsystem(t, poi)
@@ -2915,7 +2903,7 @@ func TestProductIDChangeReachesTheInstalledTrigger(t *testing.T) {
 	}
 
 	// Only the label moves: same target, same products, so this is exactly the
-	// modification the early return used to swallow.
+	// modification an early return on targets and products would swallow.
 	next := prev
 	next.ProductID = newLabel
 	s.modifyInterception(prev, next)
@@ -3011,25 +2999,24 @@ func pooledSession(t *testing.T, supi string, id int32) *smfctx.SMContext {
 // TestAModificationDoesNotWalkTheSessionPool.
 //
 // A ModifyTask on a content task reconciles the triggers held for that warrant against
-// the sessions it still covers. It computed the second set by walking *every live
-// session* and taking every session's lock — on the X1 request goroutine, so the SMF's
-// answer to a provisioning function took time proportional to the element's subscriber
+// the sessions it still covers. Computing the second set by walking *every live session*
+// and taking every session's lock — on the X1 request goroutine — would make the SMF's
+// answer to a provisioning function take time proportional to the element's subscriber
 // population, and each acquisition could block behind a PFCP handler holding that lock.
 //
-// The set was almost entirely discarded: `keep` is consulted only by
+// Such a set would be almost entirely discarded: `keep` is consulted only by
 // takeForWarrantExcept, which tests it while iterating this warrant's installed triggers,
-// so a session no trigger exists for could never be looked at. The work is now bounded by
-// the warrant's own triggers.
+// so a session no trigger exists for is never looked at. The work is bounded by the
+// warrant's own triggers.
 //
-// There were **two** such walks on this path, and this test covers both — it was written
-// for the first and failed on the second, which is how the second was found. scanSessions
-// matched its sessions on the caller's goroutine too, one call below. That one cannot be
-// bounded (nothing indexes target identity to session, so finding out is the work), so it
-// moved off the request goroutine entirely, as the AMF's UE-pool scan already had.
+// There are **two** places on this path that could walk the pool, and this test covers
+// both. scanSessions matches its sessions one call below; that cannot be bounded (nothing
+// indexes target identity to session, so finding out is the work), so it runs off the
+// request goroutine entirely, as the AMF's UE-pool scan does.
 //
 // Asserted by holding the lock of a session that is targeted but has *no* trigger. Either
-// walk blocks on that lock; the fixed pair never takes it on this goroutine. Reverting
-// either fix alone fails this test, which is what says it covers them both rather than
+// walk would block on that lock; neither path takes it on this goroutine. Reintroducing
+// either walk alone fails this test, which is what says it covers them both rather than
 // resting on whichever happens to run first.
 func TestAModificationDoesNotWalkTheSessionPool(t *testing.T) {
 	poi := newFakePOI(t)
@@ -3052,7 +3039,7 @@ func TestAModificationDoesNotWalkTheSessionPool(t *testing.T) {
 		[]upfSession{{node: upfNode(trigNodeA), addr: trigNodeA, seid: 0x2632898145f4d191}}, 7)
 
 	// A second session the same warrant targets, with no trigger of its own — the kind
-	// the pool walk used to visit and the bounded read never does.
+	// a pool walk would visit and the bounded read never does.
 	untriggered := pooledSession(t, "imsi-"+supi, 6)
 	untriggered.SMLock.Lock()
 	defer untriggered.SMLock.Unlock()
@@ -3462,19 +3449,17 @@ func TestAFaultyTriggerNamesOnlyItsOwnWarrant(t *testing.T) {
 	}
 }
 
-// TestATriggerThatStopsRunningAfterStartupIsReported drives the path that matters, which is not
-// the one the original coverage drove.
+// TestATriggerThatStopsRunningAfterStartupIsReported drives the path that matters.
 //
 // A POI's account of the tasks it holds is the only way this element learns that a trigger it
-// installed has stopped running. That account used to be read exactly once per POI per process,
-// during start-up reconciliation — *before this process has installed anything*. Every trigger it
-// went on to install was therefore outside the only window in which its health could be observed,
-// for the life of the process: the one condition `triggerFaulty` exists for was the one condition
-// it could not see.
+// installed has stopped running. Read only once per POI per process, during start-up
+// reconciliation, it would be read *before this process has installed anything*, and every
+// trigger installed afterwards would be outside the only window in which its health could be
+// observed: the one condition `triggerFaulty` exists for would be the one it could not see.
 //
-// The original test passed anyway, because it installed the trigger and *then* ran reconciliation.
-// Production cannot do that. This one keeps the order production has — reconcile first, install
-// after — and asks on the keepalive round, which is where the question now gets asked.
+// A test that installed the trigger and *then* ran reconciliation would pass either way, and
+// production cannot do that. This one keeps the order production has — reconcile first, install
+// after — and asks on the keepalive round, which is where the question gets asked.
 func TestATriggerThatStopsRunningAfterStartupIsReported(t *testing.T) {
 	poi := newFakePOI(t)
 	s := triggerSubsystem(t, poi)
@@ -3612,7 +3597,11 @@ func TestAPOIWhoseClaimsWereDiscardedIsReconciledAgain(t *testing.T) {
 	}
 
 	// And the tasking it could no longer name is withdrawn, through the ordinary
-	// pending-removal machinery rather than abandoned.
+	// pending-removal machinery rather than abandoned. Waited for: reconciliation marks
+	// the endpoint reconciled before it sends the withdrawals.
+	for poi.countMessages("DeactivateTaskRequest") == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
 	if n := poi.countMessages("DeactivateTaskRequest"); n == 0 {
 		t.Error("the orphaned trigger was never withdrawn. It was discarded from this element's " +
 			"registry without being withdrawn from the POI, so it goes on duplicating under a " +

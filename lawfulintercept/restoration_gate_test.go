@@ -70,7 +70,7 @@ func claimsAt(s *subsystem, key string) int {
 	return n
 }
 
-// hooks stands in for upstream's restoration and the release that replaces it. A restoration
+// hooks stands in for the SMF's session restoration and the release that replaces it. A restoration
 // records how many claims were still standing at the endpoint keyed claimKey when it was started,
 // which is the whole of what the ordering is about.
 type hooks struct {
@@ -182,9 +182,8 @@ func recoveryAt(offset time.Duration) time.Time {
 // claims describing that point still stand: `plan` would find the triple claimed and install
 // nothing, and this element would report an interception the restarted node is not performing.
 //
-// It used to hold only because the discard was the statement before the restoration at each of
-// five call sites. Here the restoration is reached the only way it can be — through the hook —
-// and it must find the claims already gone.
+// The restoration is reached the only way it can be — through the hook — and it must find the
+// claims already gone, whatever order the five restart-detection sites call things in.
 func TestTheClaimsAreGoneBeforeTheRestorationStarts(t *testing.T) {
 	s := gateSubsystem(t, trigNodeB)
 	claim(s, trigNodeB)
@@ -220,7 +219,7 @@ func TestARestartAtANodeThatIsNotAPOIRestoresAtOnce(t *testing.T) {
 }
 
 // TestWithInterceptionNotRunningTheRestorationPassesThrough: an element whose interception is
-// not running restores exactly as upstream does.
+// not running restores exactly as it would without the gate.
 func TestWithInterceptionNotRunningTheRestorationPassesThrough(t *testing.T) {
 	active.Store(nil)
 	h := newHooks(nil, "")
@@ -400,7 +399,7 @@ func TestARestartSettledWhileAnEarlierOneIsWithheldReplacesIt(t *testing.T) {
 	}
 }
 
-// TestWithholdingStopsTheRestorationOfAnEarlierRestart: upstream supersedes a restoration in
+// TestWithholdingStopsTheRestorationOfAnEarlierRestart: the SMF supersedes a restoration in
 // progress only when the next one starts. A withheld restart starts none, so without this the run
 // for the previous restart goes on re-installing sessions onto the restarted node with this
 // restart's claims still standing.

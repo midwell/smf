@@ -26,12 +26,11 @@ import (
 // conversion function makes, minus the place to write the assertion. That the claim is true today
 // is a fact about the current releases of both documents, not a property of this code.
 //
-// It is also the construct that produced both handover defects: `handoverCause` cast NGAP's
-// cause value straight into the record type, and `handoverType` cast NGAP's handover type. Both
-// were found by a delivered record being wrong.
+// It is also the construct behind the AMF's `handoverCause` and `handoverType` mappings, which
+// are asserted the same way.
 //
-// So the cast stays — per the change's design, replacing it with a switch would add a mapping
-// nobody needs and a `default` arm whose value would be a guess — and what was missing is this.
+// So the cast stays — replacing it with a switch would add a mapping nobody needs and a
+// `default` arm whose value would be a guess — and this test is the assertion behind it.
 // The shape is `amf/ngap`'s TestTheCauseMappingIsTotalOverNGAP: derive from both definitions by
 // name, then assert the code agrees.
 
@@ -85,12 +84,9 @@ func ts33128Module(t *testing.T) string {
 // against, or "" if it cannot be read. It is used to say which module this assertion ran
 // against rather than leaving it assumed.
 //
-// **The replace directive governs, not the require.** go.mod names util twice — a `require` at
-// whatever version the dependency graph settled on, and a `replace` pointing at the fork this
-// project ships. The replacement is what is compiled and the require line is only a floor, so
-// reading the first matching line answers with a version nothing builds against. Not
-// hypothetical: this helper was first written that way here too, and the pin assertion above
-// caught it on the first run.
+// **A replace directive governs, not the require.** When go.mod replaces util, the
+// replacement is what is compiled and the require line is only a floor, so a replace is
+// returned in preference to the require wherever it appears.
 //
 // Duplicated from amf/ngap's licause_test.go rather than shared, because the two are separate
 // modules and a test helper is not worth a package to hold it.
@@ -108,7 +104,7 @@ func pinnedUtilVersion(t *testing.T) string {
 
 	for _, line := range strings.Split(string(mod), "\n") {
 		line = strings.TrimSpace(line)
-		if !strings.Contains(line, "omec-project/util") && !strings.Contains(line, "midwell/util") {
+		if !strings.Contains(line, "omec-project/util") {
 			continue
 		}
 

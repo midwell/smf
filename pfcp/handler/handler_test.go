@@ -311,11 +311,12 @@ func modificationResponse(seq uint32, seid uint64) *udp.Message {
 }
 
 // TestLIModificationResponseDoesNotCompleteTheSessionsOwnProcedure is the
-// interleaving the correlation could not see. A modification sent for Lawful
+// interleaving the correlation cannot see. A modification sent for Lawful
 // Interception and one sent by the subscriber's own procedure differ in nothing
-// the response path reads — same SEID, same UPF, same message type — so the LI
-// answer used to clear the pending entry the subscriber's procedure was waiting
-// on and report that procedure complete before its own answer had arrived.
+// the response path reads — same SEID, same UPF, same message type — so without
+// the sequence-number guard the LI answer would clear the pending entry the
+// subscriber's procedure is waiting on and report that procedure complete before
+// its own answer had arrived.
 //
 // Interception is permitted to lose a copy or decline a record. It is not
 // permitted to change what happens to the subscriber.

@@ -224,13 +224,13 @@ configuration:
 			if tt.typo == "keepaliveTimeut" {
 				body = strings.Replace(good, "keepaliveTimeout", tt.typo, 1)
 			}
-			// **Both halves, and the second is the one a previous round lost.** The key must
+			// **Both halves, and the second is the one easily lost.** The key must
 			// be refused, *and* the network function must still come up: a configuration load
 			// that fails takes PFCP, the SBI, registration and every subscriber's sessions with
 			// it, over a typo in an optional subsystem — and a network function that will not
 			// start announces to every operator and peer that it is LI-provisioned, which is
-			// the disclosure undetectability exists to prevent. Asserting only the refusal is
-			// what let that regression through.
+			// the disclosure undetectability exists to prevent. Asserting only the refusal
+			// would pass a load that refuses the key by failing.
 			if err := InitConfigFactory(write(t, body)); err != nil {
 				t.Fatalf("a misspelled LI key stopped the whole configuration load, which stops "+
 					"the network function: %v", err)
@@ -251,13 +251,13 @@ configuration:
 		orig := SmfConfig
 		t.Cleanup(func() { SmfConfig = orig })
 
-		// The scope of the check, asserted rather than assumed. This fork tracks an upstream
-		// that adds configuration keys; if strictness leaked past the li block, the next
-		// upstream field would stop every deployment carrying it from starting.
-		body := strings.Replace(good, "configuration:\n", "configuration:\n  aKeyThisForkDoesNotModel: 1\n", 1)
+		// The scope of the check, asserted rather than assumed. A configuration can carry keys
+		// this version does not model — one written for a later release; if strictness leaked
+		// past the li block, every deployment carrying such a key would stop starting.
+		body := strings.Replace(good, "configuration:\n", "configuration:\n  aKeyThisElementDoesNotModel: 1\n", 1)
 		if err := InitConfigFactory(write(t, body)); err != nil {
 			t.Fatalf("an unmodelled key outside the li block was refused, which would stop this "+
-				"fork starting on the next upstream field: %v", err)
+				"SMF starting on a key from a later release: %v", err)
 		}
 	})
 

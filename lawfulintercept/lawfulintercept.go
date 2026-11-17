@@ -52,8 +52,8 @@ type Config struct {
 
 	// MDF3 is the X3 delivery destination this CC-TF provisions at each triggered
 	// CC-POI (TS 33.128 table 6.2.3-6: the trigger names destinations by DID, which
-	// the triggering function configures beforehand). The UPF no longer carries an
-	// MDF3 address of its own.
+	// the triggering function configures beforehand). The UPF carries no MDF3 address
+	// of its own.
 	MDF3 string
 	// UPFTriggers lists the LI_T3 triggering endpoints of the UPFs this SMF may
 	// serve sessions with. A UPF absent from this list cannot be tasked, so CC on a
@@ -278,7 +278,7 @@ func (s *subsystem) iriDestinations(t types.InterceptTask) []string {
 // xIRI to, each with its reachability. It resolves through iriDestinations, the same question
 // destinationsInUse asks, so the configured MDF2 serving a task that named no DID is watched,
 // and an MDF2 no task delivers xIRI to is not: watched for a content-only task, an MDF2 whose
-// last delivery failed was reported unreachable for as long as that task lived, while the
+// last delivery failed would be reported unreachable for as long as that task lived, while the
 // status answer said nothing was in use.
 func (s *subsystem) x2Health(unreachableAt func(addr string) bool) []x1.DestinationHealth {
 	return x1.DestinationHealthOf(s.store.Snapshot(), types.DeliveryX2, s.iriDestinations, unreachableAt)
@@ -334,13 +334,12 @@ func newX1Server(st *store.Store, cfg Config, sub *subsystem) *x1.Server {
 		//     to one of the warrants pointing at it would report the same fault once per
 		//     warrant and imply each was separately broken.
 		//
-		// **The CC triggering role is different, and this element used to answer "nothing" for
-		// it too.** A point of interception reporting that the trigger this element installed is
-		// not running is task-scoped, re-observable, and means this warrant's content
-		// interception has stopped while the warrant is live. It was unanswerable only because
-		// this element asked its POIs once per process, at start-up, before it had installed
-		// anything — so the condition existed and nothing could ever see it. Asking on the
-		// keepalive round is what turned it into a state, and taskFaults is what answers it.
+		// **The CC triggering role is different, and is answered.** A point of interception
+		// reporting that the trigger this element installed is not running is task-scoped,
+		// re-observable, and means this warrant's content interception has stopped while the
+		// warrant is live. Asked only once per process, at start-up, before anything was
+		// installed, the condition could exist with nothing able to see it. Asking on the
+		// keepalive round is what makes it a state, and taskFaults is what answers it.
 		x1.WithTaskFaults(sub.taskFaults),
 		x1.OnTaskChange(sub.applyTaskChange),
 		// Refuse a warrant this element could never act on. It resolves subjects by
@@ -367,7 +366,7 @@ func newX1Server(st *store.Store, cfg Config, sub *subsystem) *x1.Server {
 			// ADMF is up, which is observable to whoever is probing it.
 			//
 			// The dispatch is bounded in effect rather than in count, and it is
-			// NotifyAsync that makes that true rather than the `go` this used to be.
+			// NotifyAsync that makes that true, not a bare `go`.
 			// The throttle is consulted on this goroutine before anything is spawned,
 			// so under a flood of refusals each of these costs a mutex; spawning first
 			// would have been a goroutine per refusal, which is the shape that made the
@@ -469,13 +468,13 @@ func Init(cfg Config) error {
 	// One client per destination address, created on first use: a task carries the
 	// endpoints its product goes to, and TS 33.128 marks them mandatory, so this
 	// element cannot know them at startup.
-	// The delivery-failure hook no longer reports. An unreachable mediation function
+	// The delivery-failure hook does not report. An unreachable mediation function
 	// is a condition this element can re-observe — the pool's own accounting answers
 	// it — so it has an ending, and TS 103 221-1 clause 5.3 requires an ending to be
 	// reported too. A site that announces with nothing that retracts eventually
 	// announces something nobody retracts, so both edges belong to whoever can see
 	// the transition. The hook nudges that watcher, which keeps the report as prompt
-	// as it was while moving the decision to one place.
+	// as reporting from the hook would be, with the decision in one place.
 	// Both declared before the pool because its callbacks close over them, and both are
 	// only *called* once delivery is under way — by which time each is assigned.
 	var (
@@ -729,9 +728,9 @@ func droppedXIRIs(n int) string {
 // Call this once the UPF has answered the PFCP Session Establishment Request, not
 // when the SBI create returns. The record carries the session's F-TEID and its X2
 // correlation identifier is the F-SEID, and neither exists until the UPF has
-// assigned them — emitting at the SBI point produced a record with a zero TEID
-// and a zero correlation, so the one record that describes the session to the MDF
-// was the one record that could not be joined to that session's content.
+// assigned them. Emitted at the SBI point, the record would carry a zero TEID and
+// a zero correlation, so the one record that describes the session to the MDF
+// would be the one record that cannot be joined to that session's content.
 //
 // Emitted at most once per session: a session spanning several UPFs draws an
 // establishment response from each. Caller holds sc.SMLock.
@@ -767,9 +766,9 @@ func ReportEstablishmentReject(sc *smfctx.SMContext, cause uint8) {
 // **It is the counterpart to a record this element already emits.** ReportModification is raised
 // before the PFCP modification is attempted, because the state the record describes may be gone by
 // the time the outcome is known — a legitimate choice, and one that obliges the element to report
-// the failure that follows. Without this the agency held a record asserting a modification that
-// never took effect, with nothing to say so; the release path has handled exactly this shape on
-// all three of its failure branches since it was written.
+// the failure that follows. Without this the agency would hold a record asserting a modification
+// that never took effect, with nothing to say so. The release path handles the same shape on all
+// three of its failure branches.
 //
 // cause is the 5GSM cause where the element decided one. The PFCP-timeout path decides none — it
 // answers the AMF with a 503 and a release command rather than a 5GSM reject — so it passes the
@@ -1013,21 +1012,21 @@ func (s *subsystem) modifyInterception(prev, next types.InterceptTask) {
 	wantedCC := prev.WantsProduct(types.ProductCC)
 	wantsCC := next.WantsProduct(types.ProductCC)
 	// Both products, not just content. A test that compared the targets and the CC
-	// flag alone found "nothing changed" when IRI was *added* to a task that already
-	// had CC — and returned before reportStartOfInterception, so the target's
-	// already-established sessions produced no SMFStartOfInterceptionWithEstablishedPDUSession
-	// at all. Interception of that product genuinely began, at a moment the ADMF chose,
-	// and the only record that would have said so is the one this comparison skipped.
+	// flag alone would find "nothing changed" when IRI is *added* to a task that already
+	// has CC — and return before reportStartOfInterception, so the target's
+	// already-established sessions would produce no SMFStartOfInterceptionWithEstablishedPDUSession
+	// at all. Interception of that product genuinely begins, at a moment the ADMF chose,
+	// and the only record that says so is the one such a comparison skips.
 	// Each product is a separate authority that can be granted on its own, so the test
 	// for "nothing about this interception has moved" has to cover each of them.
 	//
 	// covered() already tests the product on the other side, so a previous task that
-	// did not want IRI does not suppress the record once the branch is reached. That is
-	// the whole of the fix, and it is what the AMF's applyTaskChange already did.
+	// did not want IRI does not suppress the record once the branch is reached. The AMF's
+	// applyTaskChange makes the same comparison.
 	wantedIRI := prev.WantsProduct(types.ProductIRI)
 	wantsIRI := next.WantsProduct(types.ProductIRI)
 	// The record scope belongs in the same test, and for the same reason the products do:
-	// widening it makes records due that were previously excluded, for subjects the task
+	// widening it makes records due that the narrower scope excluded, for subjects the task
 	// already covered — so a scope-only modification *can* produce a record and must not take
 	// the early return. The AMF's predicate says the same three things; they had no business
 	// disagreeing.
@@ -1164,12 +1163,11 @@ func (s *subsystem) reportDeactivation(task types.InterceptTask) {
 // The target match is done under the per-session lock because it reads the
 // session's identity fields.
 //
-// The *match* used to run on the caller's goroutine, with only the processing
-// deferred. That is the shape the AMF's UE-pool scan had before this change too, and
-// it is a scan either way: it visits every live session and takes every session's
-// lock, so a provisioning function's answer took time proportional to the element's
-// subscriber population, and any one of those acquisitions could queue behind a PFCP
-// handler holding that session's lock. Unlike the registry read in retriggerWarrant,
+// The *match* runs on the goroutine too, not only the processing. It is a scan
+// either way: it visits every live session and takes every session's lock, so on the
+// caller's goroutine a provisioning function's answer would take time proportional to
+// the element's subscriber population, and any one of those acquisitions could queue
+// behind a PFCP handler holding that session's lock. Unlike the registry read in retriggerWarrant,
 // this walk cannot be bounded — which session a target holds is not indexed anywhere,
 // and finding out is the work — so what moves is the whole of it, not its cost.
 //
@@ -1373,12 +1371,11 @@ func (s *subsystem) modifySession(sc *smfctx.SMContext) {
 		return
 	}
 	if err := sessionModifier(sc); err != nil {
-		// **A send that failed is an outcome, and it used to be discarded here.** The
-		// comment said the failure surfaces through normal PFCP handling, which is true of
-		// a modification the datapath *answers* and false of one that never left: no
-		// sequence number was recorded, so no response can arrive, and nothing sweeps for
-		// a modification that was never sent. The element had already recorded the
-		// duplication as applied.
+		// **A send that failed is an outcome, and is not discarded.** Normal PFCP handling
+		// surfaces the failure of a modification the datapath *answers*, not of one that
+		// never left: no sequence number was recorded, so no response can arrive, and
+		// nothing sweeps for a modification that was never sent. The element has already
+		// recorded the duplication as applied.
 		//
 		// Reported rather than retried, and the asymmetry with the answer path is
 		// deliberate: this runs with sc.SMLock held, from the paths that derive
@@ -1426,8 +1423,7 @@ func (s *subsystem) deliverIRI(tasks []types.InterceptTask, corr [8]byte, subjec
 	payload, err := iri.EncodeXIRI(event)
 	if err != nil {
 		// **A record this element could not encode is product it produced and did not
-		// deliver, so it is reported.** It used to return silently, which was defensible
-		// while the only way to fail was an internal codec error — but the encoder now also
+		// deliver, so it is reported.** Besides an internal codec error, the encoder
 		// refuses a record whose values violate the constraints its own definition carries. A
 		// conformant mediation function would discard such a record anyway; what must not
 		// happen is that neither side knows.

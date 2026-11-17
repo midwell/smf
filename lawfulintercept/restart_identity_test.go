@@ -47,12 +47,12 @@ func namedTriggerSubsystem(t *testing.T, poi *fakePOI, node, addr string) *subsy
 //
 // `li.upfTriggers[].nodeId` is the configured string and the trigger keys are built from it;
 // the caller holds a `smfctx.NodeID` whose resolved form is an address. Handed the address,
-// the discard matched no key: every claim survived, so `plan` found each triple already
-// claimed and installed nothing — the restarted UPF holding no tasking and discarding the
+// the discard would match no key: every claim would survive, so `plan` would find each triple
+// already claimed and install nothing — the restarted UPF holding no tasking and discarding the
 // copies it was told to make, while this element reported the interception as running.
 //
-// **Confirm this fails before the fix**: with a pre-resolved string the registry keeps its
-// claims and the second establishment sends no activation.
+// With a pre-resolved string the registry keeps its claims and the second establishment sends
+// no activation, which is what this test fails on.
 func TestARestartAtANamedNodeIsRecognised(t *testing.T) {
 	poi := newFakePOI(t)
 	s := namedTriggerSubsystem(t, poi, "upf", trigNodeA)

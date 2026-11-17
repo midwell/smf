@@ -92,6 +92,43 @@ func TestAFailedEstablishmentAlreadyReportedIsReportedReleased(t *testing.T) {
 	}
 }
 
+// The create-failure handler calls ReportEstablishmentFailure without SMLock, and both of its
+// outcomes read session state that the other session paths guard with it -- the record the
+// identities and tunnels, the withdrawal the FARs. So every hook it reaches runs under the
+// session's lock, on either branch, and the lock is released when it returns.
+func TestReportEstablishmentFailureHoldsTheSessionLock(t *testing.T) {
+	for _, reported := range []bool{false, true} {
+		calls := captureLIFailures(t)
+		sc := teardownSession(t)
+		t.Cleanup(func() { smf_context.RemoveSMContext(sc.Ref) })
+		sc.LiEstablishmentReported = reported
+
+		unlocked := 0
+		checkHeld := func() {
+			if sc.SMLock.TryLock() {
+				sc.SMLock.Unlock()
+				unlocked++
+			}
+		}
+		liReportEstablishmentReject = func(*smf_context.SMContext, uint8) { checkHeld() }
+		liReportRelease = func(*smf_context.SMContext) { checkHeld(); calls.released++ }
+		liUntriggerCC = func(*smf_context.SMContext) { checkHeld(); calls.untasked++ }
+
+		ReportEstablishmentFailure(sc)
+
+		if calls.untasked != 1 {
+			t.Fatalf("establishment reported %v: triggers withdrawn %d times, want 1", reported, calls.untasked)
+		}
+		if unlocked != 0 {
+			t.Errorf("establishment reported %v: %d hook calls ran without the session's SMLock", reported, unlocked)
+		}
+		if !sc.SMLock.TryLock() {
+			t.Fatalf("establishment reported %v: SMLock still held after ReportEstablishmentFailure returned", reported)
+		}
+		sc.SMLock.Unlock()
+	}
+}
+
 // A modification the UE's update asked for, which the user plane refused or never answered, is
 // reported failed exactly once: the counterpart to the modification record emitted before the send.
 func TestAFailedUeModificationIsReportedFailedOnce(t *testing.T) {

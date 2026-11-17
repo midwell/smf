@@ -135,7 +135,7 @@ func TestProductDroppedByAFullQueueIsReported(t *testing.T) {
 }
 
 // TestADroppedUnitIsReportedAsALossAndNotAsUnreachability is the consumer half of the
-// finding, asserted where the decision is made.
+// dropped-unit accounting, asserted where the decision is made.
 //
 // A partial write costs one product unit only where the library's own resend of that unit
 // does not land either — it resends it whole on the fresh connection, which recovers the

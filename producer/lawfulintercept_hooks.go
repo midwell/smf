@@ -16,8 +16,7 @@ import (
 // to lawfulintercept, and Init needs mTLS material and a TCP bind that this
 // package's tests have no business standing up. Without a seam the hooks are
 // silent no-ops in every test, so a path that stopped calling them would look
-// exactly like a path that calls them — which is how two teardown paths came to
-// be missing them for as long as they were.
+// exactly like a path that calls them.
 //
 // The seam lives here rather than as test-only API on lawfulintercept, because
 // what needs asserting is which of *this* package's paths call the hooks, not

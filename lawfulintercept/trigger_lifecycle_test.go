@@ -35,7 +35,7 @@ func noGoroutineIn(t *testing.T, names ...string) {
 
 		var still []string
 		for _, name := range names {
-			if strings.Contains(stacks, name) {
+			if runningIn(stacks, name) {
 				still = append(still, name)
 			}
 		}
@@ -54,6 +54,26 @@ func noGoroutineIn(t *testing.T, names ...string) {
 	}
 }
 
+// runningIn reports whether any goroutine in a runtime.Stack dump has the named
+// function in one of its own frames.
+//
+// A frame line is the function name followed by its arguments, so the name must be
+// followed by "(": otherwise keepalive would match keepaliveRound. And a goroutine's
+// "created by" line names the function that started it, not one it is running: a
+// reconciliation another test started from keepaliveRound is no keepalive loop.
+func runningIn(stacks, name string) bool {
+	for _, line := range strings.Split(stacks, "\n") {
+		if strings.HasPrefix(line, "created by ") {
+			continue
+		}
+		if strings.Contains(line, name+"(") {
+			return true
+		}
+	}
+
+	return false
+}
+
 // TestAFailedInitWithdrawsNothingAndLeavesNothingRunning is the whole of *Outbound
 // X1 work has an owner*, reached from the one arrangement that makes it a live
 // hazard rather than untidiness.
@@ -61,7 +81,7 @@ func noGoroutineIn(t *testing.T, names ...string) {
 // Reconciliation withdraws every trigger a POI reports that this registry cannot
 // account for — which is what makes a previous life's orphans reclaimable — and a
 // just-started registry accounts for none. So it may only run once this subsystem is
-// the one running. Dispatched from the registry's construction, as it was, it ran
+// the one running. Dispatched from the registry's construction, it would run
 // while initialisation could still fail, and the step most likely to fail is the X1
 // bind: it fails when another process already holds the port, which is what a
 // rolling restart or a duplicated deployment looks like. The process most likely to

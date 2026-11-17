@@ -272,10 +272,10 @@ func TestAnAcceptedModificationIsLeftAlone(t *testing.T) {
 // carry.
 //
 // An NE-level report may name no target and no warrant, which is the channel's rule and is
-// correct. That limit used to be read as meaning the condition could not be attributed at all —
-// so a LIPF holding several warrants was told only that *some* content interception this element
-// triggers was not running, which is a condition nobody can act on. It is the same defect
-// `triggerFaulty` was corrected for, on a different path.
+// correct. It does not mean the condition cannot be attributed at all: told only that *some*
+// content interception this element triggers is not running, a LIPF holding several warrants
+// has a condition nobody can act on. `triggerFaulty` attributes its condition for the same
+// reason, on a different path.
 //
 // It can be attributed: a task report is scoped to a warrant by construction, and the SEID the
 // answer carries names the session, which names the warrants covering it.

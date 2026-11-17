@@ -80,9 +80,9 @@ func sessionServedBy(supi, addr string) *smfctx.SMContext {
 // triggerCC runs on HandlePfcpSessionEstablishmentResponse's path with sc.SMLock held.
 // The reports it issues for a warrant it cannot install — no triggering endpoint for a
 // UPF serving the target — go over X1, and ReportTaskIssue is deliberately unthrottled
-// because each task's failure is its own fact. So every affected warrant used to cost
-// the establishment a full client timeout, under the session's own lock, and only for
-// the subscribers who were being intercepted.
+// because each task's failure is its own fact. Issued synchronously, every affected
+// warrant would cost the establishment a full client timeout, under the session's own
+// lock, and only for the subscribers who were being intercepted.
 //
 // Three warrants, so a synchronous report costs three timeouts rather than one: this
 // asserts against a stall that scales with the tasking, which is the shape that makes

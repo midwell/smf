@@ -14,12 +14,10 @@ import (
 	"github.com/omec-project/util/li/iri"
 )
 
-// The conditional members of TS 33.128 the SMF holds and did not report —
-// CONFORMANCE.md findings 2 and 3.
+// The conditional members of TS 33.128 the SMF holds and reports.
 //
 // One assertion per record-field site. A test asking whether "some identity is
-// present" passes with all but one of them still missing, which is how finding 3's
-// prose came to disagree with the audited list.
+// present" passes with all but one of them still missing.
 
 // fullSession is an SMContext holding every value the records below can report.
 func fullSession() *smfctx.SMContext {
@@ -110,8 +108,8 @@ func TestSMFRecordsCarryTheServingNetwork(t *testing.T) {
 	}
 }
 
-// The one uEEndpoint site that was genuinely missing. The other two records already
-// carried it; finding 3's prose named the wrong one.
+// The modification record's uEEndpoint, beside the two other session records that
+// carry it.
 //
 // The modification record's uEEndpoint is the CHOICE itself in the module, not the
 // SEQUENCE OF the other records carry, so it must be one address — and must encode.
@@ -126,8 +124,8 @@ func TestModificationCarriesTheUEEndpoint(t *testing.T) {
 	}
 }
 
-// sUPIUnauthenticated is finding 2, and false is the whole point: it is the ordinary
-// value, and the value the encoder could not express before pointer support.
+// sUPIUnauthenticated, where false is the whole point: it is the ordinary value, and
+// the encoder can only express it because the field is a pointer.
 func TestSUPIUnauthenticatedIsCarriedAsFalse(t *testing.T) {
 	sc := fullSession()
 

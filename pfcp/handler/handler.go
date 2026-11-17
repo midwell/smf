@@ -197,10 +197,10 @@ func SetUpfInactive(nodeID smf_context.NodeID, msgTypeName string) {
 	// POI it may not be reaching that its triggering function is present, which is what
 	// disables that POI's own fail-safe.
 	//
-	// The adapter's twin of this function has raised it since it was written; this one did not,
-	// so on the native path a UPF reporting no established association was discovered only by
-	// the next probe cycle. Only one of the two runs in a deployment, which is exactly what
-	// makes a remedy present in one of them a remedy that depends on enableUPFAdapter.
+	// The adapter's twin of this function raises it too. Without it here, on the native path a
+	// UPF reporting no established association would be discovered only by the next probe
+	// cycle. Only one of the two runs in a deployment, so a remedy present in one of them alone
+	// would depend on enableUPFAdapter.
 	POIRestarted(upf.NodeID, upf.NodeID.ResolveNodeIdToIp().String())
 }
 
@@ -807,13 +807,13 @@ func HandlePfcpSessionModificationResponse(msg *udp.Message) {
 	// clears the pending entry a concurrent subscriber modification is waiting on
 	// and completes that procedure on an answer never sent to it.
 	//
-	// **Keeping it out of that procedure is one obligation; discarding it was a second
-	// mistake.** The guard returned without reading the Cause, so the answer to this
-	// element's own modification was thrown away — and with it, a refused activation was
-	// never retried: the element held a task it reported as intercepting and a datapath
+	// **Keeping it out of that procedure is one obligation; reading it is a second.** A
+	// guard that returned without reading the Cause would throw away the answer to this
+	// element's own modification — and with it, a refused activation would never be
+	// retried: the element would hold a task it reported as intercepting and a datapath
 	// that had declined it, with nothing left to re-send (the send itself cleared the
-	// RULE_UPDATE marker) and nothing reported. A refused withdrawal left duplication
-	// running while the element believed it was off.
+	// RULE_UPDATE marker) and nothing reported. A refused withdrawal would leave
+	// duplication running while the element believed it was off.
 	if req, ok := lisequence.Take(rsp.Sequence()); ok {
 		cause, answered := liResponseCause(rsp)
 		LIModificationAnswered(req, cause, answered)
@@ -821,11 +821,10 @@ func HandlePfcpSessionModificationResponse(msg *udp.Message) {
 		return
 	}
 
-	// Upstream guards this immediately after the lookup (omec-project/smf#643). Here it has to
-	// come after the interception block above, not before it: that block answers a modification
-	// this element sent itself, keyed on the sequence number alone, and it must still run when
-	// the session has since been released. Guarding at the lookup would discard those answers and
-	// reinstate exactly the defect the block was added to fix.
+	// The nil-context guard (omec-project/smf#643) comes after the interception block above, not
+	// at the lookup: that block answers a modification this element sent itself, keyed on the
+	// sequence number alone, and it must still run when the session has since been released.
+	// Guarding at the lookup would discard those answers.
 	if smContext == nil {
 		logger.PfcpLog.Warnf("PFCP Session Modification Response found SM context nil for SEID[%d], response discarded", SEID)
 		return

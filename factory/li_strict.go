@@ -21,8 +21,8 @@ import (
 // and nothing anywhere says so.
 //
 // **Scoped to the `li` block, deliberately.** Decoding the whole configuration strictly would
-// refuse upstream keys this fork does not model, which is a different and much larger change: the
-// fork tracks an upstream that adds fields, and a deployment carrying one would stop starting. The
+// refuse every key this version does not model, which is a different and much larger change: a
+// deployment carrying a key from a later release would stop starting. The
 // property to hold is narrow — a mistyped LI key must not reach a default — and so is the check.
 //
 // The block is isolated first and decoded strictly second, because strictness lives on the decode

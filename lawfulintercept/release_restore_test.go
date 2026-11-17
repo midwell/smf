@@ -61,7 +61,7 @@ func TestARestoredReleaseIsReportableAgainAndRetasksNothing(t *testing.T) {
 
 	// And nothing was sent. The withdrawal the POI has already acknowledged stands:
 	// what would re-establish this session's content interception is its user-plane
-	// state coming back, which is the held-out upstream session-cleanup TODO.
+	// state coming back, which no path here provides.
 	if n := poi.countMessages("ActivateTaskRequest"); n != 0 {
 		t.Errorf("%d triggers were installed for a session with no tunnel: the criterion is a "+
 			"PFCP session that has been deleted, so it matches no packet while this element "+

@@ -41,16 +41,16 @@ func InitConfigFactory(f string) error {
 		return err
 	}
 
-	// The lenient decode above is upstream's and stays lenient — this fork must keep starting
-	// when upstream adds a key it does not model. The LI block is held to a stricter standard,
+	// The lenient decode above stays lenient — the SMF must keep starting on a configuration
+	// carrying a key this version does not model. The LI block is held to a stricter standard,
 	// on its own, because a key dropped there lands on a default that fails unsafely and says
 	// nothing: see strictLiBlock.
 	//
-	// **Recorded, not returned.** Returning it failed the whole configuration load, which stops
-	// the SMF: PFCP, the service-based interface, registration with the network, every
-	// subscriber's sessions — over a typo in an optional subsystem. That is the outage this
-	// fork's own `service/init.go` comment describes and refuses to cause for an unreadable
-	// keepalive window, arrived at one frame earlier and in another package. It is also the
+	// **Recorded, not returned.** Returning it would fail the whole configuration load, which
+	// stops the SMF: PFCP, the service-based interface, registration with the network, every
+	// subscriber's sessions — over a typo in an optional subsystem. That is the outage the
+	// `service/init.go` LI comment describes and refuses to cause for an unreadable keepalive
+	// window, arrived at one frame earlier and in another package. It is also the
 	// louder half of undetectability: a network function that will not start is visible to every
 	// operator and peer, where a log line is visible only to whoever reads logs.
 	//

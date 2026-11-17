@@ -17,14 +17,12 @@ import (
 )
 
 // Every value this element puts into a TS 33.128 record arrives through a conversion into one
-// of `li/iri`'s types, and two of those conversions have already been defects.
+// of `li/iri`'s types, and a raw cast is where such a conversion goes wrong silently.
 //
-// `handoverCause` cast NGAP's cause value straight into the record type — every handover record
-// delivered before 2026-08-20 carried the wrong cause. `handoverType` cast NGAP's handover type
-// the same way, and `intra5gs(0)` made every intra-5GS handover record undecodable on receipt.
-// Both were found by a delivered record being wrong, one of them weeks after the fact, and
-// `PDUSessionType` was found by reading. **None of those is a check**, so the next raw cast into
-// a record enumeration would arrive exactly the same way.
+// Casting NGAP's cause value or handover type straight into the record type would put the wrong
+// cause in every handover record, and `intra5gs(0)` would make every intra-5GS handover record
+// undecodable on receipt. Neither shows until a delivered record is read and found wrong, so
+// every raw cast into a record enumeration needs a check that does not depend on reading.
 //
 // **This keys on the shape, not on a list of enumerations.** The tempting design is "for each
 // known `iri` enum type, require an assertion", and that list is the thing that goes stale: a
@@ -78,7 +76,7 @@ type iriConversion struct {
 // depends on two enumerations agreeing. A cast is a correspondence claim with nothing behind it,
 // and it looks identical either way from the call site.
 var recordedConversions = map[string]iriConversion{
-	// The one enumerated conversion in this module, and this change's own finding: a direct
+	// The one enumerated conversion in this module: a direct
 	// cast from the NAS value, correct today because TS 24.501 and TS 33.128 happen to number
 	// the concept identically, with nothing holding it there.
 	"PDUSessionType": {
@@ -342,12 +340,11 @@ func declaredTests(t *testing.T) map[string]bool {
 	return out
 }
 
-// TestEveryIRIConversionIsRecorded is the check the two handover defects needed and the one that
-// reproduces this change's own finding.
+// TestEveryIRIConversionIsRecorded finds every conversion into a TS 33.128 record field and fails
+// on one that is not recorded above.
 //
-// Written before the `PDUSessionType` assertion landed, it failed naming `PDUSessionType` — the
-// finding that had been made by reading, produced instead by the check that should have found
-// it.
+// Without the `PDUSessionType` entry it fails naming `PDUSessionType`: a cast with nothing
+// holding the correspondence is found by the check rather than by reading.
 func TestEveryIRIConversionIsRecorded(t *testing.T) {
 	// It reads source files and nothing else.
 	t.Parallel()

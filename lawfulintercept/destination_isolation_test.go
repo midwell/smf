@@ -18,9 +18,9 @@ import (
 //
 // A task that names destinations and yields no X2 endpoint is an assertion this element
 // cannot honour: substituting the configured MDF2 sends an agency's signalling to an
-// endpoint the warrant never named. The two used to be one test, an empty resolved list,
-// and they are different facts. x1 now refuses such a task with 3040 before it reaches the
-// store, so this pins the backstop rather than a path X1 can drive.
+// endpoint the warrant never named. Both arrive as an empty resolved list, and they are
+// different facts. x1 refuses such a task with 3040 before it reaches the store, so this
+// pins the backstop rather than a path X1 can drive.
 func TestTheConfiguredEndpointServesAnUnnamedDestinationOnly(t *testing.T) {
 	sub := &subsystem{mdf2: testDestinationAddr}
 
@@ -84,7 +84,7 @@ func TestAnUnresolvableWarrantDeliversToNoAgency(t *testing.T) {
 	sub := &subsystem{mdf2: agencyA}
 
 	// Agency B's warrant, as it would look if x1 had stored it: it named a destination
-	// and this element resolved none of it. x1 now refuses such a task outright, so this
+	// and this element resolved none of it. x1 refuses such a task outright, so this
 	// is the belt to that braces — the delivery path must not substitute either.
 	agencyBWarrant := types.InterceptTask{
 		XID:      "66666666-6666-4666-8666-666666666666",

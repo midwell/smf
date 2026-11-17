@@ -15,12 +15,10 @@ import (
 // TestNumberingReturnsToZeroWhenEveryWarrantIsWithdrawn is the assertion that makes the
 // numbering-leak class detectable, rather than a test of one leak.
 //
-// Three separate defects in this workstream were the same shape: a numbering context created
-// for a (warrant, subject) pair and never released — by a relabel, by a modification, by a
-// withdrawal that took a different path. Each was found by reading code, none by a test, and
-// each was invisible in operation: the element keeps numbering correctly, delivery keeps
-// working, and the only symptom is an entry per subject per warrant held for the life of the
-// process. A long-lived element accumulates them until it dies and takes every warrant it
+// The leak has one shape: a numbering context created for a (warrant, subject) pair and never
+// released — by a relabel, by a modification, by a withdrawal that takes a different path. It is
+// invisible in operation: the element keeps numbering correctly, delivery keeps working, and the
+// only symptom is an entry per subject per warrant held for the life of the process. A long-lived element accumulates them until it dies and takes every warrant it
 // holds with it.
 //
 // What closes the class rather than the instance is the invariant: **an element holding no

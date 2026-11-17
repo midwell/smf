@@ -75,9 +75,8 @@ func bulkRequest(msgType, admfID, neID string) []byte {
 // server of its own, because a second copy of the wiring is exactly where a configured
 // policy stops being applied without anything failing.
 //
-// Both directions are covered: the failure this change exists to fix is a stated `false`
-// arriving as nothing, and the failure it must not introduce is an unstated value arriving
-// as something.
+// Both directions are covered: a stated `false` must not arrive as nothing, and an
+// unstated value must not arrive as something.
 func TestBulkDeactivationFollowsConfiguration(t *testing.T) {
 	const admfID, neID = testADMFID, testNEID
 	no := false

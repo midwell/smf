@@ -64,12 +64,11 @@ func liHookNames(t *testing.T, file, fn string) map[string]bool {
 // a hook whose presence depends on configuration, and the agency's product depends on it with no
 // way for anyone to notice.
 //
-// That is not hypothetical. This package's establishment-response handler carried **none** of the
-// three hooks the native one has. With the adapter selected, the SMF still set the DUPL bit on the
-// FARs — so the UPF duplicated a targeted subscriber's traffic — but never sent the ActivateTask
-// that authorises it. The CC-POI held no task for that session and dropped every copy as
-// unattributable, and no establishment record was ever produced. From the SMF's side nothing had
-// failed, so nothing raised a fault.
+// An establishment-response handler here missing the native one's hooks would, with the adapter
+// selected, still set the DUPL bit on the FARs — so the UPF duplicates a targeted subscriber's
+// traffic — but never send the ActivateTask that authorises it. The CC-POI would hold no task for
+// that session and drop every copy as unattributable, and no establishment record would be
+// produced. From the SMF's side nothing would have failed, so nothing would raise a fault.
 //
 // The guard derives its expectation from the native handler rather than from a list, so a fourth
 // hook added there fails this test until the adapter gets it too.

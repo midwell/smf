@@ -3,14 +3,13 @@
 
 // Package lisequence records the PFCP modifications this element sent for Lawful
 // Interception, so their responses can be recognised, kept out of the session's own
-// procedure handling, and — the part that was missing — acted on.
+// procedure handling, and acted on.
 //
 // It is its own package because both response handlers need it and they cannot both
 // reach it anywhere else: pfcp/message calls pfcp/adapter, so the adapter cannot
-// import pfcp/message, which is where this used to live. The guard has to be in the
-// handler rather than at one call site — an LI response reaching subscriber procedure
-// handling is the fault, whichever path delivered it — so the record moves to where
-// every handler can ask.
+// import pfcp/message. The guard has to be in the handler rather than at one call
+// site — an LI response reaching subscriber procedure handling is the fault, whichever
+// path delivered it — so the record lives where every handler can ask.
 package lisequence
 
 import (

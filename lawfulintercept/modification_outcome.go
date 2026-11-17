@@ -152,14 +152,13 @@ func (s *subsystem) modificationNotApplied(req lisequence.Request) {
 
 		// **Two channels, because they carry different things and only one of them may name
 		// a warrant.** The NE-level report below carries no target and no warrant, which is
-		// what that channel permits — an earlier version of this comment read that limit as
-		// meaning the condition could not be attributed at all, and left it at element scope.
-		// It can be: a task report is scoped to a warrant by construction, and this element
+		// what that channel permits. That limit does not mean the condition cannot be
+		// attributed: a task report is scoped to a warrant by construction, and this element
 		// knows which warrants cover the session, because the SEID names it.
 		//
 		// Without that, a LIPF holding several warrants is told only that *some* content
 		// interception this element triggers is not running, which is a condition nobody can
-		// act on — the same defect `triggerFaulty` was corrected for.
+		// act on — the reason `triggerFaulty` is attributed too.
 		//
 		// The two directions are separate facts and are reported as such: an activation
 		// that did not take is an interception that is not running, and a withdrawal that

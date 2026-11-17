@@ -114,8 +114,8 @@ type SMContext struct {
 	// RequestType is the 5GSM request type the AMF supplied when creating this
 	// context — whether the UE asked for a new PDU session or for an existing one,
 	// and whether it was an emergency request. It is a mandatory field of the
-	// Lawful Interception establishment record, which previously reported every
-	// session as an initial request because nothing retained the real value.
+	// Lawful Interception establishment record, which without it would report every
+	// session as an initial request.
 	RequestType models.RequestType `json:"requestType,omitempty" yaml:"requestType" bson:"requestType,omitempty"`
 	RatType     models.RatType     `json:"ratType,omitempty" yaml:"ratType" bson:"ratType,omitempty"`
 
@@ -1070,9 +1070,8 @@ func (smContext *SMContext) SetCreateData(createData *models.SmContextCreateData
 	smContext.OldPduSessionId = createData.GetOldPduSessionId()
 	smContext.ServingNfId = createData.GetServingNfId()
 	// Guami and UnauthenticatedSupi are both mandatory conditional fields of the
-	// Lawful Intercept session records, and both were sent by the AMF and dropped
-	// here. Same shape as RequestType above, which "previously reported every session
-	// as an initial request because nothing retained the real value".
+	// Lawful Intercept session records, and the AMF sends both, so they are kept here
+	// for the same reason as RequestType above.
 	//
 	// ServingNfId is not a substitute for Guami: it is an NF instance UUID, while
 	// TS 33.128's aMFID is the AMF region/set/pointer of TS 23.003 clause 2.10.1.

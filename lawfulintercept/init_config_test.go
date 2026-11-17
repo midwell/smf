@@ -12,12 +12,12 @@ import (
 	"github.com/omec-project/util/li/x1"
 )
 
-// TestUnreadableKeepaliveWindowStopsInterceptionAndTellsTheADMF is the property that
-// makes this refusal better than the one it replaces.
+// TestUnreadableKeepaliveWindowStopsInterceptionAndTellsTheADMF is why the window is read
+// inside Init.
 //
-// The window used to be read *before* Init, where there was no fault channel to report
-// on — so the refusal had to be made by returning from the network function's own
-// start-up, and nothing could tell the provisioning function why. Read inside Init, the
+// Read *before* Init, there is no fault channel to report on — so the refusal would have
+// to be made by returning from the network function's own start-up, and nothing could
+// tell the provisioning function why. Read inside Init, the
 // refusal costs interception and nothing else, and the one party who needs to know that
 // this element is not intercepting is told: no interrogation reveals it, since an
 // element holding no tasking answers every query successfully and looks exactly like one
@@ -185,7 +185,7 @@ func TestASubFloorKeepaliveWindowStopsInterceptionRatherThanTheProcess(t *testin
 }
 
 // TestNoX1ListenAddressStopsInterceptionAndTellsTheADMF covers the configuration mistake that
-// produced a *working* element nobody could provision.
+// would otherwise produce a *working* element nobody could provision.
 //
 // `Listen(ctx, "tcp", "")` does not fail. It binds every interface at an OS-selected ephemeral
 // port, so with `x1Listen` absent — misspelled, or templated from a value that rendered

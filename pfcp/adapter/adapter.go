@@ -83,8 +83,7 @@ func notifyApplyCCAfterEstablishment(sc *context.SMContext) {
 //
 // One helper per hook, named for it, rather than one that raises both: the call site is what a
 // reader and a parity check both look at, and a helper that groups two hooks hides their names
-// from it. That is not hypothetical either — the first version of this grouped them, and the
-// parity guard in this package failed until they were named here.
+// from it, and the parity guard in this package fails until each hook is named here.
 func notifyTriggerCC(sc *context.SMContext) {
 	if TriggerCC != nil {
 		TriggerCC(sc)
@@ -527,23 +526,23 @@ func HandlePfcpSessionModificationResponse(msg *udp.Message) error {
 	// A modification this element sent for Lawful Interception, not one the session's
 	// own procedures sent — the same guard the native handler applies, on the path
 	// taken when enableUPFAdapter is set. sendSessionModification routes the response
-	// through HandleAdapterPfcpRsp in that mode, and this handler had none: an LI
-	// modification's response landing during SmStatePfcpModify cleared the pending-UPF
-	// entry the subscriber's own concurrent modification was waiting on and completed
-	// that procedure on an answer never sent to it. The correlation below — SEID,
-	// serving UPF, procedure state — cannot tell the two apart, which is why the
-	// sequence number is what answers it.
+	// through HandleAdapterPfcpRsp in that mode. Without it, an LI modification's
+	// response landing during SmStatePfcpModify would clear the pending-UPF entry the
+	// subscriber's own concurrent modification is waiting on and complete that procedure
+	// on an answer never sent to it. The correlation below — SEID, serving UPF, procedure
+	// state — cannot tell the two apart, which is why the sequence number is what answers
+	// it.
 	//
-	// Note that Take *consumes* the record. Before this, nothing in adapter mode consumed
-	// it, so every LI-originated sequence number lingered until the age-out.
+	// Note that Take *consumes* the record, so an LI-originated sequence number does not
+	// linger until the age-out.
 	//
 	// **And the answer is read.** Keeping it out of the subscriber's procedure is one
-	// obligation and discarding it was a second mistake: the Cause says whether the
-	// datapath applied the duplication this element had already recorded as applied, and
-	// with it discarded a refused activation was never retried — the element holding a
-	// task it reports as intercepting and a datapath that declined it, with nothing left
-	// to re-send and nothing reported. A refused withdrawal left duplication running while
-	// the element believed it was off.
+	// obligation and reading it is a second: the Cause says whether the datapath applied
+	// the duplication this element had already recorded as applied, and with it discarded
+	// a refused activation would never be retried — the element holding a task it reports
+	// as intercepting and a datapath that declined it, with nothing left to re-send and
+	// nothing reported. A refused withdrawal would leave duplication running while the
+	// element believed it was off.
 	if req, ok := lisequence.Take(pfcpRsp.Sequence()); ok {
 		notifyLIModificationAnswered(req, causeValue, true)
 

@@ -14,10 +14,10 @@ import (
 
 // Every PFCP establishment failure reaches the create-failure handler -- a UPF that refused, a
 // request that timed out, an adapter error, a verdict collected across several UPFs -- so that is
-// where Lawful Interception has to hear of it. Before, the record hung off a PFCP send-error
-// handler the native establishment path no longer used, so a tasked subject's failed establishment
-// produced no record, and one that failed after the anchor accepted left its establishment record
-// and its trigger standing.
+// where Lawful Interception hears of it. A PFCP send-error handler is not such a point: the native
+// establishment path does not use one, so a record raised there would leave a tasked subject's
+// failed establishment unreported, and one that failed after the anchor accepted with its
+// establishment record and its trigger standing.
 //
 // The hook must run while the context exists: the record and the withdrawal both read the session,
 // and the handler removes it.

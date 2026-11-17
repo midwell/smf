@@ -92,10 +92,10 @@ type upfEndpoint struct {
 // markReconciled records that this POI has given an authoritative account of its
 // tasking.
 //
-// It used to be documented as never going back to false. That was true while the only thing
-// that could invalidate the account was a restart of *this* process — but ForgetPOI discards
-// this element's claims for a POI on a liveness timeout too, and after that this process can
-// no longer name what that POI holds. See forgetReconciled.
+// It does not stay true for the life of the process. A restart of *this* process is not the
+// only thing that invalidates the account: ForgetPOI discards this element's claims for a POI
+// on a liveness timeout too, and after that this process can no longer name what that POI
+// holds. See forgetReconciled.
 func (e *upfEndpoint) markReconciled() {
 	e.reconciled.Store(true)
 }
@@ -157,9 +157,9 @@ type triggerRegistry struct {
 	// configured nodes can resolve to one address — transiently, while a Service is
 	// being recreated, or permanently in a mistaken configuration — and choosing
 	// between them by Go's map order would send a session's triggers to a different
-	// UPF from one establishment to the next. The final review found that same
-	// nondeterminism in warrant selection at the CC-POI; it is worse here, because
-	// the trigger carries the X3 destination.
+	// UPF from one establishment to the next. The CC-POI avoids the same
+	// nondeterminism in warrant selection; it is worse here, because the trigger
+	// carries the X3 destination.
 	order []string
 
 	// reportUnattributable tells the LIPF that a POI's answer could not be bound to
@@ -182,10 +182,10 @@ type triggerRegistry struct {
 	// **A condition that can only be observed once is not a condition this element can
 	// report.** The POI's account is the only way a triggering function learns that a trigger
 	// it installed has stopped running — a failed provisioning, an unresolved fault, a
-	// datapath that refused the duplication rule. It used to be read exactly once per POI per
-	// process, during start-up reconciliation, which is *before this process has installed
-	// anything*: every trigger it goes on to install is outside that window for the life of
-	// the process. So the one condition `triggerFaulty` exists for was the one condition it
+	// datapath that refused the duplication rule. Read only once per POI per process, during
+	// start-up reconciliation, it would be read *before this process has installed anything*:
+	// every trigger it goes on to install would be outside that window for the life of the
+	// process, and the one condition `triggerFaulty` exists for would be the one condition it
 	// could not see.
 	//
 	// Asked on the keepalive round because that round already contacts every endpoint this
@@ -250,8 +250,8 @@ type triggerRegistry struct {
 	// Two reasons, one in production and one in test. In production, construction
 	// happens before the X1 listener is bound and before this subsystem is committed
 	// to running; an initialisation that fails after this point must leave nothing
-	// behind, and it used to leave a resolver and a keepalive loop running for the
-	// life of the process, one set per attempt. In test, a registry built to exercise
+	// behind — not a resolver and a keepalive loop running for the life of the
+	// process, one set per attempt. In test, a registry built to exercise
 	// planning or matching should start no background work at all, and a goroutine
 	// outliving its test fails the next one.
 	//
@@ -413,18 +413,17 @@ func newTriggerRegistry(
 	claimedNEIDs := make(map[string]string, len(cfg.UPFTriggers))
 
 	for _, t := range cfg.UPFTriggers {
-		// Key by the NodeID exactly as configured, and resolve nothing here. An
-		// earlier version keyed by the address the NodeID resolved to at this moment,
-		// which made a derived, mutable value permanent: a UPF that later changed
-		// address was never found again, and a name that did not resolve at the
-		// instant the SMF started was keyed "0.0.0.0" for the life of the process.
-		// Either way every CC warrant for that UPF reported "no triggering endpoint"
-		// until the SMF was restarted. Matching now happens per use, in
-		// matchEndpoint.
+		// Key by the NodeID exactly as configured, and resolve nothing here. Keying
+		// by the address the NodeID resolves to at this moment would make a derived,
+		// mutable value permanent: a UPF that later changed address would never be
+		// found again, and a name that did not resolve at the instant the SMF started
+		// would be keyed "0.0.0.0" for the life of the process. Either way every CC
+		// warrant for that UPF would report "no triggering endpoint" until the SMF
+		// was restarted. Matching happens per use, in matchEndpoint.
 		if _, dup := reg.endpoints[t.NodeID]; dup {
-			// Previously the second entry silently replaced the first, so a
-			// two-UPF configuration presented as a one-UPF registry and the
-			// displaced UPF's content was never attributable.
+			// Letting the second entry replace the first would present a two-UPF
+			// configuration as a one-UPF registry, and the displaced UPF's content
+			// would never be attributable.
 			return nil, fmt.Errorf("upfTriggers names the same node twice: %q", t.NodeID)
 		}
 		// **Two points of interception may not share an element identifier**, and this
@@ -471,7 +470,7 @@ func newTriggerRegistry(
 	//
 	// The name-typed ones are left to the loop, which resolves before its first tick.
 	// Blocking this constructor on DNS would put a name lookup on the element's
-	// startup path, which is the kind of thing this change exists to remove; the cost
+	// startup path, which is the kind of thing this design keeps off it; the cost
 	// is that a deployment whose LI block names its UPFs differently from the slice
 	// topology has a window of one lookup in which such a session reports a warrant
 	// with no triggering endpoint and the next one succeeds. Where the two agree —
@@ -588,7 +587,7 @@ func (r *triggerRegistry) drainWarrant(warrant types.XID) {
 //
 // Identity is tried first and costs nothing: when `li.upfTriggers` names the node
 // the way the slice topology names it, the two NodeIDs are equal and no name is
-// ever resolved. That is upstream's own conclusion for the sibling comparison in
+// ever resolved. That is the SMF's own conclusion for the sibling comparison in
 // nodeInLinks (#613) — membership is identity, not reachability.
 //
 // Resolution remains as the fallback because these two values come from
@@ -971,12 +970,12 @@ func (s *subsystem) reconcileTriggers() {
 // warrant corresponds to, retrying until it has an authoritative answer.
 //
 // One attempt is not reconciliation. A POI unreachable at startup and reachable a
-// minute later — the ordinary shape of a whole-cluster restart — was abandoned
-// with a fault report and never revisited, while this process resumed keepalives
-// to it regardless: the POI was then kept alive, for the life of the process, by a
-// triggering function that could not name a single thing it held. Retrying is what
-// makes that state temporary, and the keepalive gating (keepaliveDue) is what makes
-// it safe while it lasts.
+// minute later — the ordinary shape of a whole-cluster restart — would, after one
+// attempt, be abandoned with a fault report and never revisited, while this process
+// resumed keepalives to it regardless: the POI would then be kept alive, for the
+// life of the process, by a triggering function that could not name a single thing
+// it held. Retrying is what makes that state temporary, and the keepalive gating
+// (keepaliveDue) is what makes it safe while it lasts.
 func (s *subsystem) reconcileEndpoint(nodeID string, endpoint *upfEndpoint) {
 	// At most one per endpoint: this is called from start-up and from every keepalive round,
 	// and it retries until it has an answer.
@@ -1250,18 +1249,18 @@ func TriggerCC(sc *smfctx.SMContext) {
 // registry has to be allowed to apply its own matching rule. Trigger keys carry
 // `li.upfTriggers[].nodeId` exactly as configured — which the chart and the blueprint default
 // to `upf`, a name — while every caller here holds a `smfctx.NodeID` whose resolved form is
-// an address. Handed the address, ForgetPOI's string equality matched nothing and this
-// notification did nothing at all: the registry kept every claim for the restarted POI, so
-// `plan` found each triple already claimed and installed nothing, while the POI held no
-// tasking and discarded the copies it was told to make. The only existing test passed
-// because it configured an IP literal, the one spelling in which the two forms coincide.
+// an address. Handed the address, ForgetPOI's string equality would match nothing and this
+// notification would do nothing at all: the registry would keep every claim for the
+// restarted POI, so `plan` would find each triple already claimed and install nothing, while
+// the POI held no tasking and discarded the copies it was told to make. A test configured
+// with an IP literal cannot see this: it is the one spelling in which the two forms coincide.
 //
 // So the two values travel in the shape sessionUPFs already builds, and matchEndpoint
 // resolves them to a configured key — identity first, then the refreshed address index —
 // which is the same rule the trigger path uses. ForgetPOI stays as the key-level primitive.
 //
 // **A detected restart does not come through here.** It reaches the same discard through
-// GateRestoration, which wraps upstream's session restoration so the discard is settled before
+// GateRestoration, which wraps the SMF's session restoration so the discard is settled before
 // any session is re-installed. This is for the paths on which a UPF stops answering, where
 // nothing is restored. If it comes back having restarted, its re-association reports a new
 // recovery timestamp and is gated in turn; if it comes back with the timestamp it had, nothing
@@ -1305,20 +1304,17 @@ func UntriggerCC(sc *smfctx.SMContext) {
 // The SMF reports the release and withdraws the session's triggers *before* PFCP
 // deletion, and that order is right rather than wrong: stopping interception before or
 // as the session goes is the fail-closed direction, and withdrawal needs the
-// serving-UPF list that hangs off sc.Tunnel. What was missing is that nothing put the
-// *report* state back on the branches where the deletion times out or fails and the
-// session is restored to service — so the release that eventually happened was
-// suppressed as a duplicate of one that never occurred, and the agency's record of the
-// session ended at a failed attempt, permanently. That is what this restores, and it is
-// the half the spec obliges: `A record reports the transition it names` requires the
-// eventual release to stay reportable.
+// serving-UPF list that hangs off sc.Tunnel. On the branches where the deletion times
+// out or fails and the session is restored to service, the *report* state must be put
+// back — otherwise the release that eventually happens is suppressed as a duplicate of
+// one that never occurred, and the agency's record of the session ends at a failed
+// attempt, permanently. That is what this restores: the eventual release stays
+// reportable, because a record reports the transition it names.
 //
-// **It does not re-install the triggers, and it cannot.** An earlier version called
-// triggerCC from here and its comment said the interception was restored. Every
-// reachable caller runs after releaseTunnel has set sc.Tunnel = nil
-// (producer/pdu_session.go), and a session with no tunnel has no serving UPFs, so
-// sessionUPFs returns nothing and triggerCC returns before planning anything. The call
-// was unreachable on every branch while the comment asserted it had run.
+// **It does not re-install the triggers, and it cannot.** Every reachable caller runs
+// after releaseTunnel has set sc.Tunnel = nil (producer/pdu_session.go), and a session
+// with no tunnel has no serving UPFs, so sessionUPFs would return nothing and triggerCC
+// would return before planning anything.
 //
 // Snapshotting the UPF list before releaseTunnel and re-triggering afterwards is not
 // the fix. It would install a trigger keyed to a PFCP session that has been deleted,
@@ -1390,11 +1386,11 @@ func (s *subsystem) triggerCC(sc *smfctx.SMContext) {
 	// This runs on HandlePfcpSessionEstablishmentResponse's path with sc.SMLock held,
 	// for the very subscriber being intercepted. ReportTaskIssue is a synchronous mTLS
 	// POST bounded only by its own 10s timeout, and — unlike an NE-level report — it is
-	// deliberately *not* throttled, because each task's failure is its own fact. So
-	// every affected warrant used to cost the establishment a full timeout while an
-	// ADMF was unreachable, under the session's own lock: a tasked subscriber's session
-	// setup measurably slower than an untasked one's, which is the target-observable
-	// timing difference this element must never produce.
+	// deliberately *not* throttled, because each task's failure is its own fact. Sent
+	// in line, every affected warrant would cost the establishment a full timeout while
+	// an ADMF was unreachable, under the session's own lock: a tasked subscriber's
+	// session setup measurably slower than an untasked one's, which is the
+	// target-observable timing difference this element must never produce.
 	go func() {
 		// A UPF we have no triggering endpoint for is carrying a tasked session's
 		// traffic and cannot be told whose warrant it serves. The interception is
@@ -1598,8 +1594,8 @@ func (s *subsystem) untriggerCC(sc *smfctx.SMContext) {
 // deactivate withdraws pending triggers at the UPF each was installed at, and
 // keeps trying until every one of them is acknowledged.
 //
-// Its two callers arrive with opposite premises, and this function used to hold
-// only the first one's. untriggerCC releases a session that is *gone*: the
+// Its two callers arrive with opposite premises, and it holds the second's, which
+// is the stricter. untriggerCC releases a session that is *gone*: the
 // trigger's detection criterion is that session's SEID, so it can no longer match
 // a packet and a POI that keeps the trigger produces nothing from it.
 // untriggerWarrant withdraws *authority* from sessions that remain: the criterion
@@ -1852,7 +1848,7 @@ type plannedTrigger struct {
 // provisioning function left, and one that named only X2 destinations is an assertion
 // this element cannot honour by substituting an endpoint of its own. On an element
 // serving several agencies the substitution sends a warrant's content to whichever
-// address local configuration happens to name. x1 now refuses that task with 3040 before
+// address local configuration happens to name. x1 refuses that task with 3040 before
 // it is stored, so the branch below is a backstop, kept for the reason x2Destinations
 // keeps its own.
 //
@@ -2167,7 +2163,7 @@ func (r *triggerRegistry) canRuleOut(session upfSession) bool {
 // right answer — keeping a restarted POI alive on the strength of tasking that no longer
 // exists is what disables its own fail-safe.
 //
-// **What this does not do is restore the subscriber's sessions.** That is upstream's
+// **What this does not do is restore the subscriber's sessions.** That is the SMF's session
 // restoration, which GateRestoration starts for a detected restart only once this has run.
 // What is in scope is that the interception bookkeeping is not the reason re-tasking cannot
 // happen: after this, an establishment at the restarted POI — a restored one included, since
@@ -2442,14 +2438,14 @@ func (s *subsystem) retriggerWarrant(next types.InterceptTask) {
 // It is what bounds the modification path, and it is bounded correctly rather than
 // merely narrowed: `keep` has exactly one consumer, takeForWarrantExcept, which tests
 // it while iterating this warrant's installed triggers. A session no trigger exists for
-// could therefore never be consulted, so computing an answer for it was work whose
-// result was unobservable.
+// could never be consulted, so computing an answer for it would be work whose result is
+// unobservable.
 //
-// What it replaces walked every live session and took every session's lock, per
-// modification — on the X1 request goroutine, so a provisioning function's answer took
-// time proportional to the element's subscriber population. That is the question having
-// been asked of the wrong structure: which of the triggers this element holds a modified
-// task still covers is a fact about the registry, and the registry knows it.
+// The alternative, walking every live session and taking every session's lock per
+// modification, would run on the X1 request goroutine, so a provisioning function's answer
+// would take time proportional to the element's subscriber population. Which of the triggers
+// this element holds a modified task still covers is a fact about the registry, and the
+// registry knows it.
 //
 // A session served by several UPFs holds a trigger per UPF and appears once here.
 func (r *triggerRegistry) sessionsWithTriggers(warrant types.XID) []string {

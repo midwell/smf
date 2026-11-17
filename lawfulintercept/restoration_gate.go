@@ -30,8 +30,8 @@ const (
 	restartUndecidable
 )
 
-// RestartHooks are upstream's restoration and the two things the gate needs beside it, supplied
-// by the service wiring because this package may not import the producer.
+// RestartHooks are the SMF's session restoration and the two things the gate needs beside it,
+// supplied by the service wiring because this package may not import the producer.
 type RestartHooks struct {
 	// Restore re-installs the sessions anchored on a restarted node. It starts its own work.
 	Restore func(smfctx.NodeID, time.Time)
@@ -51,12 +51,13 @@ type RestartHooks struct {
 // GateRestoration wraps the SMF's restart hook so that the record of what a restarted point of
 // interception held is settled before any of its sessions is re-installed.
 //
-// The two used to be neighbouring statements at each place a restart is detected: the discard,
-// then upstream's restoration. That order is the whole of what stops a restored session covered
-// by a content task from forwarding at a restarted point of interception while the stale claims
-// still say it is tasked — `plan` then finds the triple claimed, installs nothing, and this
-// element reports the interception as running. Wrapping the hook makes the order a property of
-// the only way restoration can be reached, so a new detection path cannot leave the discard out.
+// The order — the discard, then the restoration — is the whole of what stops a restored session
+// covered by a content task from forwarding at a restarted point of interception while the stale
+// claims still say it is tasked: `plan` would find the triple claimed, install nothing, and this
+// element would report the interception as running. As neighbouring statements at each place a
+// restart is detected, the order would be a matter of each call site. Wrapping the hook makes it
+// a property of the only way restoration can be reached, so a new detection path cannot leave
+// the discard out.
 //
 // A node that is not a point of interception, and an element whose interception is not running,
 // restore exactly as without this. A node that cannot be matched or ruled out is not restored

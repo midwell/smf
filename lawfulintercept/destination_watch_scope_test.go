@@ -13,8 +13,8 @@ import (
 // TestTheWatcherDoesNotWatchMDF2ForAContentOnlyTask: a task ordering only content is
 // triggered at the UPF and delivers no xIRI from this element, so the configured MDF2 is not
 // its destination. Watched for it, an MDF2 whose last delivery failed — under an IRI warrant
-// since withdrawn — was reported unreachable for as long as the content task lived, while the
-// status answer, which asks only about tasks wanting xIRI, said nothing was in use.
+// since withdrawn — would be reported unreachable for as long as the content task lived, while
+// the status answer, which asks only about tasks wanting xIRI, said nothing was in use.
 func TestTheWatcherDoesNotWatchMDF2ForAContentOnlyTask(t *testing.T) {
 	st := store.New()
 	sub := &subsystem{store: st, mdf2: testDestinationAddr}

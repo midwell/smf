@@ -15,7 +15,7 @@ import (
 // there. What this element has to get right is *supplying* it: without the option wired into
 // newX1Server, the X1 endpoint answers activeAndWorking for an endpoint this same element is
 // reporting unreachable over ReportDestinationIssue — a remedy that exists in the library and
-// not in the element, which is the class of miss this whole change is about.
+// not in the element.
 //
 // So it goes through newX1Server, the constructor Init uses, for the reason the bulk-operation
 // test gives: a second copy of the wiring is exactly where a supplied answer stops being

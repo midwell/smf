@@ -33,9 +33,9 @@ func modRsp(seid uint64, seq uint32) *udp.Message {
 	}
 }
 
-// The nil guard carried from omec-project/smf#643. Upstream places it immediately
-// after the context lookup; here it must sit after the interception block, so the
-// two tests below pin both halves of that placement.
+// The nil guard from omec-project/smf#643 sits after the interception block rather
+// than immediately after the context lookup, so the two tests below pin both halves
+// of that placement.
 
 func TestLIModificationResponseNoSMContextIsDiscarded(t *testing.T) {
 	nilCtxTestConfig()
@@ -49,11 +49,10 @@ func TestLIModificationResponseNoSMContextIsDiscarded(t *testing.T) {
 	handler.HandlePfcpSessionModificationResponse(modRsp(0xDEADBEEF, 4242))
 }
 
-// The reason the guard cannot go where upstream puts it. A modification this
-// element sent for interception is answered on the sequence number alone, and it
-// must still be answered when the session it referred to has since been released.
-// Guarding at the lookup would discard it and reinstate the defect the
-// interception block exists to fix.
+// The reason the guard cannot sit at the lookup. A modification this element sent
+// for interception is answered on the sequence number alone, and it must still be
+// answered when the session it referred to has since been released. Guarding at the
+// lookup would discard the answer, and a refused activation would never be retried.
 func TestLIAnswerSurvivesAReleasedSession(t *testing.T) {
 	nilCtxTestConfig()
 

@@ -823,9 +823,8 @@ func HandlePDUSessionSMContextRelease(eventData any) error {
 		// nilled smContext.Tunnel, so this session has no serving UPFs to task, and a
 		// trigger keyed to a PFCP session that has been deleted would match no packet
 		// while this element believed interception was running. Restoring the session's
-		// user-plane state is the pre-existing upstream `// TODO: Session cleanup
-		// required` (pfcp/handler/handler.go), which is larger than this and held out.
-		// See lawfulintercept.RestoreInterception — the absence is deliberate.
+		// user-plane state is a larger problem than interception, and no path here does
+		// it. See lawfulintercept.RestoreInterception — the absence is deliberate.
 		restoreInterception(smContext)
 		// And the unsuccessful-procedure record the other two failure branches already
 		// emit. A timeout and a stated refusal are both the procedure not completing,
