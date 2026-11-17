@@ -73,7 +73,7 @@ type Configuration struct {
 	EnableUpfAdapter         bool              `yaml:"enableUPFAdapter,omitempty"`
 	ULCL                     bool              `yaml:"ulcl,omitempty"`
 	PCSCFInfo                PCSCFInfo         `yaml:"pcscfInfos,omitempty"`
-	Li                       *Li               `yaml:"li,omitempty"`
+	Li                       *Li               `yaml:"-"` // decoded on its own: see strictLiBlock
 	T3591                    *TimerValue       `yaml:"t3591,omitempty"`
 }
 

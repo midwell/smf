@@ -101,6 +101,43 @@ func TestStrictLiBlockDoesNotFailTheConfigurationLoad(t *testing.T) {
 			"this element is LI-provisioned. Record it and let the LI subsystem refuse "+
 			"interception on it, where the ADMF can be told.", file)
 	}
+
+	// The same outage, one decode earlier. If the lenient decode of the whole file reads the
+	// `li` block too, a value of the wrong type inside it (`keepaliveDisabled: [true]`) fails
+	// nfconfig.LoadYAML before strictLiBlock ever runs, and InitConfigFactory returns it.
+	const configFile = "config.go"
+	parsedConfig, err := parser.ParseFile(fset, configFile, nil, 0)
+	if err != nil {
+		t.Fatalf("parsing %s: %v", configFile, err)
+	}
+
+	var tag string
+	ast.Inspect(parsedConfig, func(n ast.Node) bool {
+		spec, isSpec := n.(*ast.TypeSpec)
+		if !isSpec || spec.Name.Name != "Configuration" {
+			return true
+		}
+		fields, isStruct := spec.Type.(*ast.StructType)
+		if !isStruct {
+			return false
+		}
+		for _, field := range fields.Fields.List {
+			for _, name := range field.Names {
+				if name.Name == "Li" && field.Tag != nil {
+					tag = field.Tag.Value
+				}
+			}
+		}
+
+		return false
+	})
+
+	if tag != "`yaml:\"-\"`" {
+		t.Errorf("%s: Configuration.Li is tagged %s, want `yaml:\"-\"`. The lenient decode of the "+
+			"whole configuration must not read the li block: a type error inside it would fail "+
+			"the configuration load, which stops the network function. strictLiBlock is the "+
+			"block's only decode.", configFile, tag)
+	}
 }
 
 // TestTheStrictLiDecodeIsStillStrict guards the other direction. The fix above is a narrow one —
@@ -117,7 +154,7 @@ configuration:
     keepaliveTimeut: 30s
 `
 
-	if err := strictLiBlock([]byte(body)); err == nil {
+	if _, err := strictLiBlock([]byte(body)); err == nil {
 		t.Error("a misspelled LI key was accepted by the strict decode; the containment fix is " +
 			"about who acts on the refusal, not about whether there is one")
 	}

@@ -32,6 +32,7 @@ var (
 // then it closes the existing client start a new client.
 func InitConfigFactory(f string) error {
 	SmfConfig = Config{}
+	liBlockErr = nil
 
 	if err := nfconfig.LoadYAML(f, &SmfConfig); err != nil {
 		return err
@@ -59,7 +60,7 @@ func InitConfigFactory(f string) error {
 	if err != nil {
 		return err
 	}
-	liBlockErr = strictLiBlock(content)
+	SmfConfig.Configuration.Li, liBlockErr = strictLiBlock(content)
 
 	if SmfConfig.Configuration.KafkaInfo.EnableKafka == nil {
 		enableKafka := true

@@ -21,8 +21,10 @@ var liBlockErr error
 // LI configuration keys, so it belongs on the X1 fault channel and nowhere else.
 func LiBlockError() error { return liBlockErr }
 
-// strictLiBlock re-decodes the `li` block on its own, refusing a key this element does not
-// model.
+// strictLiBlock decodes the `li` block on its own, refusing a key this element does not model or
+// a value it cannot read. It is the only decode of the block: Configuration.Li is excluded from
+// the lenient decode of the whole file, so that a mistake inside the block reaches the LI
+// subsystem as a refusal instead of failing the configuration load.
 //
 // **A misspelled LI key is silently dropped, and the defaults it lands on are the dangerous
 // ones.** A typo'd `keepaliveRetainTasking` or `keepaliveTimeout` leaves the X1 keepalive
@@ -40,7 +42,12 @@ func LiBlockError() error { return liBlockErr }
 // The block is isolated first and decoded strictly second, because strictness lives on the decode
 // and a decode covers everything it is given. The lenient first pass models nothing but the path
 // to the block, so no key outside it is visible to be refused.
-func strictLiBlock(content []byte) error {
+//
+// The returned *Li is nil only when the configuration has no `li` key or a null one. Whenever the
+// key is present it is non-nil, refused or not: the LI subsystem starts on a non-nil block, and it
+// is the LI subsystem that declines to intercept on the error and reports it to the ADMF. A nil
+// block on a refusal would turn interception off with nothing reported.
+func strictLiBlock(content []byte) (*Li, error) {
 	// Only the path to the block. This struct must not grow: modelling anything else here would
 	// make it a second, diverging definition of the configuration.
 	var outer struct {
@@ -51,30 +58,33 @@ func strictLiBlock(content []byte) error {
 	if err := yaml.Unmarshal(content, &outer); err != nil {
 		// Anything that makes the file undecodable is the real decode's to report, with its own
 		// message. This check has nothing to add about it.
-		return nil
+		return nil, nil
 	}
 
 	block := &outer.Configuration.Li
-	if block.Kind == 0 {
+	if block.Kind == 0 || (block.Kind == yaml.ScalarNode && block.ShortTag() == "!!null") {
 		// No `li` block at all: interception is off, and there is nothing to be strict about.
-		return nil
+		return nil, nil
 	}
+
+	li := &Li{}
 
 	// Round-tripped so the strict pass sees the block and only the block. One small mapping, once,
 	// at startup.
 	raw, err := yaml.Marshal(block)
 	if err != nil {
-		return nil
+		return li, fmt.Errorf("configuration.li: %w", err)
 	}
 
-	var li Li
-	if err := yaml.Load(raw, &li, yaml.WithKnownFields()); err != nil {
-		return fmt.Errorf("configuration.li: %w — a key this element does not recognise is a "+
-			"setting that never reaches it, and the defaults it leaves in place are the unsafe ones: "+
-			"an unread keepalive setting leaves the X1 keepalive procedure on terms the operator did not "+
-			"choose, and an unread admfUrl leaves "+
+	// A decode error leaves whatever was decoded before it in li; the error is what the LI
+	// subsystem acts on, so a partial block is never used to intercept.
+	if err := yaml.Load(raw, li, yaml.WithKnownFields()); err != nil {
+		return li, fmt.Errorf("configuration.li: %w — a key this element does not recognise, or a "+
+			"value it cannot read, is a setting that never reaches it, and the defaults it leaves in "+
+			"place are the unsafe ones: an unread keepalive setting leaves the X1 keepalive procedure "+
+			"on terms the operator did not choose, and an unread admfUrl leaves "+
 			"this element with no channel to report that on", err)
 	}
 
-	return nil
+	return li, nil
 }
