@@ -814,9 +814,15 @@ func HandlePfcpSessionModificationResponse(msg *udp.Message) {
 	// that had declined it, with nothing left to re-send (the send itself cleared the
 	// RULE_UPDATE marker) and nothing reported. A refused withdrawal would leave
 	// duplication running while the element believed it was off.
-	if req, ok := lisequence.Take(rsp.Sequence()); ok {
-		cause, answered := liResponseCause(rsp)
-		LIModificationAnswered(req, cause, answered)
+	//
+	// **Only the first answer is read.** A UPF answering both the request and its
+	// retransmission sends two; the second is still LI, so it is kept out of the session's
+	// procedure as well, and dropped.
+	if req, ok, first := lisequence.Take(rsp.Sequence()); ok {
+		if first {
+			cause, answered := liResponseCause(rsp)
+			LIModificationAnswered(req, cause, answered)
+		}
 
 		return
 	}

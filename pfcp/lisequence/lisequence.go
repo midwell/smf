@@ -40,14 +40,23 @@ type Request struct {
 	Duplicating bool
 }
 
-// pending records the LI modifications awaiting an answer.
+// pending records the LI modifications awaiting an answer, and for a while the ones that have
+// had it.
 //
-// Bounded on purpose. Entries are normally consumed by the response they describe, but a
+// Bounded on purpose. Entries are normally answered by the response they describe, but a
 // response that never arrives — a lost datagram, a UPF that restarts — would otherwise
 // leave one behind forever, and an unbounded map that grows with traffic while nothing
 // prunes it is a fault in its own right. Expired hands the interception subsystem the
 // records to sweep; Mark drops anything far past the window as the backstop for a
 // deployment where nothing sweeps.
+//
+// **An answered entry stays as a tombstone for tombstoneAge.** A UPF can answer the same
+// modification twice — once for the request and once for the SMF's retransmission of it —
+// and the native UDP reader can hand the second answer to the handler before the
+// transaction is gone. Without the tombstone that second answer is no longer recognised as
+// LI, falls through to the session's own procedure handling, and can clear the pending UPF a
+// concurrent subscriber modification is waiting on. The tombstone keeps it recognised, and
+// Take reports it as not the first answer, so it is dropped.
 var (
 	pending = map[uint32]entry{}
 	lock    sync.Mutex
@@ -59,9 +68,35 @@ var (
 	now = time.Now
 )
 
+// tombstoneAge is how long an answered or expired entry is kept to recognise a repeated or
+// late answer: well past the SMF's retransmission schedule for one request.
+func tombstoneAge() time.Duration { return 2 * maxAge }
+
 type entry struct {
 	req  Request
 	sent time.Time
+	// closed is when the entry was answered or expired; zero while it awaits an answer.
+	closed time.Time
+}
+
+func (e entry) isTombstone() bool { return !e.closed.IsZero() }
+
+// prune drops tombstones past tombstoneAge, and entries still awaiting an answer far past
+// the window. The caller holds lock.
+func prune(at time.Time) {
+	tombstoneCutoff := at.Add(-tombstoneAge())
+	// The backstop: entries far past the window belong to a deployment where nothing is
+	// sweeping, and they may not accumulate.
+	cutoff := at.Add(-4 * maxAge)
+	for seq, e := range pending {
+		if e.isTombstone() {
+			if e.closed.Before(tombstoneCutoff) {
+				delete(pending, seq)
+			}
+		} else if e.sent.Before(cutoff) {
+			delete(pending, seq)
+		}
+	}
 }
 
 // Mark records that seqNum belongs to an LI-initiated modification, and what it asked for.
@@ -69,35 +104,36 @@ func Mark(seqNum uint32, req Request) {
 	lock.Lock()
 	defer lock.Unlock()
 
-	// The backstop: entries far past the window belong to a deployment where nothing is
-	// sweeping, and they may not accumulate.
-	cutoff := now().Add(-4 * maxAge)
-	for seq, e := range pending {
-		if e.sent.Before(cutoff) {
-			delete(pending, seq)
-		}
-	}
+	prune(now())
 	pending[seqNum] = entry{req: req, sent: now()}
 }
 
-// Take reports whether seqNum was an LI-initiated modification and what it asked for,
-// consuming the record. A response arrives once, so holding the entry past it would only
-// keep a sequence number that the counter will eventually reuse.
-func Take(seqNum uint32) (Request, bool) {
+// Take reports whether seqNum was an LI-initiated modification, what it asked for, and
+// whether this is the first answer to it.
+//
+// ok is true for any answer to an LI modification, first or not, so the caller keeps it out
+// of the session's own procedure handling. first is true once: the caller acts on that
+// answer and drops the rest. The record stays as a tombstone for tombstoneAge to recognise
+// a repeated answer.
+func Take(seqNum uint32) (req Request, ok, first bool) {
 	lock.Lock()
 	defer lock.Unlock()
 
 	e, ok := pending[seqNum]
 	if !ok {
-		return Request{}, false
+		return Request{}, false, false
 	}
-	delete(pending, seqNum)
+	if e.isTombstone() {
+		return e.req, true, false
+	}
+	e.closed = now()
+	pending[seqNum] = e
 
-	return e.req, true
+	return e.req, true, true
 }
 
-// Expired removes and returns the modifications no answer has arrived for within the
-// window.
+// Expired returns the modifications no answer has arrived for within the window, leaving a
+// tombstone for each so a late answer is still recognised as LI and dropped.
 //
 // An unanswered modification is not a lesser case than a refused one. A refusal says the
 // datapath declined; silence says the element does not know, and the element must treat
@@ -108,23 +144,34 @@ func Expired() []Request {
 	lock.Lock()
 	defer lock.Unlock()
 
-	cutoff := now().Add(-maxAge)
+	at := now()
+	prune(at)
+	cutoff := at.Add(-maxAge)
 
 	var out []Request
 	for seq, e := range pending {
-		if e.sent.Before(cutoff) {
+		if !e.isTombstone() && e.sent.Before(cutoff) {
 			out = append(out, e.req)
-			delete(pending, seq)
+			e.closed = at
+			pending[seq] = e
 		}
 	}
 
 	return out
 }
 
-// Outstanding is how many LI modifications await an answer. For tests.
+// Outstanding is how many LI modifications await an answer, tombstones not counted. For
+// tests.
 func Outstanding() int {
 	lock.Lock()
 	defer lock.Unlock()
 
-	return len(pending)
+	n := 0
+	for _, e := range pending {
+		if !e.isTombstone() {
+			n++
+		}
+	}
+
+	return n
 }

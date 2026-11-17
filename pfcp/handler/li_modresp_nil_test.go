@@ -82,7 +82,7 @@ func TestLIAnswerSurvivesAReleasedSession(t *testing.T) {
 	if !gotAnswered || gotCause != ie.CauseRequestAccepted {
 		t.Errorf("answered=%v cause=%d, want answered=true cause=%d", gotAnswered, gotCause, ie.CauseRequestAccepted)
 	}
-	if _, still := lisequence.Take(seq); still {
-		t.Error("the sequence was not consumed, so the interception block did not run")
+	if _, _, first := lisequence.Take(seq); first {
+		t.Error("the sequence was not answered, so the interception block did not run")
 	}
 }

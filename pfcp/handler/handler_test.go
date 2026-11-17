@@ -364,6 +364,58 @@ func TestLIModificationResponseDoesNotCompleteTheSessionsOwnProcedure(t *testing
 	}
 }
 
+// TestARepeatedLIModificationResponseIsStillLI covers a UPF that answers both an LI
+// modification and the SMF's retransmission of it. The native UDP reader can hand the second
+// answer to the handler before the transaction is gone; it must still be recognised as LI, kept
+// out of the subscriber's concurrent procedure, and not read a second time.
+func TestARepeatedLIModificationResponseIsStillLI(t *testing.T) {
+	if factory.SmfConfig.Configuration == nil {
+		off := false
+		factory.SmfConfig.Configuration = &factory.Configuration{
+			KafkaInfo: factory.KafkaInfo{EnableKafka: &off},
+		}
+		t.Cleanup(func() { factory.SmfConfig.Configuration = nil })
+	}
+
+	nodeID := context.NewNodeID("1.1.1.1")
+	upfIP := nodeID.ResolveNodeIdToIp().String()
+	smContext := context.NewSMContext("imsi-123456789012397", 13)
+	t.Cleanup(func() { context.RemoveSMContext(smContext.Ref) })
+
+	datapath := &context.DataPath{FirstDPNode: &context.DataPathNode{UPF: &context.UPF{NodeID: *nodeID}}}
+	smContext.AllocateLocalSEIDForDataPath(datapath)
+	seid := smContext.PFCPContext[upfIP].LocalSEID
+
+	smContext.ChangeState(context.SmStatePfcpModify)
+	smContext.PendingUPF = context.PendingUPF{upfIP: true}
+	// Buffered, so a wrongly completed procedure is observed rather than blocking the handler.
+	smContext.SBIPFCPCommunicationChan = make(chan context.PFCPSessionResponseStatus, 1)
+
+	answers := 0
+	orig := LIModificationAnswered
+	LIModificationAnswered = func(lisequence.Request, uint8, bool) { answers++ }
+	t.Cleanup(func() { LIModificationAnswered = orig })
+
+	const liSeq = uint32(4244)
+	lisequence.Mark(liSeq, lisequence.Request{SEID: seid, NodeID: "1.1.1.1", Duplicating: true})
+
+	HandlePfcpSessionModificationResponse(modificationResponse(liSeq, seid))
+	HandlePfcpSessionModificationResponse(modificationResponse(liSeq, seid))
+
+	if answers != 1 {
+		t.Errorf("the LI answer was read %d times, want once", answers)
+	}
+	if smContext.PendingUPF.IsEmpty() {
+		t.Error("the repeated LI answer cleared the UPF the subscriber's own modification " +
+			"was waiting on")
+	}
+	select {
+	case got := <-smContext.SBIPFCPCommunicationChan:
+		t.Errorf("the repeated LI answer completed the session's own procedure with %v", got)
+	default:
+	}
+}
+
 // TestOrdinaryModificationResponseStillCompletes is the other side of the guard:
 // the early return must recognise only LI-originated sequences, or every ordinary
 // modification stops being answered and every session update hangs.

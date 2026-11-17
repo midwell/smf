@@ -508,8 +508,8 @@ func HandlePfcpSessionModificationResponse(msg *udp.Message) error {
 	// state — cannot tell the two apart, which is why the sequence number is what answers
 	// it.
 	//
-	// Note that Take *consumes* the record, so an LI-originated sequence number does not
-	// linger until the age-out.
+	// Take closes the record; it stays as a tombstone for a bounded time, so a repeated
+	// answer is still recognised as LI.
 	//
 	// **And the answer is read.** Keeping it out of the subscriber's procedure is one
 	// obligation and reading it is a second: the Cause says whether the datapath applied
@@ -522,7 +522,13 @@ func HandlePfcpSessionModificationResponse(msg *udp.Message) error {
 	// Ahead of the Cause checks below, as the native handler's is: an answer with no Cause
 	// this element can read is treated as not applied, and so retried, rather than
 	// discarded.
-	if req, ok := lisequence.Take(pfcpRsp.Sequence()); ok {
+	//
+	// Only the first answer to a sequence number is read, as in the native handler; a repeat
+	// is still LI, and dropped.
+	if req, ok, first := lisequence.Take(pfcpRsp.Sequence()); ok {
+		if !first {
+			return nil
+		}
 		var (
 			liCause  uint8
 			answered bool
