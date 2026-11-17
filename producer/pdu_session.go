@@ -119,9 +119,9 @@ func formContextCreateErrRsp(httpStatus int, problemBody models.ExtProblemDetail
 // to the LI subsystem, which emits an SMFUnsuccessfulProcedure xIRI if the
 // subscriber is under an active warrant.
 //
-// It exists so the two cannot come apart: every GeneratePDUSessionEstablishmentReject
-// call in this package goes through it, and TestEveryEstablishmentRejectIsReported
-// fails on a call anywhere else. The LI call is a no-op for an untasked subscriber and cannot fail
+// It exists so the two cannot come apart: every non-test GeneratePDUSessionEstablishmentReject
+// call in this package goes through it, and TestEveryEstablishmentRejectIsReported fails on
+// one inside a function body of a non-test file. The LI call is a no-op for an untasked subscriber and cannot fail
 // the rejection — see lawfulintercept.reportUnsuccessful.
 //
 // The cause passed to LI is read from the same errors table the reject is built

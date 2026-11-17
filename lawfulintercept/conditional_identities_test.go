@@ -203,12 +203,12 @@ func TestAnAllZeroAMFIdentityIsReported(t *testing.T) {
 // The retention step, which the tests above do not reach.
 //
 // They build an SMContext directly, so they prove the builders map what the context
-// holds and nothing about whether the context ever holds it. Without these three lines
-// of SetCreateData the builders could be correct while every real record carried none
+// holds and nothing about whether the context ever holds it. Without these three
+// assignments in SetCreateData the builders could be correct while every real record carried none
 // of them, and a PEI warrant could match nothing — a field populated in a builder and
 // never supplied by the peer is invisible from inside the builder's own test.
 //
-// Reverting any of the three lines in SetCreateData fails here.
+// Reverting any of the three assignments in SetCreateData fails here.
 func TestTheN11RequestSuppliesTheAMFIdentityAndAuthenticationStatus(t *testing.T) {
 	guami := models.Guami{AmfId: "c80043", PlmnId: models.PlmnIdNid{Mcc: "262", Mnc: "01"}}
 	unauthenticated := true

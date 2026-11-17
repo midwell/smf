@@ -519,7 +519,7 @@ func HandlePfcpSessionModificationResponse(msg *udp.Message) error {
 	// nothing reported. A refused withdrawal would leave duplication running while the
 	// element believed it was off.
 	//
-	// Ahead of the Cause checks below, as in the native handler: an answer with no Cause
+	// Ahead of the Cause checks below, as the native handler's is: an answer with no Cause
 	// this element can read is treated as not applied, and so retried, rather than
 	// discarded.
 	if req, ok := lisequence.Take(pfcpRsp.Sequence()); ok {
