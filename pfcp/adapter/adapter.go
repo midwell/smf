@@ -320,7 +320,10 @@ func HandlePfcpSessionEstablishmentResponse(msg *udp.Message) error {
 	smContext.SMLock.Lock()
 	defer smContext.SMLock.Unlock()
 	logger.PfcpLog.Infof("in HandlePfcpSessionEstablishmentResponse SEID %v", SEID)
-	logger.PfcpLog.Infof("in HandlePfcpSessionEstablishmentResponse smContext %+v", smContext)
+	// The session's reference, not the context: the context's text carries the subscriber's
+	// identities and every FAR's apply action, including the duplication that marks an
+	// intercepted session.
+	logger.PfcpLog.Infof("in HandlePfcpSessionEstablishmentResponse smContext Ref %s", smContext.Ref)
 
 	// Get NodeId from Seq:NodeId Map
 	seq := rsp.Sequence()
@@ -566,7 +569,6 @@ func HandlePfcpSessionModificationResponse(msg *udp.Message) error {
 	}
 
 	smContext := context.GetSMContextBySEID(SEID)
-	logger.PfcpLog.Infof("in HandlePfcpSessionModificationResponse smContext found by SEID %v", smContext)
 
 	// After the interception block, as in the native handler: that block answers a
 	// modification this element sent itself, keyed on the sequence number alone, and it must
@@ -574,6 +576,8 @@ func HandlePfcpSessionModificationResponse(msg *udp.Message) error {
 	if smContext == nil {
 		return fmt.Errorf("PFCP Session Modification Response found SM context nil for SEID %d, response discarded", SEID)
 	}
+	// The session's reference, not the context: see HandlePfcpSessionEstablishmentResponse.
+	logger.PfcpLog.Infof("in HandlePfcpSessionModificationResponse smContext Ref %s found by SEID %d", smContext.Ref, SEID)
 
 	if causeValue == ie.CauseRequestAccepted {
 		smContext.SubPduSessLog.Infoln("PFCP Modification Response Accept")
