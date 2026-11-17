@@ -897,10 +897,21 @@ func ApplyCCTrigger(sc *smfctx.SMContext) {
 // would be a drop, and the interception would silently never start: the one
 // direction this plane must not fail in.
 //
+// It also delivers a duplication change still owed to the UPF that just answered.
+// On a session served by more than one UPF, the X1 scan reaches it once the anchor
+// has answered and may set duplication on the FARs of a UPF still establishing.
+// ModifySessionForLI skips that UPF, which has no remote SEID yet, so its FARs are
+// left RULE_UPDATE with the SMF-side Dupl already as the tasking implies, and
+// applyCC finds nothing to change when it answers. A forwarding FAR still
+// RULE_UPDATE is therefore a modification due as well. ModifySessionForLI sends
+// every RULE_UPDATE FAR, so one left by the session's own pending modification
+// rides along, as it does in every LI send.
+//
 // In the ordinary case nothing has changed since ApplyCCTrigger ran, applyCC
-// returns false, and no modification is sent. Run here rather than anywhere
-// earlier because this is the first point ordered after the session exists, and
-// it is already under the lock the handler holds for its whole body.
+// returns false, no FAR is RULE_UPDATE, and no modification is sent. Run here
+// rather than anywhere earlier because this is the first point ordered after the
+// session exists, and it is already under the lock the handler holds for its
+// whole body.
 //
 // Caller holds sc.SMLock.
 func ApplyCCAfterEstablishment(sc *smfctx.SMContext) {
@@ -908,9 +919,25 @@ func ApplyCCAfterEstablishment(sc *smfctx.SMContext) {
 	if sub == nil || sc == nil {
 		return
 	}
-	if sub.applyCC(sc) {
+	if sub.applyCC(sc) || farUpdateOwed(sc) {
 		sub.modifySession(sc)
 	}
+}
+
+// farUpdateOwed reports whether any of sc's forwarding FARs is still marked
+// RULE_UPDATE, that is, changed and not yet sent. Caller holds sc.SMLock.
+func farUpdateOwed(sc *smfctx.SMContext) bool {
+	if sc.Tunnel == nil {
+		return false
+	}
+	owed := false
+	forEachForwardingFAR(sc, func(far *smfctx.FAR) {
+		if far.State == smfctx.RULE_UPDATE {
+			owed = true
+		}
+	})
+
+	return owed
 }
 
 // forEachForwardingFAR invokes fn for every forwarding FAR across all of sc's
