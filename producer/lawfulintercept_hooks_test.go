@@ -6,8 +6,11 @@ package producer
 import (
 	"testing"
 
+	"github.com/omec-project/openapi/v2/models"
 	smf_context "github.com/omec-project/smf/context"
 	"github.com/omec-project/smf/factory"
+	"github.com/omec-project/smf/msgtypes/svcmsgtypes"
+	"github.com/omec-project/smf/transaction"
 	"github.com/omec-project/smf/util"
 )
 
@@ -42,10 +45,8 @@ func teardownSession(t *testing.T) *smf_context.SMContext {
 	return sc
 }
 
-// TestContextReplacementReportsAndUntasks is the assertion that was impossible
-// before the seam, and the one whose absence let this path ship without the
-// hooks: a session torn down because a newer context replaced it must still emit
-// its release and give up its triggers.
+// TestContextReplacementReportsAndUntasks: a session torn down because a newer
+// context replaced it must still emit its release and give up its triggers.
 //
 // The hooks are silent no-ops unless LI is configured, so without a seam a path
 // that never calls them is indistinguishable from one that does.
@@ -106,6 +107,34 @@ func TestARestorationReleaseReportsAndUntasks(t *testing.T) {
 		t.Errorf("release reported %d times and triggers withdrawn %d times, want 1 and 1 — the "+
 			"agency would never see the session end, and its triggers would outlive it",
 			calls.released, calls.untasked)
+	}
+}
+
+// TestAReleaseCompleteReportsAndUntasks covers the UE's Release Complete. After an ordinary
+// release it finds both already done; after a Release Command that answered a modification the
+// SMF could not carry out, it is the only teardown the session gets.
+func TestAReleaseCompleteReportsAndUntasks(t *testing.T) {
+	const pduSessionID = 5
+
+	calls := captureLI(t)
+	sc := teardownSession(t)
+	sc.SMContextState = smf_context.SmStateActive
+
+	request := models.UpdateSmContextRequest{}
+	request.SetJsonData(models.SmContextUpdateData{})
+	request.SetBinaryDataN1SmMessage(n1SmMessageFile(t, encodeReleaseComplete(t, pduSessionID, requestPti)))
+
+	txn := transaction.NewTransaction(request, nil, svcmsgtypes.UpdateSmContext)
+	txn.Ctxt = sc
+
+	if err := HandleUpdateN1Msg(txn, models.NewUpdateSmContext200Response(), &pfcpAction{}); err != nil {
+		t.Fatalf("HandleUpdateN1Msg: %v", err)
+	}
+
+	if calls.released != 1 || calls.untasked != 1 {
+		t.Errorf("release reported %d times and triggers withdrawn %d times, want 1 and 1 — the "+
+			"session left the pool without the agency being told it ended, and its triggers "+
+			"would outlive it", calls.released, calls.untasked)
 	}
 }
 

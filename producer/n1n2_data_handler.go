@@ -436,6 +436,14 @@ func HandleUpdateN1Msg(txn *transaction.Transaction, response *models.UpdateSmCo
 			// ChangeState(SmStateRelease). RemoveSMContextLocked, not RemoveSMContext, since
 			// HandlePDUSessionSMContextUpdate already holds smContext.SMLock and it is not
 			// reentrant.
+			//
+			// Lawful Interception IRI-POI: the session ends here, and owes the release record
+			// and the withdrawal of its triggers. An ordinary release has reported both already
+			// and this does nothing more. A Release Command that answered a modification the
+			// SMF could not carry out (makePduCtxtModifyErrRsp) reaches here with neither done. Before
+			// RemoveSMContextLocked, while the session can still be read. Silent no-op unless LI
+			// is configured.
+			reportAndUntask(smContext)
 			context.RemoveSMContextLocked(smContext)
 			smContext.SubPduSessLog.Debugln("PDUSessionSMContextUpdate, sent SMContext Status Notification successfully")
 
