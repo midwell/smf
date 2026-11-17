@@ -1064,7 +1064,12 @@ func (s *subsystem) reconcileEndpoint(nodeID string, endpoint *upfEndpoint) {
 //
 // Claims make it idempotent. plan skips a (warrant, session, POI) already claimed, so a trigger
 // that was never discarded, or that an establishment has installed again, is not installed twice.
-// At start-up no warrant is held yet, and nothing is installed.
+// At start-up no warrant is usually held yet, and nothing is installed; usually, because
+// reconciliation retries until the POI answers, and a warrant can be provisioned meanwhile.
+//
+// It walks every live session and takes each one's lock, once per reconciliation of each POI and
+// outside the scans' bound. So it returns before the walk when no task asks for CC, which is the
+// case at start-up and on an element holding no content warrant.
 //
 // Only at nodeID. A session the node's current incarnation did not acknowledge is skipped: after
 // a restart, a session that restoration has not re-established yet still carries the SEID the
@@ -1073,6 +1078,10 @@ func (s *subsystem) reconcileEndpoint(nodeID string, endpoint *upfEndpoint) {
 // session's other UPFs, whose incarnations this reconciliation says nothing about, so their
 // triggers are left to their own establishment and reconciliation.
 func (s *subsystem) retriggerAt(nodeID string) {
+	if !s.ccTaskHeld() {
+		return
+	}
+
 	smfctx.RangeSMContexts(func(sc *smfctx.SMContext) bool {
 		sc.SMLock.Lock()
 		defer sc.SMLock.Unlock()
@@ -1088,6 +1097,18 @@ func (s *subsystem) retriggerAt(nodeID string) {
 
 		return true
 	})
+}
+
+// ccTaskHeld reports whether the store holds any task asking for CC, asked as the activation
+// scan asks it of one task.
+func (s *subsystem) ccTaskHeld() bool {
+	for _, t := range s.store.Snapshot() {
+		if t.WantsProduct(types.ProductCC) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // servedByCurrentIncarnation returns the UPF configured as nodeID serving sc, when it serves sc

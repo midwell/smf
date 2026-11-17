@@ -3749,6 +3749,42 @@ func TestASessionAnEarlierIncarnationAcknowledgedIsNotRetriggered(t *testing.T) 
 	}
 }
 
+// TestReconciliationWithoutAContentWarrantDoesNotWalkTheSessions: re-triggering walks every
+// live session and takes each one's lock, once per reconciliation of each POI. With no task
+// asking for CC there is nothing it could install, so the walk is skipped; held here is a
+// session lock it would otherwise wait on.
+func TestReconciliationWithoutAContentWarrantDoesNotWalkTheSessions(t *testing.T) {
+	poi := newFakePOI(t)
+	s := triggerSubsystem(t, poi)
+
+	sc := pooledSession(t, testSUPI, 7)
+	if !s.store.Activate(types.InterceptTask{
+		XID:      testXIDSecondary,
+		Targets:  []types.TargetIdentifier{{Type: types.TargetSUPI, Value: "262019876543210"}},
+		Products: []types.ProductType{types.ProductIRI},
+		State:    types.TaskActive,
+	}) {
+		t.Fatal("failed to activate the warrant")
+	}
+
+	sc.SMLock.Lock()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.reconcileOne()
+	}()
+
+	select {
+	case <-done:
+		sc.SMLock.Unlock()
+	case <-time.After(2 * time.Second):
+		sc.SMLock.Unlock()
+		<-done
+		t.Error("reconciliation waited on a session's lock although no task asks for content, " +
+			"so it walked the session pool for triggers it could not install")
+	}
+}
+
 // TestASessionWithNoAcknowledgementIsNotRetriggered: a session restored from a document stored
 // without the recovery timestamp its node acknowledged it at carries a zero one, and against a
 // node held at no timestamp yet, zero equals zero. Neither names an incarnation, so nothing
