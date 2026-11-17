@@ -204,9 +204,6 @@ func farToCreateFAR(far *context.FAR) *ie.IE {
 	return ie.NewCreateFAR(createFARies...)
 }
 
-// duplicatingParametersIE builds the Duplicating Parameters grouped IE that
-// accompanies a DUPL FAR, telling the UPF where to copy the user-plane packets
-// (for Lawful Interception, the LI Function interface).
 // duplicatingParametersIEs builds the inner IEs shared by the Create and Update
 // Duplicating Parameters grouped IEs: the LI destination interface plus an
 // optional outer header.

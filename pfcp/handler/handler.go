@@ -201,7 +201,7 @@ func SetUpfInactive(nodeID smf_context.NodeID, msgTypeName string) {
 	// UPF reporting no established association would be discovered only by the next probe
 	// cycle. Only one of the two runs in a deployment, so a remedy present in one of them alone
 	// would depend on enableUPFAdapter.
-	POIRestarted(upf.NodeID, upf.NodeID.ResolveNodeIdToIp().String())
+	POIRestarted(upf.NodeID)
 }
 
 func HandlePfcpPfdManagementRequest(msg *udp.Message) {

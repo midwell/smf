@@ -542,7 +542,7 @@ func sendPfcpSessionModificationRequest(
 	upfPort uint16,
 	awaited bool,
 	forLI bool,
-) error {
+) (err error) {
 	seqNum := getSeqNumber()
 	upNodeIDStr := upNodeID.ResolveNodeIdToIp().String()
 	pfcpContext, ok := ctx.PFCPContext[upNodeIDStr]
@@ -555,15 +555,21 @@ func sendPfcpSessionModificationRequest(
 		// that selected these FARs is cleared by this send — and the SMF-side Dupl bit
 		// already equals what the tasking implies, so nothing re-derives it. A response
 		// handler that went back to the session to work out what had been requested
-		// would find nothing to do, which is why a refused activation was never retried.
+		// would find nothing to do, and a refused activation would never be retried.
 		//
-		// Recorded after the PFCP context lookup, so a modification that is not sent
-		// leaves no record awaiting an answer that cannot come.
+		// Recorded before the send, because with the UPF adapter the answer is handled before
+		// the send returns, and taken back if the send fails: a modification that is not sent
+		// leaves no record awaiting an answer that cannot come. Its caller reports the failure.
 		lisequence.Mark(seqNum, lisequence.Request{
 			SEID:        pfcpContext.LocalSEID,
 			NodeID:      upNodeIDStr,
 			Duplicating: anyDuplicating(farList),
 		})
+		defer func() {
+			if err != nil {
+				lisequence.Take(seqNum)
+			}
+		}()
 	}
 
 	// The builder marks every rule it is handed as applied while it builds, so a request that then

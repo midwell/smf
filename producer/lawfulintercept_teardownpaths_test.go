@@ -7,6 +7,8 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"os"
+	"strings"
 	"testing"
 )
 
@@ -113,5 +115,49 @@ func TestEveryTeardownPathReportsAndUntasks(t *testing.T) {
 					tt.fn, tt.why)
 			}
 		})
+	}
+}
+
+// TestEveryEstablishmentRejectIsReported: a PDU session establishment reject built anywhere
+// but rejectEstablishment reaches the UE without the unsuccessful-procedure record a tasked
+// subscriber's refused establishment owes the agency, and nothing else would notice.
+func TestEveryEstablishmentRejectIsReported(t *testing.T) {
+	fset := token.NewFileSet()
+
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("reading the producer package: %v", err)
+	}
+
+	for _, entry := range entries {
+		if !strings.HasSuffix(entry.Name(), ".go") || strings.HasSuffix(entry.Name(), "_test.go") {
+			continue
+		}
+
+		file, parseErr := parser.ParseFile(fset, entry.Name(), nil, 0)
+		if parseErr != nil {
+			t.Fatalf("parsing %s: %v", entry.Name(), parseErr)
+		}
+
+		for _, decl := range file.Decls {
+			fd, isFunc := decl.(*ast.FuncDecl)
+			if !isFunc || fd.Body == nil || fd.Name.Name == "rejectEstablishment" {
+				continue
+			}
+
+			ast.Inspect(fd.Body, func(n ast.Node) bool {
+				call, isCall := n.(*ast.CallExpr)
+				if !isCall {
+					return true
+				}
+				if sel, isSel := call.Fun.(*ast.SelectorExpr); isSel &&
+					sel.Sel.Name == "GeneratePDUSessionEstablishmentReject" {
+					t.Errorf("%s: %s builds an establishment reject directly; use "+
+						"rejectEstablishment, which also reports it", fset.Position(call.Pos()), fd.Name.Name)
+				}
+
+				return true
+			})
+		}
 	}
 }

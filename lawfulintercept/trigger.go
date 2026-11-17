@@ -1245,7 +1245,7 @@ func TriggerCC(sc *smfctx.SMContext) {
 // has stopped answering, so the tasking this element believes it holds there is discarded and
 // subsequent establishments and scans re-install it. Silent no-op unless LI is configured.
 //
-// **It takes the node identity and its address, not a pre-resolved string**, because the
+// **It takes the node identity, not a pre-resolved string**, because the
 // registry has to be allowed to apply its own matching rule. Trigger keys carry
 // `li.upfTriggers[].nodeId` exactly as configured — which the chart and the blueprint default
 // to `upf`, a name — while every caller here holds a `smfctx.NodeID` whose resolved form is
@@ -1255,8 +1255,8 @@ func TriggerCC(sc *smfctx.SMContext) {
 // the POI held no tasking and discarded the copies it was told to make. A test configured
 // with an IP literal cannot see this: it is the one spelling in which the two forms coincide.
 //
-// So the two values travel in the shape sessionUPFs already builds, and matchEndpoint
-// resolves them to a configured key — identity first, then the refreshed address index —
+// So the identity and its resolved address travel in the shape sessionUPFs already builds,
+// and matchEndpoint resolves them to a configured key — identity first, then the refreshed address index —
 // which is the same rule the trigger path uses. ForgetPOI stays as the key-level primitive.
 //
 // **A detected restart does not come through here.** It reaches the same discard through
@@ -1265,9 +1265,10 @@ func TriggerCC(sc *smfctx.SMContext) {
 // nothing is restored. If it comes back having restarted, its re-association reports a new
 // recovery timestamp and is gated in turn; if it comes back with the timestamp it had, nothing
 // is restored, and the discard here is what lets its next establishments re-install tasking.
-func POIRestarted(node smfctx.NodeID, addr string) {
+func POIRestarted(node smfctx.NodeID) {
 	if sub := active.Load(); sub != nil {
-		sub.discardRestarted(upfSession{node: node, addr: addr})
+		// Resolved here, not by the caller, so an element without LI does no lookup.
+		sub.discardRestarted(upfSession{node: node, addr: node.ResolveNodeIdToIp().String()})
 	}
 }
 
@@ -2408,10 +2409,9 @@ func parseTriggerKey(key string) (warrant, session, nodeID string, ok bool) {
 // was meant to leave it alone. Which is the race the ordering above exists to prevent,
 // reintroduced by the fix for a different problem.
 //
-// What made it safe to keep here is that it no longer costs a walk of the session pool:
-// the work is bounded by this warrant's own triggers (see sessionsWithTriggers), so a
-// provisioning function's answer does not scale with the element's subscriber population.
-// Deferring it would have moved that cost rather than removed it.
+// It is safe to keep here because it costs no walk of the session pool: the work is
+// bounded by this warrant's own triggers (see sessionsWithTriggers), so a provisioning
+// function's answer does not scale with the element's subscriber population.
 func (s *subsystem) retriggerWarrant(next types.InterceptTask) {
 	if s.triggers == nil {
 		return

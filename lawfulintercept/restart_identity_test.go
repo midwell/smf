@@ -73,7 +73,7 @@ func TestARestartAtANamedNodeIsRecognised(t *testing.T) {
 
 	// The UPF restarts, discovered on whichever PFCP path noticed. The node identity is what
 	// the PFCP handlers hold.
-	POIRestarted(*smfctx.NewNodeID(trigNodeA), trigNodeA)
+	POIRestarted(*smfctx.NewNodeID(trigNodeA))
 
 	// And the next establishment re-tasks it.
 	s.installFor("session-ref-1", []types.InterceptTask{warrant}, upfs, 7)
@@ -101,7 +101,7 @@ func TestARestartIsRecognisedThroughTheAddressFallbackToo(t *testing.T) {
 	s.installFor("session-ref-1", []types.InterceptTask{warrant}, upfs, 7)
 	awaitMessages(t, poi, "ActivateTaskRequest", 1)
 
-	POIRestarted(*smfctx.NewNodeID(trigNodeA), trigNodeA)
+	POIRestarted(*smfctx.NewNodeID(trigNodeA))
 
 	s.installFor("session-ref-1", []types.InterceptTask{warrant}, upfs, 7)
 	awaitMessages(t, poi, "ActivateTaskRequest", 2)
@@ -163,7 +163,7 @@ func TestARecognisedRestartIsReported(t *testing.T) {
 	s.installFor("session-ref-1", []types.InterceptTask{warrant}, upfs, 7)
 	awaitMessages(t, poi, "ActivateTaskRequest", 1)
 
-	POIRestarted(*smfctx.NewNodeID(trigNodeA), trigNodeA)
+	POIRestarted(*smfctx.NewNodeID(trigNodeA))
 
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {

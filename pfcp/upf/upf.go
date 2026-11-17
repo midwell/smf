@@ -85,7 +85,7 @@ func heartbeatUpf(upf *context.UPF) {
 		// Discarding them is the same conclusion the heartbeat mismatch and the
 		// re-association paths reach, by the route that reaches it first: a claim
 		// that cannot be true must not be treated as one.
-		lawfulintercept.POIRestarted(upf.NodeID, upf.NodeID.ResolveNodeIdToIp().String())
+		lawfulintercept.POIRestarted(upf.NodeID)
 	}
 }
 

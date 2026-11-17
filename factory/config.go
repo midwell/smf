@@ -77,8 +77,8 @@ type Configuration struct {
 	T3591                    *TimerValue       `yaml:"t3591,omitempty"`
 }
 
-// Li configures the Lawful Interception IRI-POI. It is opt-in: when absent, LI
-// is inactive and the SMF behaves exactly as before.
+// Li configures the Lawful Interception IRI-POI and CC triggering function. It is opt-in:
+// when absent, no LI component starts.
 type Li struct {
 	X1Listen string `yaml:"x1Listen"` // address for the X1 provisioning listener
 	MDF2     string `yaml:"mdf2"`     // X2 delivery destination (host:port)
@@ -152,8 +152,6 @@ type Li struct {
 	RemoveAllDestinations *bool `yaml:"removeAllDestinations,omitempty"`
 }
 
-// LiUPFTrigger is one UPF's LI_T3 triggering endpoint.
-
 // LiDestination is one pre-shared delivery destination: the identifier an ADMF's tasks
 // reference it by, and where it points. Its three fields are the ones CreateDestination
 // carries, because the entry has to resolve identically to a provisioned one.
@@ -163,6 +161,7 @@ type LiDestination struct {
 	Address      string `yaml:"address"`      // host:port
 }
 
+// LiUPFTrigger is one UPF's LI_T3 triggering endpoint.
 type LiUPFTrigger struct {
 	NodeID string `yaml:"nodeId"` // the UPF's N4 node address
 	X1URL  string `yaml:"x1Url"`  // its LI_T3 endpoint, e.g. https://upf-1:8443/X1/NE

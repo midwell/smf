@@ -703,7 +703,6 @@ func (smContext *SMContext) ChangeState(nextState SMContextState) {
 	smContext.PublishSmCtxtInfo()
 }
 
-// *** add unit test ***//
 // RangeSMContexts calls fn for each live SM context (fn returns false to stop).
 // The Lawful Interception POI uses it to scan already-established sessions when a
 // warrant is activated over X1.
@@ -717,6 +716,7 @@ func RangeSMContexts(fn func(*SMContext) bool) {
 	})
 }
 
+// *** add unit test ***//
 func GetSMContext(ref string) (smContext *SMContext) {
 	if value, ok := smContextPool.Load(ref); ok {
 		smContext = value.(*SMContext)

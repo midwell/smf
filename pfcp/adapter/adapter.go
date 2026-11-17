@@ -33,7 +33,7 @@ func init() {
 // pfcp/message, so the direct call is an import cycle. The same shape the producer's
 // teardown hooks take, for the same reason, and it is assigned once by the service wiring
 // that already builds the LI subsystem.
-var POIRestarted func(node context.NodeID, addr string)
+var POIRestarted func(node context.NodeID)
 
 // LIModificationAnswered is the Lawful Interception hook this package calls with the
 // outcome of a modification the interception subsystem sent. Nil unless LI is wired, and
@@ -54,11 +54,11 @@ func notifyLIModificationAnswered(req lisequence.Request, cause uint8, answered 
 // import lawfulintercept.
 //
 // **They exist because only one of the native and adapter handlers runs in a deployment.** The
-// native handler in pfcp/handler has carried these three since interception was built; this one
-// had none of them, so with enableUPFAdapter set — the chart's default — the SMF sent the UPF a
-// DUPL FAR and then never sent the ActivateTask that authorises it. The CC-POI held no task for
-// the session, dropped every copy as unattributable, and the establishment record was never
-// produced. Nothing anywhere raised a fault, because from the SMF's side nothing had failed.
+// native handler in pfcp/handler raises the same three. Without them here, with enableUPFAdapter
+// set — the chart's default — the SMF would send the UPF a DUPL FAR and never send the
+// ActivateTask that authorises it: the CC-POI would hold no task for the session and drop every
+// copy as unattributable, the establishment record would never be produced, and nothing would
+// raise a fault, because from the SMF's side nothing failed.
 var (
 	ReportEstablishment       func(sc *context.SMContext)
 	ApplyCCAfterEstablishment func(sc *context.SMContext)
@@ -92,9 +92,9 @@ func notifyTriggerCC(sc *context.SMContext) {
 
 // notifyPOIRestarted calls the hook if one is wired. Written once so a new call site cannot
 // forget the nil check — a nil function value panics, and these are PFCP message handlers.
-func notifyPOIRestarted(node context.NodeID, addr string) {
+func notifyPOIRestarted(node context.NodeID) {
 	if POIRestarted != nil {
-		POIRestarted(node, addr)
+		POIRestarted(node)
 	}
 }
 
@@ -672,5 +672,5 @@ func SetUpfInactive(nodeID context.NodeID) {
 	// the planning path skip every triple as already claimed, and they keep this element
 	// telling a POI it may not be reaching that its triggering function is present, which is
 	// what disables that POI's own fail-safe.
-	notifyPOIRestarted(upf.NodeID, upf.NodeID.ResolveNodeIdToIp().String())
+	notifyPOIRestarted(upf.NodeID)
 }

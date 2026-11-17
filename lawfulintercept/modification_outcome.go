@@ -45,7 +45,10 @@ const modificationSweepInterval = 10 * time.Second
 // duplication is visible to the CC-POI as content it can attribute, while under-applying it
 // is silent — so the ambiguous case resolves toward retry.
 //
-// Called from the PFCP response handlers, which do not hold the session lock at this point.
+// Called from the PFCP response handlers, and possibly with the session lock held: with the UPF
+// adapter the response is dispatched on the goroutine that sent the request, and every LI
+// modification is sent under sc.SMLock. So nothing here takes that lock on the caller's
+// goroutine; a re-send runs on its own (see modificationNotApplied).
 func ModificationAnswered(req lisequence.Request, cause uint8, answered bool) {
 	sub := active.Load()
 	if sub == nil {
@@ -182,6 +185,19 @@ func (s *subsystem) modificationNotApplied(req lisequence.Request) {
 		return
 	}
 
+	// On its own goroutine, because this may run on the goroutine that sent the refused
+	// modification while it still holds sc.SMLock (the adapter answers inline), and the
+	// re-send needs that lock. resends lets a test wait for it.
+	s.resends.Add(1)
+	go func() {
+		defer s.resends.Done()
+		s.resend(req)
+	}()
+}
+
+// resend re-marks the forwarding FARs the refused send cleared and sends the modification
+// again, under the session lock.
+func (s *subsystem) resend(req lisequence.Request) {
 	sc := smfctx.GetSMContextBySEID(req.SEID)
 	if sc == nil {
 		// The session went while the answer was in flight. Nothing is left to duplicate,

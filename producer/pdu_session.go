@@ -119,11 +119,10 @@ func formContextCreateErrRsp(httpStatus int, problemBody models.ExtProblemDetail
 // to the LI subsystem, which emits an SMFUnsuccessfulProcedure xIRI if the
 // subscriber is under an active warrant.
 //
-// It exists so the two cannot come apart. There are sixteen rejection paths in
-// HandlePDUSessionSMContextCreate; a hook added to each of them individually is a
-// hook that a seventeenth path will be written without. The LI call is a no-op
-// for an untasked subscriber and cannot fail the rejection — see
-// lawfulintercept.reportUnsuccessful.
+// It exists so the two cannot come apart: every establishment reject in this package
+// goes through it, and TestEveryEstablishmentRejectIsReported fails on a reject built
+// any other way. The LI call is a no-op for an untasked subscriber and cannot fail
+// the rejection — see lawfulintercept.reportUnsuccessful.
 //
 // The cause passed to LI is read from the same errors table the reject is built
 // from, so the record and the wire cannot disagree about why the session failed.
@@ -240,11 +239,13 @@ func HandlePDUSessionSMContextCreate(eventData any) error {
 	smContext.SubPduSessLog.Debugln("PDUSessionSMContextCreate, SM context created")
 	// smContext.ChangeState(smf_context.SmStateActivePending)
 	smContext.SubCtxLog.Debugln("PDUSessionSMContextCreate, SMContextState change state:", smContext.SMContextState.String())
-	smContext.SetCreateData(createData)
-	smContext.SmStatusNotifyUri = createData.GetSmContextStatusUri()
-
+	// Under SMLock: the context is already in the pool, and a Lawful Interception scan of
+	// established sessions reads the subscriber identities SetCreateData writes.
 	smContext.SMLock.Lock()
 	defer smContext.SMLock.Unlock()
+
+	smContext.SetCreateData(createData)
+	smContext.SmStatusNotifyUri = createData.GetSmContextStatusUri()
 
 	// DNN Information from config
 	smContext.DNNInfo = smf_context.RetrieveDnnInformation(createData.GetSNssai(), createData.GetDnn())
@@ -428,7 +429,7 @@ func HandlePDUSessionSMContextCreate(eventData any) error {
 			// never associated has nothing to accept with, and carrying on builds an accept for a
 			// path that does not exist. The branch beside this one has always refused here.
 			smContext.SubPduSessLog.Errorf("ensureDataPathUpfAssociated error for SUPI[%s]: %v", createData.Supi, err)
-			txn.Rsp = smContext.GeneratePDUSessionEstablishmentReject("UPFDataPathError")
+			txn.Rsp = rejectEstablishment(smContext, "UPFDataPathError")
 
 			return fmt.Errorf("DataPathError")
 		} else if err := defaultPath.ActivateTunnelAndPDR(smContext, 255); err != nil {
@@ -438,7 +439,7 @@ func HandlePDUSessionSMContextCreate(eventData any) error {
 			// session rule for the Session-AMBR, and the same absence that stopped the build stops
 			// that too -- one step later, as a panic, in a builder that cannot say what went wrong.
 			smContext.SubPduSessLog.Errorf("ActivateTunnelAndPDR error for SUPI[%s]: %v", createData.Supi, err)
-			txn.Rsp = smContext.GeneratePDUSessionEstablishmentReject("UPFDataPathError")
+			txn.Rsp = rejectEstablishment(smContext, "UPFDataPathError")
 
 			return fmt.Errorf("DataPathError")
 		}
@@ -503,7 +504,7 @@ func HandlePDUSessionSMContextCreate(eventData any) error {
 	// The Lawful Interception establishment xIRI is deliberately NOT emitted here.
 	// This point does not wait for the UPF's PFCP Session Establishment Response,
 	// so the session's F-SEID and F-TEID do not exist yet, and a record emitted
-	// here carried zeroes for both — leaving it unjoinable to the session's own
+	// here would carry zeroes for both — leaving it unjoinable to the session's own
 	// content. It is emitted from the response handler instead.
 
 	return nil
@@ -1309,10 +1310,10 @@ func HandlePFCPResponse(smContext *smf_context.SMContext,
 		// Lawful Interception IRI-POI: this releases the session's tunnel, so it
 		// ends the session as far as the subject's traffic is concerned, and owes
 		// the release record and the withdrawal of the triggers it held. The other
-		// caller of SendPfcpSessionReleaseReq already reports before calling it;
-		// this one did not, which left the trigger installed — and a trigger this
-		// element still believes in keeps its keepalives flowing, which is exactly
-		// what stops the POI's fail-safe from reclaiming it.
+		// caller of SendPfcpSessionReleaseReq reports before calling it, and so does
+		// this one: a trigger left installed, which this element still believes in,
+		// keeps its keepalives flowing, which is exactly what stops the POI's
+		// fail-safe from reclaiming it.
 		//
 		// The lock is taken around these two calls alone and not around the release
 		// request: that request blocks on SBIPFCPCommunicationChan until the PFCP

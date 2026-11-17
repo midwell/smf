@@ -93,16 +93,59 @@ func outcomeFixture(t *testing.T) (*subsystem, *admfStub, func() int) {
 	}
 }
 
+// answerAndWait delivers a PFCP answer to an LI modification and waits for any re-send it
+// started, which runs on its own goroutine.
+func answerAndWait(sub *subsystem, req lisequence.Request, cause uint8, answered bool) {
+	ModificationAnswered(req, cause, answered)
+	sub.resends.Wait()
+}
+
+// The answer can arrive on the goroutine that sent the modification while it still holds the
+// session lock: with the UPF adapter, the response is dispatched inline. Handling a refusal
+// there must not wait for that lock, or the sender waits on itself and the session is wedged
+// for every later procedure.
+func TestARefusalAnsweredUnderTheSessionLockDoesNotWaitForIt(t *testing.T) {
+	sub, _, sent := outcomeFixture(t)
+	sc := duplicatingSession(t)
+
+	req := lisequence.Request{
+		SEID:        sc.PFCPContext[trigNodeA].LocalSEID,
+		NodeID:      trigNodeA,
+		Duplicating: true,
+	}
+
+	sc.SMLock.Lock()
+	done := make(chan struct{})
+	go func() {
+		ModificationAnswered(req, ie.CauseRequestRejected, true)
+		close(done)
+	}()
+	select {
+	case <-done:
+		sc.SMLock.Unlock()
+	case <-time.After(2 * time.Second):
+		// Released before failing, so the stuck handler can finish and the test ends.
+		sc.SMLock.Unlock()
+		<-done
+		sub.resends.Wait()
+		t.Fatal("handling a refused LI modification waited for the session lock its sender holds")
+	}
+
+	sub.resends.Wait()
+	if n := sent(); n != 1 {
+		t.Errorf("the refusal produced %d re-sends once the lock was released, want 1", n)
+	}
+}
+
 // TestARefusedDuplicationIsRetriedAndThenReported is the whole of *the SMF acts on the
 // answer to its own PFCP modifications*.
 //
 // The `lisequence` guard exists so an LI-initiated response cannot complete a subscriber's
-// concurrent procedure, which is right and required. What it also did was `return` without
-// reading the Cause — so a refused activation was never retried, and could not be: the send
+// concurrent procedure, which is right and required. It must still read the Cause: the send
 // itself cleared the `RULE_UPDATE` marker `ModifySessionForLI` selects on, and `applyCC`
-// will not set it again because the SMF-side `Dupl` bit already matches the tasking. The
-// element was left holding a task it reports as intercepting and a datapath that declined
-// it, with nothing to re-send and nothing reported.
+// will not set it again because the SMF-side `Dupl` bit already matches the tasking, so a
+// refusal nobody reads leaves the element holding a task it reports as intercepting and a
+// datapath that declined it, with nothing to re-send and nothing reported.
 //
 // Two properties. The refusal is retried, which requires the marker to be re-established.
 // And a datapath that keeps refusing is reported rather than asked forever, because it is
@@ -120,7 +163,7 @@ func TestARefusedDuplicationIsRetriedAndThenReported(t *testing.T) {
 	}
 
 	// The datapath refuses.
-	ModificationAnswered(req, ie.CauseRequestRejected, true)
+	answerAndWait(sub, req, ie.CauseRequestRejected, true)
 
 	if n := sent(); n != 1 {
 		t.Fatalf("a refused duplication produced %d re-sends, want 1: the element recorded the "+
@@ -147,7 +190,7 @@ func TestARefusedDuplicationIsRetriedAndThenReported(t *testing.T) {
 		sc.SMLock.Lock()
 		forEachForwardingFAR(sc, func(far *smfctx.FAR) { far.State = smfctx.RULE_CREATE })
 		sc.SMLock.Unlock()
-		ModificationAnswered(req, ie.CauseRequestRejected, true)
+		answerAndWait(sub, req, ie.CauseRequestRejected, true)
 	}
 
 	deadline := time.Now().Add(5 * time.Second)
@@ -155,11 +198,10 @@ func TestARefusedDuplicationIsRetriedAndThenReported(t *testing.T) {
 		if strings.Contains(strings.Join(admf.received(), "\n"), "duplicationRefused") {
 			// And it stopped asking.
 			before := sent()
-			ModificationAnswered(req, ie.CauseRequestRejected, true)
+			answerAndWait(sub, req, ie.CauseRequestRejected, true)
 			if after := sent(); after > before+1 {
 				t.Errorf("the element sent %d more modifications after giving up", after-before)
 			}
-			_ = sub
 
 			return
 		}
@@ -175,7 +217,7 @@ func TestARefusedDuplicationIsRetriedAndThenReported(t *testing.T) {
 // is content still being duplicated under authority that has gone, which nothing downstream
 // can tell from content that is authorised.
 func TestARefusedWithdrawalIsNotBelieved(t *testing.T) {
-	_, admf, sent := outcomeFixture(t)
+	sub, admf, sent := outcomeFixture(t)
 	sc := duplicatingSession(t)
 
 	// The withdrawal: the FARs were sent with Dupl cleared.
@@ -192,7 +234,7 @@ func TestARefusedWithdrawalIsNotBelieved(t *testing.T) {
 		Duplicating: false,
 	}
 
-	ModificationAnswered(req, ie.CauseRequestRejected, true)
+	answerAndWait(sub, req, ie.CauseRequestRejected, true)
 
 	if n := sent(); n != 1 {
 		t.Fatalf("a refused withdrawal produced %d re-sends, want 1: the element believes "+
@@ -203,7 +245,7 @@ func TestARefusedWithdrawalIsNotBelieved(t *testing.T) {
 		sc.SMLock.Lock()
 		forEachForwardingFAR(sc, func(far *smfctx.FAR) { far.State = smfctx.RULE_CREATE })
 		sc.SMLock.Unlock()
-		ModificationAnswered(req, ie.CauseRequestRejected, true)
+		answerAndWait(sub, req, ie.CauseRequestRejected, true)
 	}
 
 	deadline := time.Now().Add(5 * time.Second)
@@ -228,7 +270,7 @@ func TestARefusedWithdrawalIsNotBelieved(t *testing.T) {
 // as content it can attribute; under-applying it is silent, so the ambiguous case resolves
 // toward retry.
 func TestAnUnansweredModificationIsTreatedAsRefused(t *testing.T) {
-	_, _, sent := outcomeFixture(t)
+	sub, _, sent := outcomeFixture(t)
 	sc := duplicatingSession(t)
 
 	req := lisequence.Request{
@@ -238,7 +280,7 @@ func TestAnUnansweredModificationIsTreatedAsRefused(t *testing.T) {
 	}
 
 	// answered=false: no Cause could be read, or none arrived.
-	ModificationAnswered(req, 0, false)
+	answerAndWait(sub, req, 0, false)
 
 	if n := sent(); n != 1 {
 		t.Errorf("an unanswered duplication produced %d re-sends, want 1", n)
@@ -248,7 +290,7 @@ func TestAnUnansweredModificationIsTreatedAsRefused(t *testing.T) {
 // TestAnAcceptedModificationIsLeftAlone keeps the fix from becoming a re-send loop on the
 // ordinary path: the datapath took it, so there is nothing to do.
 func TestAnAcceptedModificationIsLeftAlone(t *testing.T) {
-	_, admf, sent := outcomeFixture(t)
+	sub, admf, sent := outcomeFixture(t)
 	sc := duplicatingSession(t)
 
 	req := lisequence.Request{
@@ -257,7 +299,7 @@ func TestAnAcceptedModificationIsLeftAlone(t *testing.T) {
 		Duplicating: true,
 	}
 
-	ModificationAnswered(req, ie.CauseRequestAccepted, true)
+	answerAndWait(sub, req, ie.CauseRequestAccepted, true)
 
 	if n := sent(); n != 0 {
 		t.Errorf("an accepted modification produced %d re-sends, want 0", n)
@@ -304,7 +346,7 @@ func TestARefusedDuplicationIsAttributedToItsWarrant(t *testing.T) {
 		sc.SMLock.Lock()
 		forEachForwardingFAR(sc, func(far *smfctx.FAR) { far.State = smfctx.RULE_CREATE })
 		sc.SMLock.Unlock()
-		ModificationAnswered(req, ie.CauseRequestRejected, true)
+		answerAndWait(sub, req, ie.CauseRequestRejected, true)
 	}
 
 	faults := sub.taskFaults(warrant.XID)
@@ -316,7 +358,7 @@ func TestARefusedDuplicationIsAttributedToItsWarrant(t *testing.T) {
 
 	// State, not a push: a later modification the datapath applies ends it, and the watcher
 	// then retracts the fault (TS 103 221-1 clause 6.5.2.1).
-	ModificationAnswered(req, ie.CauseRequestAccepted, true)
+	answerAndWait(sub, req, ie.CauseRequestAccepted, true)
 
 	if f := sub.taskFaults(warrant.XID); len(f) != 0 {
 		t.Errorf("the warrant still reports %+v after a modification for the session applied", f)

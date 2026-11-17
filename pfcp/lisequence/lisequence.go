@@ -25,8 +25,8 @@ import (
 // encodes, so the `RULE_UPDATE` marker that selected these FARs is cleared by the send
 // itself — and `applyCC` will not set it again, because the SMF-side `Dupl` bit already
 // equals what the tasking implies. A response handler that went back to the session to
-// work out what had been asked would therefore find nothing to do, which is why a
-// refused activation was never retried.
+// work out what had been asked would therefore find nothing to do, and a refused
+// activation would never be retried.
 type Request struct {
 	// SEID is the local PFCP session identifier the modification was sent for, which is
 	// how the session is found again.
@@ -45,7 +45,7 @@ type Request struct {
 // Bounded on purpose. Entries are normally consumed by the response they describe, but a
 // response that never arrives — a lost datagram, a UPF that restarts — would otherwise
 // leave one behind forever, and an unbounded map that grows with traffic while nothing
-// prunes it is a fault this project has already had to fix once. Expired records the
+// prunes it is a fault in its own right. Expired records the
 // interception subsystem to sweep; Mark drops anything far past the window as the backstop
 // for a deployment where nothing sweeps.
 var (
@@ -119,4 +119,12 @@ func Expired() []Request {
 	}
 
 	return out
+}
+
+// Outstanding is how many LI modifications await an answer.
+func Outstanding() int {
+	lock.Lock()
+	defer lock.Unlock()
+
+	return len(pending)
 }

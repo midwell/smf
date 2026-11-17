@@ -152,6 +152,8 @@ type subsystem struct {
 	// know how many attempts preceded it — the sequence number is allocated per send.
 	modMu       sync.Mutex
 	modAttempts map[modKey]int
+	// resends counts the re-sends modificationNotApplied has started and not finished.
+	resends sync.WaitGroup
 	// modFailed holds, per (session, UPF), why this element gave up on an LI modification the
 	// datapath did not apply. It is task-fault state: taskFaults reports it against every warrant
 	// covering the session until a later modification for that session and UPF applies, or the
@@ -420,17 +422,6 @@ func Init(cfg Config) error {
 	if cfg.AdmfURL != "" {
 		reporter = x1.NewReporter(cfg.AdmfURL, cfg.AdmfID, cfg.NEID, mat.ClientTLS())
 	}
-	// The keepalive timers, now that there is somewhere to report a value this element
-	// cannot read (they are read below, once the block itself is trusted). Interception
-	// does not start on one — the element would otherwise run a procedure other than the
-	// one agreed with the agency, and look healthy while it did — but the network function
-	// does, because an element that refuses to run over its LI configuration is
-	// distinguishable from one that has none by anybody who can see whether it is running.
-	// The listener's address, before anything binds it. An empty address is a bind that
-	// succeeds on an unpredictable port rather than one that fails, so nothing downstream
-	// will ever report it — see errNoX1Listen. Reported to the ADMF, because an element that
-	// cannot be provisioned is precisely what the ADMF needs to hear about, and refused,
-	// because starting is what makes it look healthy.
 	// The refused `li` block, now that there is somewhere to report it. Checked before any
 	// value out of that block is used, because the block is exactly what could not be read:
 	// the keys that did decode are not trustworthy as a set, and one of the ones that did not
@@ -443,6 +434,11 @@ func Init(cfg Config) error {
 
 		return cfg.BlockError
 	}
+	// The listener's address, before anything binds it. An empty address is a bind that
+	// succeeds on an unpredictable port rather than one that fails, so nothing downstream
+	// will ever report it — see errNoX1Listen. Reported to the ADMF, because an element that
+	// cannot be provisioned is precisely what the ADMF needs to hear about, and refused,
+	// because starting is what makes it look healthy.
 	if cfg.X1Listen == "" {
 		reporter.Notify(x1.NEIssueInvalidConfig,
 			"no X1 listen address is configured, so this element would accept tasking on an "+
@@ -450,6 +446,11 @@ func Init(cfg Config) error {
 
 		return errNoX1Listen
 	}
+	// The keepalive timers. Interception does not start on one this element cannot read —
+	// it would otherwise run a procedure other than the one agreed with the agency, and look
+	// healthy while it did — but the network function does, because an element that refuses
+	// to run over its LI configuration is distinguishable from one that has none by anybody
+	// who can see whether it is running.
 	keepalive, err := keepaliveProcedure(cfg)
 	if err != nil {
 		reporter.Notify(x1.NEIssueInvalidConfig,
