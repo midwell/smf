@@ -3611,13 +3611,15 @@ func TestAPOIWhoseClaimsWereDiscardedIsReconciledAgain(t *testing.T) {
 }
 
 // liveCCSession is a target's live session at trigNodeA, acknowledged by the incarnation of
-// the node acknowledgedAt names, with a CC warrant covering it activated in s's store.
+// the node acknowledgedAt names, which is the incarnation the node is held at, with a CC
+// warrant covering it activated in s's store.
 func liveCCSession(t *testing.T, s *subsystem, acknowledgedAt time.Time) *smfctx.SMContext {
 	t.Helper()
 
 	sc := pooledSession(t, testSUPI, 7)
 	node := smfctx.NewDataPathNode()
 	node.UPF = &smfctx.UPF{NodeID: upfNode(trigNodeA)}
+	node.UPF.RecoveryTimeStamp.RecoveryTimeStamp = acknowledgedAt
 	node.UpLinkTunnel.PDR["default"] = &smfctx.PDR{FAR: &smfctx.FAR{
 		ApplyAction: smfctx.ApplyAction{Forw: true, Dupl: true},
 		State:       smfctx.RULE_CREATE,
@@ -3744,6 +3746,68 @@ func TestASessionAnEarlierIncarnationAcknowledgedIsNotRetriggered(t *testing.T) 
 	s.triggers.mu.Unlock()
 	if n != 0 {
 		t.Errorf("%d claims recorded for a session the node's current incarnation does not hold", n)
+	}
+}
+
+// TestARetriggerInstallsOnlyAtTheReconciledPOI covers a session served by two UPFs, of which only
+// the one being reconciled holds the session under its current incarnation. The other restarted
+// and has been associated again, and the session is not re-established on it yet, so the SEID the
+// session carries for it is the previous incarnation's. A trigger planned there would match
+// nothing, and its claim would make the re-establishment skip the trigger it should install.
+func TestARetriggerInstallsOnlyAtTheReconciledPOI(t *testing.T) {
+	poiA, poiB := newFakePOI(t), newFakePOI(t)
+	s := &subsystem{
+		neID:  testNEID,
+		store: store.New(),
+		triggers: mustRegistry(Config{
+			NEID: testNEID, MDF3: testMDF3Addr,
+			UPFTriggers: []UPFTrigger{
+				{NodeID: trigNodeA, X1URL: poiA.srv.URL, NEID: testUPFNEID1},
+				{NodeID: trigNodeB, X1URL: poiB.srv.URL, NEID: testUPFNEID2},
+			},
+		}),
+	}
+	s.triggers.reportTaskHealth = s.noteTaskHealth
+	s.triggers.reconcile = s.reconcileEndpoint
+	waitForScans(t, s)
+
+	acknowledgedAt := time.Unix(1_700_000_000, 0)
+	sc := liveCCSession(t, s, acknowledgedAt)
+
+	// B is the session's second UPF. It restarted since it acknowledged the session, and is
+	// held at its new incarnation.
+	b := smfctx.NewDataPathNode()
+	b.UPF = &smfctx.UPF{NodeID: upfNode(trigNodeB)}
+	b.UPF.RecoveryTimeStamp.RecoveryTimeStamp = time.Unix(1_700_000_600, 0)
+	sc.SMLock.Lock()
+	a := sc.Tunnel.DataPathPool[1].FirstDPNode
+	a.DownLinkTunnel.SrcEndPoint, b.UpLinkTunnel.SrcEndPoint = b, a
+	sc.PFCPContext[trigNodeB] = &smfctx.PFCPSessionContext{
+		NodeID:                 upfNode(trigNodeB),
+		RemoteSEID:             0x51f4d1912632898a,
+		AcknowledgedAtRecovery: acknowledgedAt,
+	}
+	sc.SMLock.Unlock()
+
+	s.reconcileEndpoint(trigNodeA, s.triggers.endpoints[trigNodeA])
+
+	if !waitForMessages(poiA, "ActivateTaskRequest", 1) {
+		t.Fatal("the reconciled POI's trigger was not installed again, so this test would prove nothing")
+	}
+
+	s.triggers.mu.Lock()
+	_, claimedAtB := s.triggers.installed[triggerKey(testXIDSecondary, sc.Ref, trigNodeB)]
+	s.triggers.mu.Unlock()
+	if claimedAtB {
+		t.Error("reconciling A claimed a trigger at B on the SEID B's previous incarnation " +
+			"assigned. It matches nothing, and the claim makes B's re-establishment skip the " +
+			"trigger it should install")
+	}
+
+	// installTriggers would reach B after A, on the same goroutine.
+	time.Sleep(200 * time.Millisecond)
+	if sent := poiB.sent(); len(sent) != 0 {
+		t.Errorf("reconciling A sent %d requests to B, whose incarnation it says nothing about", len(sent))
 	}
 }
 

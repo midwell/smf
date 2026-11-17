@@ -1066,10 +1066,12 @@ func (s *subsystem) reconcileEndpoint(nodeID string, endpoint *upfEndpoint) {
 // that was never discarded, or that an establishment has installed again, is not installed twice.
 // At start-up no warrant is held yet, and nothing is installed.
 //
-// A session is skipped unless the node's current incarnation acknowledged it. After a restart,
-// a session that restoration has not re-established yet still carries the SEID the previous
-// incarnation assigned: a trigger planned on it would match nothing, and its claim would make
-// the re-establishment skip the trigger it should install.
+// Only at nodeID. A session the node's current incarnation did not acknowledge is skipped: after
+// a restart, a session that restoration has not re-established yet still carries the SEID the
+// previous incarnation assigned, so a trigger planned on it would match nothing, and its claim
+// would make the re-establishment skip the trigger it should install. The same holds at the
+// session's other UPFs, whose incarnations this reconciliation says nothing about, so their
+// triggers are left to their own establishment and reconciliation.
 func (s *subsystem) retriggerAt(nodeID string) {
 	smfctx.RangeSMContexts(func(sc *smfctx.SMContext) bool {
 		sc.SMLock.Lock()
@@ -1080,21 +1082,21 @@ func (s *subsystem) retriggerAt(nodeID string) {
 		if sc.SMContextState == smfctx.SmStateRelease || sc.LocalPurged.Load() || sc.SupersededByAnother() {
 			return true
 		}
-		if s.servedByCurrentIncarnation(sc, nodeID) {
-			s.triggerCC(sc)
-		}
+		s.triggerCCAt(sc, func(sc *smfctx.SMContext) []upfSession {
+			return s.servedByCurrentIncarnation(sc, nodeID)
+		})
 
 		return true
 	})
 }
 
-// servedByCurrentIncarnation reports whether the POI configured as nodeID serves sc on a PFCP
-// session that the node's current incarnation acknowledged. Caller holds sc.SMLock, and not
-// r.mu: the node's held recovery timestamp is read under UpfLock, which a restart path holds
-// while it waits for r.mu.
-func (s *subsystem) servedByCurrentIncarnation(sc *smfctx.SMContext, nodeID string) bool {
+// servedByCurrentIncarnation returns the UPF configured as nodeID serving sc, when it serves sc
+// on a PFCP session that the node's current incarnation acknowledged, and nothing otherwise.
+// Caller holds sc.SMLock, and not r.mu: the node's held recovery timestamp is read under
+// UpfLock, which a restart path holds while it waits for r.mu.
+func (s *subsystem) servedByCurrentIncarnation(sc *smfctx.SMContext, nodeID string) []upfSession {
 	if sc.Tunnel == nil {
-		return false
+		return nil
 	}
 	for _, dp := range sc.Tunnel.DataPathPool {
 		for node := dp.FirstDPNode; node != nil; node = node.Next() {
@@ -1111,12 +1113,12 @@ func (s *subsystem) servedByCurrentIncarnation(sc *smfctx.SMContext, nodeID stri
 			key, _, ok := s.triggers.matchEndpoint(upfSession{node: node.UPF.NodeID, addr: addr})
 			s.triggers.mu.Unlock()
 			if ok && key == nodeID && pfcpCtx.AcknowledgedAtRecovery.Unix() == node.UPF.HeldRecovery().Unix() {
-				return true
+				return []upfSession{{node: node.UPF.NodeID, addr: addr, seid: pfcpCtx.RemoteSEID}}
 			}
 		}
 	}
 
-	return false
+	return nil
 }
 
 // noteTaskHealth reports every trigger this element holds that the POI says is not running.
@@ -1426,6 +1428,12 @@ func RestoreInterception(sc *smfctx.SMContext) {
 //
 // Caller holds sc.SMLock.
 func (s *subsystem) triggerCC(sc *smfctx.SMContext) {
+	s.triggerCCAt(sc, sessionUPFs)
+}
+
+// triggerCCAt is triggerCC for the serving UPFs upfsOf returns, which is asked only once a CC
+// warrant covers sc. Caller holds sc.SMLock.
+func (s *subsystem) triggerCCAt(sc *smfctx.SMContext, upfsOf func(*smfctx.SMContext) []upfSession) {
 	if s.triggers == nil {
 		return
 	}
@@ -1440,7 +1448,7 @@ func (s *subsystem) triggerCC(sc *smfctx.SMContext) {
 		return
 	}
 
-	upfs := sessionUPFs(sc)
+	upfs := upfsOf(sc)
 	if len(upfs) == 0 {
 		return
 	}
