@@ -222,8 +222,14 @@ func (s *subsystem) resend(req lisequence.Request) {
 	// Only the FARs the send left in RULE_CREATE: one still marked RULE_UPDATE belongs to a
 	// modification the session's own path has not sent yet, and re-sending it here would
 	// take it out from under that path.
+	//
+	// And only at the UPF that refused. ModifySessionForLI sends to every UPF with a
+	// RULE_UPDATE FAR, so re-marking the session's other UPFs would re-send to each of them
+	// too, and their answers would schedule more re-sends of their own: with two UPFs
+	// refusing, every refusal re-sends to both, a UPF given up on is sent to again, and its
+	// next refusal starts a fresh count, so the re-sends never stop.
 	marked := 0
-	forEachForwardingFAR(sc, func(far *smfctx.FAR) {
+	forEachForwardingFARAt(sc, req.NodeID, func(far *smfctx.FAR) {
 		if far.State == smfctx.RULE_CREATE {
 			far.State = smfctx.RULE_UPDATE
 			marked++

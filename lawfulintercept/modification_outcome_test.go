@@ -6,6 +6,7 @@ package lawfulintercept
 import (
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -362,5 +363,86 @@ func TestARefusedDuplicationIsAttributedToItsWarrant(t *testing.T) {
 
 	if f := sub.taskFaults(warrant.XID); len(f) != 0 {
 		t.Errorf("the warrant still reports %+v after a modification for the session applied", f)
+	}
+}
+
+// TestTwoRefusingUPFsAreRetriedWithinTheBound covers a session duplicated at two UPFs that both
+// refuse. A re-send for one UPF's refusal must go to that UPF only: re-sending to every UPF
+// makes each refusal produce a refusal from both, and a UPF already given up on is asked again,
+// so the re-sends never stop.
+func TestTwoRefusingUPFsAreRetriedWithinTheBound(t *testing.T) {
+	sub, _, _ := outcomeFixture(t)
+
+	sc := pooledSession(t, testSUPI, 1)
+	a, b := smfctx.NewDataPathNode(), smfctx.NewDataPathNode()
+	a.UPF = &smfctx.UPF{NodeID: upfNode(trigNodeA)}
+	b.UPF = &smfctx.UPF{NodeID: upfNode(trigNodeB)}
+	for i, node := range []*smfctx.DataPathNode{a, b} {
+		node.UpLinkTunnel.PDR["default"] = &smfctx.PDR{FAR: &smfctx.FAR{
+			FARID:       uint32(i + 1),
+			ApplyAction: smfctx.ApplyAction{Forw: true, Dupl: true},
+			State:       smfctx.RULE_UPDATE,
+		}}
+	}
+	a.DownLinkTunnel.SrcEndPoint, b.UpLinkTunnel.SrcEndPoint = b, a
+	sc.Tunnel = &smfctx.UPTunnel{DataPathPool: smfctx.DataPathPool{
+		1: &smfctx.DataPath{FirstDPNode: a, IsDefaultPath: true, Activated: true},
+	}}
+	sc.PFCPContext = map[string]*smfctx.PFCPSessionContext{}
+	sc.AllocateLocalSEIDForDataPath(sc.Tunnel.DataPathPool[1])
+
+	// The modifier as ModifySessionForLI and the send behave: one modification per UPF with a
+	// RULE_UPDATE FAR, which the send marks RULE_CREATE. Each UPF refuses, answering inline as
+	// the adapter does.
+	var (
+		calls   atomic.Int64
+		stopped atomic.Bool
+	)
+	sessionModifier = func(sc *smfctx.SMContext) error {
+		calls.Add(1)
+		if stopped.Load() {
+			return nil
+		}
+		sentTo := map[string]bool{}
+		for _, node := range []*smfctx.DataPathNode{a, b} {
+			forEachForwardingFARAt(sc, node.GetNodeIP(), func(far *smfctx.FAR) {
+				if far.State == smfctx.RULE_UPDATE {
+					far.State = smfctx.RULE_CREATE
+					sentTo[node.GetNodeIP()] = true
+				}
+			})
+		}
+		for ip := range sentTo {
+			ModificationAnswered(lisequence.Request{
+				SEID:        sc.PFCPContext[ip].LocalSEID,
+				NodeID:      ip,
+				Duplicating: true,
+			}, ie.CauseRequestRejected, true)
+		}
+
+		return nil
+	}
+
+	// The first modification, to both UPFs.
+	sc.SMLock.Lock()
+	sub.modifySession(sc)
+	sc.SMLock.Unlock()
+
+	quiet := make(chan struct{})
+	go func() {
+		sub.resends.Wait()
+		close(quiet)
+	}()
+	select {
+	case <-quiet:
+	case <-time.After(5 * time.Second):
+		stopped.Store(true)
+		<-quiet
+		t.Fatalf("the re-sends to two refusing UPFs had not stopped after %d modifications", calls.Load())
+	}
+
+	// The first modification, then at most maxModificationAttempts-1 re-sends per UPF.
+	if n, bound := calls.Load(), int64(1+2*maxModificationAttempts); n > bound {
+		t.Errorf("two refusing UPFs took %d modifications, want at most %d", n, bound)
 	}
 }

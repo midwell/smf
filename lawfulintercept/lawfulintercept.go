@@ -944,8 +944,18 @@ func farUpdateOwed(sc *smfctx.SMContext) bool {
 // data paths — the ones actually carrying the target's user-plane traffic, on
 // every UPF serving the session. Caller holds sc.SMLock; sc.Tunnel must be non-nil.
 func forEachForwardingFAR(sc *smfctx.SMContext, fn func(*smfctx.FAR)) {
+	forEachForwardingFARAt(sc, "", fn)
+}
+
+// forEachForwardingFARAt is forEachForwardingFAR for the UPF whose node address is nodeIP
+// only, or for every UPF when nodeIP is empty. Caller holds sc.SMLock; sc.Tunnel must be
+// non-nil.
+func forEachForwardingFARAt(sc *smfctx.SMContext, nodeIP string, fn func(*smfctx.FAR)) {
 	for _, dp := range sc.Tunnel.DataPathPool {
 		for node := dp.FirstDPNode; node != nil; node = node.Next() {
+			if nodeIP != "" && (node.UPF == nil || node.GetNodeIP() != nodeIP) {
+				continue
+			}
 			for _, tun := range []*smfctx.GTPTunnel{node.UpLinkTunnel, node.DownLinkTunnel} {
 				if tun == nil {
 					continue
