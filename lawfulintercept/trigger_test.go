@@ -3668,7 +3668,7 @@ func TestALiveSessionIsRetriggeredAfterItsPOIIsReconciled(t *testing.T) {
 	s := triggerSubsystem(t, poi)
 	s.reconcileOne()
 
-	sc := liveCCSession(t, s, time.Time{})
+	sc := liveCCSession(t, s, time.Unix(1_700_000_000, 0))
 	sc.SMLock.Lock()
 	s.triggerCC(sc)
 	sc.SMLock.Unlock()
@@ -3746,6 +3746,29 @@ func TestASessionAnEarlierIncarnationAcknowledgedIsNotRetriggered(t *testing.T) 
 	s.triggers.mu.Unlock()
 	if n != 0 {
 		t.Errorf("%d claims recorded for a session the node's current incarnation does not hold", n)
+	}
+}
+
+// TestASessionWithNoAcknowledgementIsNotRetriggered: a session restored from a document stored
+// without the recovery timestamp its node acknowledged it at carries a zero one, and against a
+// node held at no timestamp yet, zero equals zero. Neither names an incarnation, so nothing
+// shows that the SEID the session carries is one the node holds.
+func TestASessionWithNoAcknowledgementIsNotRetriggered(t *testing.T) {
+	poi := newFakePOI(t)
+	s := triggerSubsystem(t, poi)
+
+	liveCCSession(t, s, time.Time{})
+
+	s.reconcileOne()
+
+	if n := poi.countMessages("ActivateTaskRequest"); n != 0 {
+		t.Errorf("%d triggers were installed for a session no incarnation of the node is known to hold", n)
+	}
+	s.triggers.mu.Lock()
+	n := len(s.triggers.installed)
+	s.triggers.mu.Unlock()
+	if n != 0 {
+		t.Errorf("%d claims recorded for a session no incarnation of the node is known to hold", n)
 	}
 }
 

@@ -1112,7 +1112,11 @@ func (s *subsystem) servedByCurrentIncarnation(sc *smfctx.SMContext, nodeID stri
 			s.triggers.mu.Lock()
 			key, _, ok := s.triggers.matchEndpoint(upfSession{node: node.UPF.NodeID, addr: addr})
 			s.triggers.mu.Unlock()
-			if ok && key == nodeID && pfcpCtx.AcknowledgedAtRecovery.Unix() == node.UPF.HeldRecovery().Unix() {
+			// A zero acknowledgement names no incarnation: a session restored from a document
+			// stored without one carries it, and so does a node held at no timestamp yet, so
+			// zero equalling zero says nothing about the SEID.
+			acknowledgedAt := pfcpCtx.AcknowledgedAtRecovery
+			if ok && key == nodeID && !acknowledgedAt.IsZero() && acknowledgedAt.Unix() == node.UPF.HeldRecovery().Unix() {
 				return []upfSession{{node: node.UPF.NodeID, addr: addr, seid: pfcpCtx.RemoteSEID}}
 			}
 		}
