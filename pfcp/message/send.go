@@ -1261,7 +1261,9 @@ func SendPfcpMsgToAdapter(upNodeID smf_context.NodeID, msg message.Message, addr
 		return nil, err
 	}
 
-	logger.PfcpLog.Debugf("json encoded udpPodMsg [%s]", udpPodMsgJson)
+	// The body is not logged: it is the whole PFCP message, a modification that sets
+	// duplication included.
+	logger.PfcpLog.Debugf("sending %s seq[%d] to the adapter (%d bytes)", msg.MessageTypeName(), msg.Sequence(), len(buf))
 	// change the IP here
 	logger.PfcpLog.Debugf("send to: %s", url)
 
