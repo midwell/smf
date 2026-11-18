@@ -886,6 +886,34 @@ func ApplyCCTrigger(sc *smfctx.SMContext) {
 	})
 }
 
+// ApplyCCTriggerTo is ApplyCCTrigger for the FARs a modification is about to carry, and only
+// those. A handler that sends part of a session's rules calls this, not ApplyCCTrigger.
+//
+// Re-deriving every forwarding FAR there loses a change. With a warrant just stored and its
+// scan waiting for SMLock, ApplyCCTrigger sets duplication on FARs the request does not carry and
+// marks them RULE_UPDATE; the request goes out without them, and the scan then finds duplication
+// already as the tasking implies and sends nothing. Left alone, those FARs differ from the tasking
+// when the scan arrives, and it sends them.
+//
+// Caller holds sc.SMLock.
+func ApplyCCTriggerTo(sc *smfctx.SMContext, fars []*smfctx.FAR) {
+	sub := active.Load()
+	if sub == nil || sc == nil || sc.Tunnel == nil {
+		return
+	}
+	cc := sub.ccTasked(sc)
+	for _, far := range fars {
+		if far == nil || !far.ApplyAction.Forw || far.ApplyAction.Dupl == cc {
+			continue
+		}
+		setDuplication(far, cc)
+		// As in ApplyCCTrigger: a FAR already installed is sent as an update.
+		if far.State == smfctx.RULE_CREATE {
+			far.State = smfctx.RULE_UPDATE
+		}
+	}
+}
+
 // ApplyCCAfterEstablishment re-derives sc's duplication state now that its PFCP
 // session exists, and sends a modification if that changed anything.
 //

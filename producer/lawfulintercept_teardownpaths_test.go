@@ -62,11 +62,11 @@ func TestEveryTeardownPathReportsAndUntasks(t *testing.T) {
 			"the N4-timeout release, where the user plane never answered",
 		},
 		{
-			"n1n2_data_handler.go", "HandleUpdateN1Msg",
+			n1n2DataHandler, "HandleUpdateN1Msg",
 			"the UE's Release Complete after a Release Command that answered a failed modification, which no release reported",
 		},
 		{
-			"n1n2_data_handler.go", "HandleUpdateN2Msg",
+			n1n2DataHandler, "HandleUpdateN2Msg",
 			"a duplicate PDU session identifier tears the earlier session down",
 		},
 	} {

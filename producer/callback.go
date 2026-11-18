@@ -535,8 +535,9 @@ func programAddedRule(smContext *smfContext.SMContext, pfcpParam *pfcpParam, nod
 
 	// Setting the FARs above replaced their whole ApplyAction, so a tasked session's content
 	// duplication was cleared; restore it from the current task state before the rules are sent.
-	// Silent no-op when LI is inactive.
-	lawfulintercept.ApplyCCTrigger(smContext)
+	// Only the FARs this modification carries: see ApplyCCTriggerTo. Silent no-op when LI is
+	// inactive.
+	lawfulintercept.ApplyCCTriggerTo(smContext, pfcpParam.farList)
 }
 
 // sessionUEAddress is the UE's address as a rule added to an established session names it, in
