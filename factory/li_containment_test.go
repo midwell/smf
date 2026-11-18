@@ -159,3 +159,56 @@ configuration:
 			"about who acts on the refusal, not about whether there is one")
 	}
 }
+
+// An alias inside the block may name an anchor outside it, and a merge key may pull the
+// whole block from one. Both are valid YAML that the lenient decode of the rest of the file
+// accepts, so the strict decode must resolve them in the context of the whole document and
+// not of the block alone; refusing them leaves interception off on a correct configuration.
+// The misspelled key under a merge must still be refused.
+func TestTheStrictLiDecodeResolvesAnchorsOutsideTheBlock(t *testing.T) {
+	const aliased = `info:
+  version: 1.0.0
+  description: &ne smf-1
+configuration:
+  li:
+    x1Listen: ":8443"
+    neId: *ne
+`
+	li, err := strictLiBlock([]byte(aliased))
+	if err != nil {
+		t.Fatalf("an alias to an anchor outside the block was refused: %v", err)
+	}
+	if li.NEID != "smf-1" {
+		t.Errorf("the aliased neId decoded as %q, want smf-1", li.NEID)
+	}
+
+	const merged = `info:
+  version: 1.0.0
+common: &li
+  x1Listen: ":8443"
+  neId: smf-2
+configuration:
+  li:
+    <<: *li
+`
+	li, err = strictLiBlock([]byte(merged))
+	if err != nil {
+		t.Fatalf("a block merged from an anchor outside it was refused: %v", err)
+	}
+	if li.NEID != "smf-2" || li.X1Listen != ":8443" {
+		t.Errorf("the merged block decoded as neId %q, x1Listen %q", li.NEID, li.X1Listen)
+	}
+
+	const mergedTypo = `info:
+  version: 1.0.0
+common: &li
+  x1Listen: ":8443"
+  keepaliveTimeut: 30s
+configuration:
+  li:
+    <<: *li
+`
+	if _, err := strictLiBlock([]byte(mergedTypo)); err == nil {
+		t.Error("a misspelled key reaching the block through a merge was accepted")
+	}
+}

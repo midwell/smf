@@ -69,16 +69,13 @@ func strictLiBlock(content []byte) (*Li, error) {
 
 	li := &Li{}
 
-	// Round-tripped so the strict pass sees the block and only the block. One small mapping, once,
-	// at startup.
-	raw, err := yaml.Marshal(block)
-	if err != nil {
-		return li, fmt.Errorf("configuration.li: %w", err)
-	}
-
+	// The node is decoded in place, so the strict pass sees the block and only the block while
+	// an alias or merge in it still resolves to its anchor elsewhere in the document. Marshalling
+	// the node out and decoding the text would keep the alias and drop the anchor.
+	//
 	// A decode error leaves whatever was decoded before it in li; the error is what the LI
 	// subsystem acts on, so a partial block is never used to intercept.
-	if err := yaml.Load(raw, li, yaml.WithKnownFields()); err != nil {
+	if err := block.Load(li, yaml.WithKnownFields()); err != nil {
 		return li, fmt.Errorf("configuration.li: %w — a key this element does not recognise, or a "+
 			"value it cannot read, is a setting that never reaches it, and the defaults it leaves in "+
 			"place are the unsafe ones: an unread keepalive setting leaves the X1 keepalive procedure "+
