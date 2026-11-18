@@ -143,6 +143,13 @@ func ModifySessionForLI(smContext *context.SMContext) error {
 			continue
 		}
 		for node := dataPath.FirstDPNode; node != nil; node = node.Next() {
+			// No live PFCP session on this UPF yet, so nothing to modify. Checked before its FARs
+			// are read, because the create path builds a UPF's establishment without SMLock and
+			// writes those FARs' state while it does.
+			ip := node.GetNodeIP()
+			if sessionContext, exist := smContext.PFCPContext[ip]; !exist || sessionContext.RemoteSEID == 0 {
+				continue
+			}
 			for _, tun := range []*context.GTPTunnel{node.UpLinkTunnel, node.DownLinkTunnel} {
 				if tun == nil {
 					continue
@@ -151,7 +158,6 @@ func ModifySessionForLI(smContext *context.SMContext) error {
 					if pdr == nil || pdr.FAR == nil || pdr.FAR.State != context.RULE_UPDATE {
 						continue
 					}
-					ip := node.GetNodeIP()
 					g := groups[ip]
 					if g == nil {
 						g = &group{nodeID: node.UPF.NodeID, port: node.UPF.PFCPPort(), seen: map[*context.FAR]bool{}}
@@ -166,11 +172,7 @@ func ModifySessionForLI(smContext *context.SMContext) error {
 		}
 	}
 	var firstErr error
-	for ip, g := range groups {
-		sessionContext, exist := smContext.PFCPContext[ip]
-		if !exist || sessionContext.RemoteSEID == 0 {
-			continue // no live PFCP session on this UPF yet — nothing to modify
-		}
+	for _, g := range groups {
 		// Only FARs are carried: LI flips the DUPL bit on existing forwarding FARs
 		// (marked RULE_UPDATE), so there is nothing to create or remove.
 		//

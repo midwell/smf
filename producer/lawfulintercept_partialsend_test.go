@@ -10,18 +10,19 @@ import (
 	"testing"
 )
 
+// n1n2DataHandler is the file of the N1 and N2 update handlers, named by the placement guards.
+const n1n2DataHandler = "n1n2_data_handler.go"
+
 // TestPartialSendsReDeriveOnlyTheFARsTheySend pins the call at each handler that sends part of a
 // session's rules. lawfulintercept.ApplyCCTrigger re-derives every forwarding FAR, and at these
 // sites the ones the request does not carry are left duplicating in memory and unsent, where a
 // pending warrant scan then finds nothing to change. They call ApplyCCTriggerTo with the FARs
 // they send. TestAPartialSendLeavesOtherFARsToTheScan covers the behaviour.
-// n1n2DataHandler is the file of the N1 and N2 update handlers, named by the placement guards.
-const n1n2DataHandler = "n1n2_data_handler.go"
-
 func TestPartialSendsReDeriveOnlyTheFARsTheySend(t *testing.T) {
 	for _, tt := range []struct{ file, fn string }{
 		{n1n2DataHandler, "HandleUpdateN2Msg"},
 		{"callback.go", "programAddedRule"},
+		{"ulcl_procedure.go", "EstablishRANTunnelInfo"},
 	} {
 		t.Run(tt.fn, func(t *testing.T) {
 			parsed, err := parser.ParseFile(token.NewFileSet(), tt.file, nil, 0)

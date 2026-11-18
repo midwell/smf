@@ -925,15 +925,11 @@ func ApplyCCTriggerTo(sc *smfctx.SMContext, fars []*smfctx.FAR) {
 // would be a drop, and the interception would silently never start: the one
 // direction this plane must not fail in.
 //
-// It also delivers a duplication change still owed to the UPF that just answered.
-// On a session served by more than one UPF, the X1 scan reaches it once the anchor
-// has answered and may set duplication on the FARs of a UPF still establishing.
-// ModifySessionForLI skips that UPF, which has no remote SEID yet, so its FARs are
-// left RULE_UPDATE with the SMF-side Dupl already as the tasking implies, and
-// applyCC finds nothing to change when it answers. A forwarding FAR still
-// RULE_UPDATE is therefore a modification due as well. ModifySessionForLI sends
-// every RULE_UPDATE FAR, so one left by the session's own pending modification
-// rides along, as it does in every LI send.
+// The scan re-derives only UPFs that have answered their establishment, because the
+// create path builds a UPF's request without SMLock. A UPF still establishing is
+// therefore re-derived here, when it answers. A forwarding FAR still RULE_UPDATE on
+// an established UPF, left by the session's own pending modification, rides along
+// in the same modification.
 //
 // In the ordinary case nothing has changed since ApplyCCTrigger ran, applyCC
 // returns false, no FAR is RULE_UPDATE, and no modification is sent. Run here

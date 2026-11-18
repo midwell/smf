@@ -313,9 +313,9 @@ func EstablishRANTunnelInfo(smContext *context.SMContext) {
 		NetworkInstance: []byte(smContext.Dnn),
 	}
 
-	// Restore duplication from the current task state on the newly activated path.
-	// Silent no-op when LI is inactive.
-	lawfulintercept.ApplyCCTrigger(smContext)
+	// Restore duplication from the current task state on the newly activated path's downlink
+	// FAR, the one this step changes and EstablishULCL sends. Silent no-op when LI is inactive.
+	lawfulintercept.ApplyCCTriggerTo(smContext, []*context.FAR{activatingANUPFDLFAR})
 
 	activatingANUPFDLFAR.State = context.RULE_INITIAL
 	activatingANUPFDLFAR.ForwardingParameters.OuterHeaderCreation = new(context.OuterHeaderCreation)
