@@ -11,6 +11,11 @@ import (
 	"strings"
 	"testing"
 	"unicode"
+
+	"github.com/omec-project/smf/logger"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 // TestLIBlockCannotReturnFromStart is a source-level assertion, and it is deliberate.
@@ -138,8 +143,9 @@ func exprString(e ast.Expr) string {
 //     and discloses more loudly than any log line could — a network function that does
 //     not serve is visible to every peer and every monitoring system.
 //
-// So the rule for this block: no process-terminating call, and any log line carries a
-// constant that names no part of interception.
+// So the rule for this block: no process-terminating call, and no log call of its own. It
+// logs through declineOptionalSubsystem, whose line names no part of interception and carries
+// no caller (TestTheDeclineLineCarriesNoCallerAndNamesNothing).
 func TestLIBlockRefusalIsNotAttributable(t *testing.T) {
 	const file = "init.go"
 
@@ -176,32 +182,42 @@ func TestLIBlockRefusalIsNotAttributable(t *testing.T) {
 
 			return true
 		}
-		if !writesToLog(callee) {
-			return true
-		}
-
-		for _, arg := range call.Args {
-			lit, isLit := arg.(*ast.BasicLit)
-			if !isLit || lit.Kind != token.STRING {
-				t.Errorf("%s: the Lawful Interception block logs a runtime value (%s). Every "+
-					"value in scope here is LI configuration or an error from LI "+
-					"initialisation, and their text names the subsystem — which on this "+
-					"network function's general log tells every operator that this element is "+
-					"LI-provisioned. Log a constant; the ADMF is told over X1 from inside Init.",
-					fset.Position(arg.Pos()), exprSummary(arg))
-
-				continue
-			}
-			if word := attributingWord(lit.Value); word != "" {
-				t.Errorf("%s: the Lawful Interception block logs a message containing %q, which "+
-					"attributes the refusal to interception on this network function's general "+
-					"log. Say that an optional subsystem did not start, and no more.",
-					fset.Position(lit.Pos()), word)
-			}
+		if writesToLog(callee) {
+			t.Errorf("%s: the Lawful Interception block calls %s directly. util's logger records "+
+				"each line's call site, and a file and line inside this block name the branch to "+
+				"anyone with the source; a runtime value here is LI configuration or an LI error "+
+				"and names the subsystem outright. Call declineOptionalSubsystem, which says that "+
+				"an optional subsystem did not start and no more; the ADMF is told over X1 from "+
+				"inside Init.", fset.Position(call.Pos()), callee)
 		}
 
 		return true
 	})
+}
+
+// TestTheDeclineLineCarriesNoCallerAndNamesNothing is what the Lawful Interception block
+// logs, read from the line itself: a message naming no part of interception, and no caller,
+// which util's logger otherwise records and which would point at the LI branch of Start.
+func TestTheDeclineLineCarriesNoCallerAndNamesNothing(t *testing.T) {
+	core, logs := observer.New(zapcore.DebugLevel)
+	saved := logger.InitLog
+	logger.InitLog = zap.New(core, zap.AddCaller()).Sugar()
+	t.Cleanup(func() { logger.InitLog = saved })
+
+	declineOptionalSubsystem()
+
+	entries := logs.All()
+	if len(entries) != 1 {
+		t.Fatalf("declineOptionalSubsystem wrote %d lines, want 1", len(entries))
+	}
+	if c := entries[0].Caller; c.Defined {
+		t.Errorf("the line carries its caller %s, which locates it in the Lawful Interception "+
+			"branch of Start", c.TrimmedPath())
+	}
+	if word := attributingWord(entries[0].Message); word != "" {
+		t.Errorf("the line %q contains %q, which attributes it to interception",
+			entries[0].Message, word)
+	}
 }
 
 // calleeName returns the called function's own name — the selector's last element for
@@ -278,18 +294,4 @@ func attributingWord(quoted string) string {
 	}
 
 	return ""
-}
-
-// exprSummary names an argument well enough to point at it in a failure.
-func exprSummary(e ast.Expr) string {
-	switch v := e.(type) {
-	case *ast.Ident:
-		return v.Name
-	case *ast.SelectorExpr:
-		return exprSummary(v.X) + "." + v.Sel.Name
-	case *ast.CallExpr:
-		return calleeName(v) + "(…)"
-	}
-
-	return "a runtime value"
 }
