@@ -214,12 +214,20 @@ func TestParseXID(t *testing.T) {
 
 // ccSession builds a minimal one-node PDU session whose default uplink PDR
 // points at far, so ApplyCCTrigger has a forwarding FAR to act on.
+//
+// The UPF has answered its establishment: applyCC re-derives only the FARs of a UPF with a
+// PFCP session (forEachEstablishedForwardingFAR).
 func ccSession(far *smfctx.FAR) *smfctx.SMContext {
+	const upf = "10.0.0.1"
 	node := smfctx.NewDataPathNode()
+	node.UPF = &smfctx.UPF{NodeID: *smfctx.NewNodeID(upf)}
 	node.UpLinkTunnel.PDR["default"] = &smfctx.PDR{FAR: far}
 	return &smfctx.SMContext{
 		Supi:   testSUPI,
 		Tunnel: &smfctx.UPTunnel{DataPathPool: smfctx.DataPathPool{1: &smfctx.DataPath{FirstDPNode: node}}},
+		PFCPContext: map[string]*smfctx.PFCPSessionContext{
+			upf: {NodeID: node.UPF.NodeID, LocalSEID: 0x1234, RemoteSEID: 0x5678},
+		},
 	}
 }
 
@@ -1124,9 +1132,10 @@ func TestUnsuccessfulProcedureCauseMatchesTheReject(t *testing.T) {
 // lives at: not that applyCC leaves the rule state alone, but that the
 // establishment request it precedes still carries the forwarding FAR.
 //
-// A warrant can activate while one of the target's sessions is still being
-// established, and the X1 scan reaches sessions by tasking rather than by
-// lifecycle. The establishment builder emits a Create FAR only for RULE_INITIAL, so
+// A FAR can still be unsent at a UPF that has a PFCP session: a rule being added,
+// or a path being activated. applyCC leaves a UPF still establishing alone
+// (forEachEstablishedForwardingFAR), so this is where it can meet one. The
+// establishment builder emits a Create FAR only for RULE_INITIAL, so
 // an applyCC that marked every FAR it touched RULE_UPDATE would drop the FAR from
 // the request while the PDR referring to it was sent anyway. The UPF would hold a
 // detection rule pointing at a forwarding rule it had never been given: no

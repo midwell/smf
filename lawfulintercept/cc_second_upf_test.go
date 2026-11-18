@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 
@@ -71,14 +72,21 @@ func (a *adapterUPFs) to(node string) []uint32 {
 	return append([]uint32(nil), a.sent[node]...)
 }
 
-// TestDuplicationSetWhileASecondUPFEstablishesReachesItWhenItAnswers covers a session served by
-// two UPFs, of which the anchor has answered its establishment and the second has not. A warrant
-// activating then sets duplication on both UPFs' forwarding FARs; the modification goes to the
-// anchor only, because the second has no PFCP session to modify yet. When the second answers,
-// its FAR, already duplicating on the SMF side and still marked RULE_UPDATE, must be sent to it.
-func TestDuplicationSetWhileASecondUPFEstablishesReachesItWhenItAnswers(t *testing.T) {
+// secondUPFSession is a session served by two UPFs, of which the anchor has answered its
+// establishment and the second has not, with a CC warrant stored whose scan has not run. Calling
+// the returned activate runs the scan. calls counts the modifications LI makes.
+type secondUPFSession struct {
+	sc           *smfctx.SMContext
+	farA, farB   *smfctx.FAR
+	nodeA, nodeB string
+	upfs         *adapterUPFs
+	calls        *int
+	activate     func()
+}
+
+func newSecondUPFSession(t *testing.T, supi string, stateB smfctx.RuleState) *secondUPFSession {
+	t.Helper()
 	const (
-		supi  = "imsi-262019876543299"
 		nodeA = "10.0.9.1"
 		nodeB = "10.0.9.2"
 	)
@@ -96,9 +104,9 @@ func TestDuplicationSetWhileASecondUPFEstablishesReachesItWhenItAnswers(t *testi
 	http.DefaultTransport = upfs
 	t.Cleanup(func() { http.DefaultTransport = origTransport })
 
-	calls := 0
+	calls := new(int)
 	lawfulintercept.SetSessionModifier(func(sc *smfctx.SMContext) error {
-		calls++
+		*calls++
 		return producer.ModifySessionForLI(sc)
 	})
 	t.Cleanup(func() { lawfulintercept.SetSessionModifier(nil) })
@@ -107,7 +115,7 @@ func TestDuplicationSetWhileASecondUPFEstablishesReachesItWhenItAnswers(t *testi
 	t.Cleanup(func() { smfctx.RemoveSMContext(sc.Ref) })
 
 	farA := &smfctx.FAR{FARID: 1, State: smfctx.RULE_CREATE, ApplyAction: smfctx.ApplyAction{Forw: true}}
-	farB := &smfctx.FAR{FARID: 2, State: smfctx.RULE_CREATE, ApplyAction: smfctx.ApplyAction{Forw: true}}
+	farB := &smfctx.FAR{FARID: 2, State: stateB, ApplyAction: smfctx.ApplyAction{Forw: true}}
 	a, b := smfctx.NewDataPathNode(), smfctx.NewDataPathNode()
 	a.UPF = &smfctx.UPF{NodeID: *smfctx.NewNodeID(nodeA), Port: 8805}
 	b.UPF = &smfctx.UPF{NodeID: *smfctx.NewNodeID(nodeB), Port: 8805}
@@ -128,42 +136,94 @@ func TestDuplicationSetWhileASecondUPFEstablishesReachesItWhenItAnswers(t *testi
 
 	activate := lawfulintercept.ActivateForTest(t, types.InterceptTask{
 		XID:      "task-cc-second-upf",
-		Targets:  []types.TargetIdentifier{{Type: types.TargetSUPI, Value: "262019876543299"}},
+		Targets:  []types.TargetIdentifier{{Type: types.TargetSUPI, Value: strings.TrimPrefix(supi, "imsi-")}},
 		Products: []types.ProductType{types.ProductCC},
 		State:    types.TaskActive,
 	})
-	activate()
 
-	sc.SMLock.Lock()
-	if !farB.ApplyAction.Dupl || farB.State != smfctx.RULE_UPDATE {
-		sc.SMLock.Unlock()
-		t.Fatalf("precondition: the second UPF's FAR is Dupl=%v State=%v after the activation, "+
-			"want a duplication change not yet sent", farB.ApplyAction.Dupl, farB.State)
+	return &secondUPFSession{
+		sc: sc, farA: farA, farB: farB, nodeA: nodeA, nodeB: nodeB,
+		upfs: upfs, calls: calls, activate: activate,
 	}
-	sc.SMLock.Unlock()
-	if got := upfs.to(nodeA); len(got) != 1 || got[0] != farA.FARID {
-		t.Fatalf("precondition: the anchor was sent FARs %v, want [%d]", got, farA.FARID)
+}
+
+// answer is the second UPF answering its establishment: the handler records its SEID and
+// re-derives duplication. It returns the second FAR's state afterwards.
+func (s *secondUPFSession) answer() smfctx.RuleState {
+	s.sc.SMLock.Lock()
+	defer s.sc.SMLock.Unlock()
+	s.sc.PFCPContext[s.nodeB].RemoteSEID = 0x9202
+	lawfulintercept.ApplyCCAfterEstablishment(s.sc)
+
+	return s.farB.State
+}
+
+// TestDuplicationSetWhileASecondUPFEstablishesReachesItWhenItAnswers: a warrant activating while
+// the second UPF establishes reaches the anchor at once and the second UPF when it answers. The
+// activation leaves the second UPF's FAR alone, since nothing can be sent to it yet, and its
+// answer is what applies duplication there.
+func TestDuplicationSetWhileASecondUPFEstablishesReachesItWhenItAnswers(t *testing.T) {
+	s := newSecondUPFSession(t, "imsi-262019876543299", smfctx.RULE_CREATE)
+	s.activate()
+
+	s.sc.SMLock.Lock()
+	dupl, state := s.farB.ApplyAction.Dupl, s.farB.State
+	s.sc.SMLock.Unlock()
+	if dupl || state != smfctx.RULE_CREATE {
+		t.Fatalf("precondition: the activation changed the FAR of a UPF with no PFCP session "+
+			"(Dupl=%v State=%v)", dupl, state)
 	}
-	if got := upfs.to(nodeB); len(got) != 0 {
+	if got := s.upfs.to(s.nodeA); len(got) != 1 || got[0] != s.farA.FARID {
+		t.Fatalf("precondition: the anchor was sent FARs %v, want [%d]", got, s.farA.FARID)
+	}
+	if got := s.upfs.to(s.nodeB); len(got) != 0 {
 		t.Fatalf("precondition: a UPF with no PFCP session was sent FARs %v", got)
 	}
-	before := calls
+	before := *s.calls
 
-	// The second UPF answers its establishment.
-	sc.SMLock.Lock()
-	sc.PFCPContext[nodeB].RemoteSEID = 0x9202
-	lawfulintercept.ApplyCCAfterEstablishment(sc)
-	stateB := farB.State
-	sc.SMLock.Unlock()
+	stateB := s.answer()
 
-	if calls == before {
+	if *s.calls == before {
 		t.Error("no modification was made when the second UPF answered, so it keeps the FAR " +
-			"it was established with, without duplication, while the SMF records it as duplicating")
+			"it was established with, without duplication")
 	}
-	if got := upfs.to(nodeB); len(got) != 1 || got[0] != farB.FARID {
-		t.Errorf("the second UPF was sent FARs %v, want [%d]", got, farB.FARID)
+	if got := s.upfs.to(s.nodeB); len(got) != 1 || got[0] != s.farB.FARID {
+		t.Errorf("the second UPF was sent FARs %v, want [%d]", got, s.farB.FARID)
 	}
-	if stateB == smfctx.RULE_UPDATE {
-		t.Error("the second UPF's FAR is still RULE_UPDATE: the duplication change was never sent")
+	if stateB == smfctx.RULE_UPDATE || !s.farB.ApplyAction.Dupl {
+		t.Errorf("the second UPF's FAR is State=%v Dupl=%v: the duplication change was never sent",
+			stateB, s.farB.ApplyAction.Dupl)
+	}
+}
+
+// TestAnActivationDuringASecondUPFsBuildIsNotLost is the interleaving the create path allows,
+// since it builds requests without SMLock: the second UPF's Create FAR is encoded without
+// duplication, the warrant's scan runs, and only then does the builder mark the FAR
+// RULE_CREATE. Had the scan set duplication on that FAR, the second UPF's answer would find it
+// already duplicating and not RULE_UPDATE, and send nothing, while the UPF was established
+// without it.
+func TestAnActivationDuringASecondUPFsBuildIsNotLost(t *testing.T) {
+	s := newSecondUPFSession(t, "imsi-262019876543298", smfctx.RULE_INITIAL)
+
+	// The builder has encoded the second UPF's Create FAR, without duplication.
+	encoded := s.farB.ApplyAction.Dupl
+
+	s.activate()
+
+	// The builder finishes with the FAR, as buildPfcpSessionEstablishmentRequest does.
+	s.sc.SMLock.Lock()
+	touched := s.farB.ApplyAction.Dupl != encoded
+	s.farB.State = smfctx.RULE_CREATE
+	s.sc.SMLock.Unlock()
+	if touched {
+		t.Error("the activation changed the FAR of a UPF whose establishment request may be " +
+			"being built without SMLock")
+	}
+
+	s.answer()
+
+	if got := s.upfs.to(s.nodeB); len(got) != 1 || got[0] != s.farB.FARID {
+		t.Errorf("the second UPF was sent FARs %v after it answered, want [%d]: it was "+
+			"established without duplication and is never told", got, s.farB.FARID)
 	}
 }

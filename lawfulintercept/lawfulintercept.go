@@ -931,7 +931,7 @@ func farUpdateOwed(sc *smfctx.SMContext) bool {
 		return false
 	}
 	owed := false
-	forEachForwardingFAR(sc, func(far *smfctx.FAR) {
+	forEachEstablishedForwardingFAR(sc, func(far *smfctx.FAR) {
 		if far.State == smfctx.RULE_UPDATE {
 			owed = true
 		}
@@ -954,6 +954,40 @@ func forEachForwardingFARAt(sc *smfctx.SMContext, nodeIP string, fn func(*smfctx
 	for _, dp := range sc.Tunnel.DataPathPool {
 		for node := dp.FirstDPNode; node != nil; node = node.Next() {
 			if nodeIP != "" && (node.UPF == nil || node.GetNodeIP() != nodeIP) {
+				continue
+			}
+			for _, tun := range []*smfctx.GTPTunnel{node.UpLinkTunnel, node.DownLinkTunnel} {
+				if tun == nil {
+					continue
+				}
+				for _, pdr := range tun.PDR {
+					if pdr != nil && pdr.FAR != nil && pdr.FAR.ApplyAction.Forw {
+						fn(pdr.FAR)
+					}
+				}
+			}
+		}
+	}
+}
+
+// forEachEstablishedForwardingFAR is forEachForwardingFAR for the UPFs whose PFCP session
+// exists, those with a remote SEID. Caller holds sc.SMLock; sc.Tunnel must be non-nil.
+//
+// A UPF without one may be having its establishment request built, and the create path builds
+// it without SMLock (fsm's HandleStatePfcpCreatePendingEventPfcpSessCreate). A re-derivation
+// that sets duplication on its FARs then can land between the builder encoding a FAR and marking
+// it RULE_CREATE: the request carries the old value, and when the UPF answers its FAR already
+// reads as the tasking implies and is not RULE_UPDATE, so nothing is sent and the UPF never
+// duplicates. Its FARs are left to ApplyCCAfterEstablishment, which re-derives them when it
+// answers, after its request was built. Nothing could be sent to it before that in any case.
+func forEachEstablishedForwardingFAR(sc *smfctx.SMContext, fn func(*smfctx.FAR)) {
+	for _, dp := range sc.Tunnel.DataPathPool {
+		for node := dp.FirstDPNode; node != nil; node = node.Next() {
+			if node.UPF == nil {
+				continue
+			}
+			ip := node.GetNodeIP()
+			if pc, ok := sc.PFCPContext[ip]; !ok || pc == nil || pc.RemoteSEID == 0 {
 				continue
 			}
 			for _, tun := range []*smfctx.GTPTunnel{node.UpLinkTunnel, node.DownLinkTunnel} {
@@ -1371,7 +1405,9 @@ func (s *subsystem) applyCC(sc *smfctx.SMContext) bool {
 	}
 	want := s.ccTasked(sc)
 	changed := false
-	forEachForwardingFAR(sc, func(far *smfctx.FAR) {
+	// Established UPFs only: see forEachEstablishedForwardingFAR. A UPF still establishing is
+	// re-derived when it answers.
+	forEachEstablishedForwardingFAR(sc, func(far *smfctx.FAR) {
 		if far.ApplyAction.Dupl == want {
 			return
 		}
