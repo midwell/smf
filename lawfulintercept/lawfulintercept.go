@@ -797,8 +797,10 @@ func ReportReleaseReject(sc *smfctx.SMContext, pduSessionID int32, cause uint8) 
 // smfReleaseRejected is the record ReportReleaseReject delivers. For a release naming
 // another session it leaves out what belongs to this context's session rather than to
 // the subscriber: its UE endpoint, DNN, access type and RAT type describe a session the
-// request did not name, and table 6.2.3-5 has each "if available", which for the session
-// the request named they are not.
+// request did not name. Table 6.2.3-5 makes all four conditional: the UE endpoint and DNN
+// "if available", which for the named session they are not, and the access type and RAT
+// type on what the AMF provided at that session's establishment, which for the named
+// session never took place here.
 func smfReleaseRejected(sc *smfctx.SMContext, pduSessionID int32, cause uint8) iri.SMFUnsuccessfulProcedure {
 	rec := smfUnsuccessful(sc, iri.SMFFailedPDUSessionRelease, cause)
 	rec.PDUSessionID = iri.PDUSessionID(pduSessionID)
@@ -857,6 +859,8 @@ func unsuccessfulRequestType(sc *smfctx.SMContext, procedure iri.SMFFailedProced
 		return requestType(sc)
 	case iri.SMFFailedPDUSessionModification:
 		return iri.SMRequestModification
+	case iri.SMFFailedPDUSessionRelease:
+		return 0
 	default:
 		return 0
 	}

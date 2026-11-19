@@ -15,7 +15,10 @@ import (
 )
 
 // liRelease records what each release branch did to the session's interception state.
-type liRelease struct{ released, untasked, restored, rejected int }
+type liRelease struct {
+	released, untasked, restored, rejected int
+	rejectedIDs                            []int32
+}
 
 func captureRelease(t *testing.T) *liRelease {
 	t.Helper()
@@ -26,7 +29,10 @@ func captureRelease(t *testing.T) *liRelease {
 	liReportRelease = func(*smf_context.SMContext) { c.released++ }
 	liUntriggerCC = func(*smf_context.SMContext) { c.untasked++ }
 	liRestoreInterception = func(*smf_context.SMContext) { c.restored++ }
-	liReportReleaseReject = func(*smf_context.SMContext, int32, uint8) { c.rejected++ }
+	liReportReleaseReject = func(_ *smf_context.SMContext, pduSessionID int32, _ uint8) {
+		c.rejected++
+		c.rejectedIDs = append(c.rejectedIDs, pduSessionID)
+	}
 	t.Cleanup(func() {
 		liReportRelease, liUntriggerCC = release, untrigger
 		liRestoreInterception, liReportReleaseReject = restore, reject
@@ -159,5 +165,9 @@ func TestAReleaseThatTimesOutRestoresTheSessionsInterceptionState(t *testing.T) 
 		t.Errorf("the timeout branch emitted %d unsuccessful-procedure records, want 1 — its two "+
 			"sibling branches emit one, so what the mediation function sees depends on which "+
 			"failure occurred, which is the distinction it cannot make", calls.rejected)
+	}
+	if len(calls.rejectedIDs) == 1 && calls.rejectedIDs[0] != sc.PDUSessionID {
+		t.Errorf("the unsuccessful-procedure record names PDU session %d, want %d: the release "+
+			"that timed out is this session's own", calls.rejectedIDs[0], sc.PDUSessionID)
 	}
 }

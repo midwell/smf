@@ -1062,14 +1062,19 @@ func TestARefusedReleaseNamesTheSessionTheRequestNamed(t *testing.T) {
 		tagAccessType   = 16
 		tagRATType      = 17
 	)
+	// A context whose access type and RAT type are both set, so that each subtest can tell
+	// an attribute left out from one that was never there.
+	contextSM := func() *smfctx.SMContext {
+		sc := targetSM()
+		sc.RatType = models.RATTYPE_NR
+		return sc
+	}
 
 	t.Run("another session", func(t *testing.T) {
 		capture := &captureSender{}
 		activateIRISub(t, capture, iriTask())
 
-		sc := targetSM()
-		sc.RatType = models.RATTYPE_NR
-		ReportReleaseReject(sc, 6, nasMessage.Cause5GSMInvalidPDUSessionIdentity)
+		ReportReleaseReject(contextSM(), 6, nasMessage.Cause5GSMInvalidPDUSessionIdentity)
 
 		rec := unsuccessfulSM(t, capture)
 		if got := integer(t, rec.member(t, tagPDUSessionID)); got != 6 {
@@ -1089,14 +1094,17 @@ func TestARefusedReleaseNamesTheSessionTheRequestNamed(t *testing.T) {
 		capture := &captureSender{}
 		activateIRISub(t, capture, iriTask())
 
-		ReportReleaseReject(targetSM(), 5, nasMessage.Cause5GSMRequestRejectedUnspecified)
+		ReportReleaseReject(contextSM(), 5, nasMessage.Cause5GSMRequestRejectedUnspecified)
 
 		rec := unsuccessfulSM(t, capture)
 		if got := integer(t, rec.member(t, tagPDUSessionID)); got != 5 {
 			t.Errorf("pDUSessionID = %d, want 5", got)
 		}
-		rec.member(t, tagDNN)
-		rec.member(t, tagUEEndpoint)
+		for _, tag := range []int{tagUEEndpoint, tagDNN, tagAccessType, tagRATType} {
+			if _, ok := rec.members[tag]; !ok {
+				t.Errorf("member [%d] absent: the refused release names this context's session, whose attributes it is", tag)
+			}
+		}
 		if _, ok := rec.members[tagRequestType]; ok {
 			t.Errorf("requestType present on a refused release; table 6.2.3-5 sets none")
 		}
