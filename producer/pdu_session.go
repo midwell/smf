@@ -831,7 +831,7 @@ func HandlePDUSessionSMContextRelease(eventData any) error {
 		// emit. A timeout and a stated refusal are both the procedure not completing,
 		// and which of them occurred is exactly the distinction a mediation function
 		// cannot make: without this it sees a release record and then silence.
-		liReportReleaseReject(smContext, nasMessage.Cause5GSMRequestRejectedUnspecified)
+		liReportReleaseReject(smContext, smContext.PDUSessionID, nasMessage.Cause5GSMRequestRejectedUnspecified)
 		httpResponse = &httpwrapper.Response{
 			Status: int(http.StatusInternalServerError),
 		}
@@ -854,7 +854,7 @@ func HandlePDUSessionSMContextRelease(eventData any) error {
 		errResponse.SetJsonData(*jsonData)
 		// The reject carries a hardcoded 5GSM cause; report the same value so the
 		// record cannot disagree with the wire.
-		liReportReleaseReject(smContext, nasMessage.Cause5GSMRequestRejectedUnspecified)
+		liReportReleaseReject(smContext, smContext.PDUSessionID, nasMessage.Cause5GSMRequestRejectedUnspecified)
 		if buf, err := smf_context.BuildGSMPDUSessionReleaseReject(smContext); err != nil {
 			smContext.SubPduSessLog.Errorf("PDUSessionSMContextRelease, build GSM PDUSessionReleaseReject failed: %+v", err)
 		} else {
@@ -890,7 +890,7 @@ func HandlePDUSessionSMContextRelease(eventData any) error {
 		errResponse.SetJsonData(*jsonData)
 		// The reject carries a hardcoded 5GSM cause; report the same value so the
 		// record cannot disagree with the wire.
-		liReportReleaseReject(smContext, nasMessage.Cause5GSMRequestRejectedUnspecified)
+		liReportReleaseReject(smContext, smContext.PDUSessionID, nasMessage.Cause5GSMRequestRejectedUnspecified)
 		if buf, err := smf_context.BuildGSMPDUSessionReleaseReject(smContext); err != nil {
 			smContext.SubPduSessLog.Errorf("PDUSessionSMContextRelease, build GSM PDUSessionReleaseReject failed: %+v", err)
 		} else {

@@ -187,7 +187,7 @@ type subsystem struct {
 	// while the other reported the endpoint unreachable.
 	unreachableAt func(addr string) bool
 	// mdf2 is the configured X2 endpoint, used only for a task that names no
-	// destination this element can resolve.
+	// destination at all (see x2Destinations).
 	mdf2 string
 	neID string
 	// ids supplies the conditional attributes that belong to this element rather than
@@ -249,8 +249,7 @@ func (s *subsystem) destinationUnreachable(addr string) bool {
 }
 
 // destinationsInUse is where this element's xIRI currently goes: the X2 endpoints the tasking
-// it holds names, and the configured MDF2 for a task that names nothing this element can
-// resolve.
+// it holds names, and the configured MDF2 for a task that names no destination at all.
 //
 // It exists because a delivery client outlives the warrant that created it. A destination
 // whose last delivery failed and whose warrant was then deactivated can never be delivered to
@@ -780,9 +779,34 @@ func ReportModificationReject(sc *smfctx.SMContext, cause uint8) {
 
 // ReportReleaseReject emits an SMFUnsuccessfulProcedure xIRI when the SMF refuses
 // a PDU session release for a tasked target. cause is the 5GSM cause the reject
-// carries.
-func ReportReleaseReject(sc *smfctx.SMContext, cause uint8) {
-	reportUnsuccessful(sc, iri.SMFFailedPDUSessionRelease, cause)
+// carries, and pduSessionID the PDU session identity the refused PDU SESSION RELEASE
+// REQUEST named, which the reject carries too.
+//
+// **The identity is the request's, not the context's.** A release can reach this
+// context naming another session, and that is refused as an invalid identity: the record
+// then describes a refused release of the session the UE named. Taking the identity from
+// the context instead would report a refused release of a session that is still up.
+func ReportReleaseReject(sc *smfctx.SMContext, pduSessionID int32, cause uint8) {
+	sub := active.Load()
+	if sub == nil || sc == nil {
+		return
+	}
+	sub.reportEvent(sc, smfReleaseRejected(sc, pduSessionID, cause))
+}
+
+// smfReleaseRejected is the record ReportReleaseReject delivers. For a release naming
+// another session it leaves out what belongs to this context's session rather than to
+// the subscriber: its UE endpoint, DNN, access type and RAT type describe a session the
+// request did not name, and table 6.2.3-5 has each "if available", which for the session
+// the request named they are not.
+func smfReleaseRejected(sc *smfctx.SMContext, pduSessionID int32, cause uint8) iri.SMFUnsuccessfulProcedure {
+	rec := smfUnsuccessful(sc, iri.SMFFailedPDUSessionRelease, cause)
+	rec.PDUSessionID = iri.PDUSessionID(pduSessionID)
+	if pduSessionID != sc.PDUSessionID {
+		rec.UEEndpoint, rec.DNN, rec.AccessType, rec.RATType = nil, "", 0, 0
+	}
+
+	return rec
 }
 
 // reportUnsuccessful is the shared body. It cannot fail the procedure it reports:
@@ -815,11 +839,26 @@ func smfUnsuccessful(sc *smfctx.SMContext, procedure iri.SMFFailedProcedureType,
 		PDUSessionID:        iri.PDUSessionID(sc.PDUSessionID),
 		UEEndpoint:          ueEndpoint(sc),
 		DNN:                 iri.DNN(sc.Dnn),
-		RequestType:         requestType(sc),
+		RequestType:         unsuccessfulRequestType(sc, procedure),
 		AccessType:          accessType(sc),
 		SUPIUnauthenticated: supiUnauthenticatedOf(sc),
 		AMFID:               amfIDOf(sc),
 		RATType:             ratTypeOf(sc.RatType),
+	}
+}
+
+// unsuccessfulRequestType is the requestType table 6.2.3-5 sets for each refused
+// procedure. Only an establishment carries a request type of its own; for the others
+// the table names the value: "modification request" for a modification, and none for a
+// release.
+func unsuccessfulRequestType(sc *smfctx.SMContext, procedure iri.SMFFailedProcedureType) iri.FiveGSMRequestType {
+	switch procedure {
+	case iri.SMFFailedPDUSessionEstablishment:
+		return requestType(sc)
+	case iri.SMFFailedPDUSessionModification:
+		return iri.SMRequestModification
+	default:
+		return 0
 	}
 }
 
@@ -2160,11 +2199,11 @@ func keepaliveConfig(cfg Config, reporter *x1.Reporter) x2x3.KeepaliveConfig {
 // configuredDestinations maps the pre-shared destinations from configuration onto the
 // form the X1 server resolves them in, and tells the ADMF about any it cannot use.
 //
-// An entry that does not resolve is not a small mistake: a task naming that DID falls
-// through to the configured default endpoint instead, so an operator's typo quietly sends
-// one agency's product to another's address. There is no general log to say so on — this
-// plane deliberately writes to none — and the count is all the ADMF needs, since the
-// entries themselves are the operator's configuration and not the ADMF's business.
+// An entry that does not resolve is not a small mistake: a task naming that DID is refused
+// with 2040 (DID does not exist on the NE), so an operator's typo stops the warrant it was
+// meant for. There is no general log to say so on — this plane deliberately writes to none —
+// and the count is all the ADMF needs, since the entries themselves are the operator's
+// configuration and not the ADMF's business.
 func configuredDestinations(dests []Destination, reporter *x1.Reporter) []x1.ConfiguredDestination {
 	out := make([]x1.ConfiguredDestination, 0, len(dests))
 	var rejected int
@@ -2180,7 +2219,7 @@ func configuredDestinations(dests []Destination, reporter *x1.Reporter) []x1.Con
 	if rejected > 0 {
 		reporter.Notify(x1.NEIssueInvalidConfig, fmt.Sprintf(
 			"%d configured delivery destination(s) are unusable and were dropped; "+
-				"a task naming one will be delivered to the default endpoint instead", rejected))
+				"a task naming one will be refused", rejected))
 	}
 
 	return out

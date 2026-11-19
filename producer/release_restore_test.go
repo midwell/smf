@@ -26,7 +26,7 @@ func captureRelease(t *testing.T) *liRelease {
 	liReportRelease = func(*smf_context.SMContext) { c.released++ }
 	liUntriggerCC = func(*smf_context.SMContext) { c.untasked++ }
 	liRestoreInterception = func(*smf_context.SMContext) { c.restored++ }
-	liReportReleaseReject = func(*smf_context.SMContext, uint8) { c.rejected++ }
+	liReportReleaseReject = func(*smf_context.SMContext, int32, uint8) { c.rejected++ }
 	t.Cleanup(func() {
 		liReportRelease, liUntriggerCC = release, untrigger
 		liRestoreInterception, liReportReleaseReject = restore, reject

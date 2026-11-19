@@ -19,6 +19,7 @@ type liFailures struct {
 	establishmentRejects []uint8
 	modificationRejects  int
 	releaseRejects       []uint8
+	releaseRejectIDs     []int32
 }
 
 func captureLIFailures(t *testing.T) *liFailures {
@@ -29,8 +30,9 @@ func captureLIFailures(t *testing.T) *liFailures {
 		c.establishmentRejects = append(c.establishmentRejects, cause)
 	}
 	liReportModificationReject = func(*smf_context.SMContext, uint8) { c.modificationRejects++ }
-	liReportReleaseReject = func(_ *smf_context.SMContext, cause uint8) {
+	liReportReleaseReject = func(_ *smf_context.SMContext, pduSessionID int32, cause uint8) {
 		c.releaseRejects = append(c.releaseRejects, cause)
+		c.releaseRejectIDs = append(c.releaseRejectIDs, pduSessionID)
 	}
 	t.Cleanup(func() {
 		liReportEstablishmentReject, liReportModificationReject, liReportReleaseReject = establishment, modification, release
@@ -242,5 +244,43 @@ func TestARefusedReleaseOfANeverEstablishedSessionIsReported(t *testing.T) {
 	}
 	if got := calls.releaseRejects[0]; got != nasMessage.Cause5GSMInvalidPDUSessionIdentity {
 		t.Errorf("record cause = %d, want #43, the cause the reject carries", got)
+	}
+	if got := calls.releaseRejectIDs[0]; got != pduSessionID {
+		t.Errorf("record PDU session ID = %d, want %d", got, pduSessionID)
+	}
+}
+
+// A release naming a session other than the one this context holds is refused as an invalid
+// identity, and the record names the session the request named: the context's own session is
+// still up, and a record naming it would report a refused release of a session nobody asked to
+// release.
+func TestARefusedReleaseNamingAnotherSessionIsReportedForThatSession(t *testing.T) {
+	calls := captureLIFailures(t)
+	// Any PTI the UE may use; the reject echoes it, and the record does not carry one.
+	const contextID, requestedID, pti = 10, 11, 7
+
+	smContext := smf_context.NewSMContext("imsi-208930100007489", contextID)
+	t.Cleanup(func() { smf_context.RemoveSMContext(smContext.Ref) })
+
+	var request models.UpdateSmContextRequest
+	request.SetJsonData(models.SmContextUpdateData{})
+	request.SetBinaryDataN1SmMessage(n1SmMessageFile(t, encodeReleaseRequest(t, requestedID, pti)))
+
+	txn := transaction.NewTransaction(request, nil, svcmsgtypes.UpdateSmContext)
+	txn.Ctxt = smContext
+
+	if err := HandleUpdateN1Msg(txn, models.NewUpdateSmContext200Response(), &pfcpAction{}); err != nil {
+		t.Fatalf("HandleUpdateN1Msg returned %v, want the release to be refused without error", err)
+	}
+
+	if len(calls.releaseRejects) != 1 {
+		t.Fatalf("failed-release records = %d, want 1", len(calls.releaseRejects))
+	}
+	if got := calls.releaseRejects[0]; got != nasMessage.Cause5GSMInvalidPDUSessionIdentity {
+		t.Errorf("record cause = %d, want #43, the cause the reject carries", got)
+	}
+	if got := calls.releaseRejectIDs[0]; got != requestedID {
+		t.Errorf("record PDU session ID = %d, want %d, the session the refused request named, not this context's %d",
+			got, requestedID, contextID)
 	}
 }

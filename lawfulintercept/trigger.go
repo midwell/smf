@@ -1506,10 +1506,10 @@ func (s *subsystem) triggerCCAt(sc *smfctx.SMContext, upfsOf func(*smfctx.SMCont
 			s.reportTaskIssue(warrant, "no triggering endpoint configured for a UPF serving the target")
 		}
 
-		// And a warrant whose content has nowhere to go at all: it named no X3
-		// destination this element can resolve and there is no configured endpoint to
-		// fall back to. Reported separately from the above because the remedy is a
-		// different one — provision the destination, or configure the fallback.
+		// And a warrant whose content has nowhere to go at all: it named no destination
+		// and there is no configured MDF3, or the destinations it named give no X3
+		// endpoint (see x3Destinations). Reported separately from the above because the
+		// remedy is a different one — provision the destination, or configure the MDF3.
 		for _, warrant := range undeliverable {
 			s.reportTaskIssue(warrant, "no X3 delivery destination could be resolved for this task")
 		}
@@ -2000,8 +2000,8 @@ func (r *triggerRegistry) x3Destinations(t types.InterceptTask) []string {
 // response brings the CC-TF back here.
 //
 // undeliverable carries the warrants whose content has nowhere to go — the task
-// names no X3 destination this element can resolve and no MDF3 is configured to
-// fall back to. It is reported separately from unreachable because the two are
+// names no destination and no MDF3 is configured, or the destinations it names give
+// no X3 endpoint (see x3Destinations). It is reported separately from unreachable because the two are
 // different faults with different remedies: one is a UPF this element cannot task,
 // the other a destination it cannot find.
 func (r *triggerRegistry) plan(

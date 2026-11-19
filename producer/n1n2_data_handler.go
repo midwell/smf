@@ -218,7 +218,7 @@ func HandleUpdateN1Msg(txn *transaction.Transaction, response *models.UpdateSmCo
 							smContext.SMContextState.String())
 						// Lawful Interception IRI-POI: a refused release, as on the mismatched
 						// identity below, reported with the cause the reject carries.
-						liReportReleaseReject(smContext, smferrors.ErrorCause["InvalidPDUSessionIdentity"])
+						liReportReleaseReject(smContext, pduSessIDRelReq, smferrors.ErrorCause["InvalidPDUSessionIdentity"])
 						buildPDUSessionReleaseReject(smContext, response, pduSessIDRelReq, "InvalidPDUSessionIdentity")
 						break
 					}
@@ -248,7 +248,7 @@ func HandleUpdateN1Msg(txn *transaction.Transaction, response *models.UpdateSmCo
 				smContext.SubPduSessLog.Errorf("Invalid PDU Session ID")
 				// Same cause key the reject is built from, so the record and the
 				// wire cannot disagree.
-				lawfulintercept.ReportReleaseReject(smContext, smferrors.ErrorCause["InvalidPDUSessionIdentity"])
+				liReportReleaseReject(smContext, pduSessIDRelReq, smferrors.ErrorCause["InvalidPDUSessionIdentity"])
 				buildPDUSessionReleaseReject(smContext, response, pduSessIDRelReq, "InvalidPDUSessionIdentity")
 				smContext.ChangeState(context.SmStateModify)
 				smContext.SubCtxLog.Debugln("PDUSessionSMContextUpdate, SMContextState Change State:", smContext.SMContextState.String())

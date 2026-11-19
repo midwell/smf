@@ -100,8 +100,9 @@ type Li struct {
 	// out of band. A task naming one of these DIDs is delivered to it exactly as if
 	// the ADMF had provisioned it with CreateDestination; a destination provisioned
 	// over X1 under the same DID takes precedence. Optional — an ADMF that
-	// provisions its own destinations needs none of these, and `mdf2` above still
-	// serves a task that names nothing resolvable.
+	// provisions its own destinations needs none of these. `mdf2` above serves only a
+	// task that names no destination at all; a task naming a DID this element cannot
+	// resolve is refused, not delivered to `mdf2`.
 	Destinations []LiDestination `yaml:"destinations,omitempty"`
 
 	AdmfURL string `yaml:"admfUrl"` // ADMF X1 endpoint for NE-initiated issue reports (optional)

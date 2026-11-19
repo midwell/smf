@@ -1036,7 +1036,7 @@ func TestUnsuccessfulProcedureReportsRefusedRelease(t *testing.T) {
 	capture := &captureSender{}
 	activateIRISub(t, capture, iriTask())
 
-	ReportReleaseReject(targetSM(), nasMessage.Cause5GSMRequestRejectedUnspecified)
+	ReportReleaseReject(targetSM(), 5, nasMessage.Cause5GSMRequestRejectedUnspecified)
 
 	rec := unsuccessfulSM(t, capture)
 	if got := integer(t, rec.member(t, 1)); got != int64(iri.SMFFailedPDUSessionRelease) {
@@ -1044,6 +1044,77 @@ func TestUnsuccessfulProcedureReportsRefusedRelease(t *testing.T) {
 	}
 	if got := integer(t, rec.member(t, 2)); got != int64(nasMessage.Cause5GSMRequestRejectedUnspecified) {
 		t.Errorf("failureCause = %d", got)
+	}
+}
+
+// TestARefusedReleaseNamesTheSessionTheRequestNamed: a release naming another session than
+// the context's is refused, and the record describes that refusal. It names the requested
+// session, and carries none of the context session's own attributes, which describe a
+// session that is still up. A release refused for the context's own session keeps them. No
+// release record carries a request type: table 6.2.3-5 sets none for a PDU SESSION RELEASE
+// REJECT.
+func TestARefusedReleaseNamesTheSessionTheRequestNamed(t *testing.T) {
+	const (
+		tagPDUSessionID = 9
+		tagUEEndpoint   = 10
+		tagDNN          = 12
+		tagRequestType  = 15
+		tagAccessType   = 16
+		tagRATType      = 17
+	)
+
+	t.Run("another session", func(t *testing.T) {
+		capture := &captureSender{}
+		activateIRISub(t, capture, iriTask())
+
+		sc := targetSM()
+		sc.RatType = models.RATTYPE_NR
+		ReportReleaseReject(sc, 6, nasMessage.Cause5GSMInvalidPDUSessionIdentity)
+
+		rec := unsuccessfulSM(t, capture)
+		if got := integer(t, rec.member(t, tagPDUSessionID)); got != 6 {
+			t.Errorf("pDUSessionID = %d, want 6, the session the refused request named, not the context's 5", got)
+		}
+		for _, tag := range []int{tagUEEndpoint, tagDNN, tagAccessType, tagRATType, tagRequestType} {
+			if _, ok := rec.members[tag]; ok {
+				t.Errorf("member [%d] present: it describes the context's session 5, not the session the request named", tag)
+			}
+		}
+		if supi := imsiOf(t, rec.member(t, 5)); supi != "262019876543210" {
+			t.Errorf("SUPI = %q, want the subscriber's", supi)
+		}
+	})
+
+	t.Run("this session", func(t *testing.T) {
+		capture := &captureSender{}
+		activateIRISub(t, capture, iriTask())
+
+		ReportReleaseReject(targetSM(), 5, nasMessage.Cause5GSMRequestRejectedUnspecified)
+
+		rec := unsuccessfulSM(t, capture)
+		if got := integer(t, rec.member(t, tagPDUSessionID)); got != 5 {
+			t.Errorf("pDUSessionID = %d, want 5", got)
+		}
+		rec.member(t, tagDNN)
+		rec.member(t, tagUEEndpoint)
+		if _, ok := rec.members[tagRequestType]; ok {
+			t.Errorf("requestType present on a refused release; table 6.2.3-5 sets none")
+		}
+	})
+}
+
+// TestARefusedModificationIsReportedAsAModificationRequest: table 6.2.3-5 has a refused
+// modification reported with request type "modification request", whatever request type
+// established the session.
+func TestARefusedModificationIsReportedAsAModificationRequest(t *testing.T) {
+	sc := targetSM()
+	sc.RequestType = models.REQUESTTYPE_EXISTING_PDU_SESSION
+
+	if got := smfUnsuccessful(sc, iri.SMFFailedPDUSessionModification, 26).RequestType; got != iri.SMRequestModification {
+		t.Errorf("requestType = %d, want modification request (%d)", got, iri.SMRequestModification)
+	}
+	if got := smfUnsuccessful(sc, iri.SMFFailedPDUSessionEstablishment, 26).RequestType; got != iri.SMRequestExisting {
+		t.Errorf("establishment requestType = %d, want the session's own (%d)", got, iri.SMRequestExisting)
 	}
 }
 
@@ -1061,7 +1132,7 @@ func TestUnsuccessfulProcedureSilentForUntaskedSubscriber(t *testing.T) {
 	})
 
 	ReportEstablishmentReject(targetSM(), nasMessage.Cause5GSMInsufficientResources)
-	ReportReleaseReject(targetSM(), nasMessage.Cause5GSMRequestRejectedUnspecified)
+	ReportReleaseReject(targetSM(), 5, nasMessage.Cause5GSMRequestRejectedUnspecified)
 
 	if len(capture.pdus) != 0 {
 		t.Errorf("an untasked subscriber's refusal produced %d PDU(s)", len(capture.pdus))
@@ -1077,19 +1148,19 @@ func TestUnsuccessfulProcedureCannotWorsenTheFailure(t *testing.T) {
 	t.Run("no subsystem", func(t *testing.T) {
 		active.Store(nil)
 		ReportEstablishmentReject(targetSM(), 26)
-		ReportReleaseReject(targetSM(), 26)
+		ReportReleaseReject(targetSM(), 5, 26)
 	})
 
 	t.Run("nil context", func(t *testing.T) {
 		activateIRISub(t, &captureSender{}, iriTask())
 		ReportEstablishmentReject(nil, 26)
-		ReportReleaseReject(nil, 26)
+		ReportReleaseReject(nil, 5, 26)
 	})
 
 	t.Run("delivery fails", func(t *testing.T) {
 		activateIRISub(t, senderFunc(func(*x2x3.PDU) error { return errors.New("MDF unreachable") }), iriTask())
 		ReportEstablishmentReject(targetSM(), 26)
-		ReportReleaseReject(targetSM(), 26)
+		ReportReleaseReject(targetSM(), 5, 26)
 	})
 
 	// Reaching here at all is the assertion: none of the above panicked, blocked,
